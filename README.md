@@ -122,6 +122,25 @@ The repository’s workflow at `.github/workflows/platform.yml` prepares Linux, 
 
 There is no transport encryption, trusted-device authentication, replay protection, internet/port-forwarding support, resume, clipboard sharing, folder sync, or automatic updating in v1. Those protections must be designed before remote support is considered.
 
+## Automated local integration tests
+
+The `integration-tests` feature exposes a test-only peer harness. Each test peer has its own device identity, loopback TCP listener, receive directory, transfer state, and temporary filesystem tree. Discovery is injected; the handshake, request decision, framed transfer, checksum verification, staging, finalization, cancellation, and shutdown paths use the production implementation.
+
+Run the normal local scenarios serially to keep progress-barrier and allocation measurements deterministic:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml \
+  --features integration-tests --test transfer_integration -- --test-threads=1
+```
+
+The repeated 50-transfer stress pass is intentionally ignored in the normal run:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml \
+  --features integration-tests --test transfer_integration \
+  -- --ignored --test-threads=1
+```
+
 ## Validate
 
 ```sh

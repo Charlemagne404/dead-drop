@@ -123,8 +123,31 @@ struct StagedFile {
     final_path: PathBuf,
 }
 
-struct TransferTracker {
+pub(crate) trait EventSink: Send + Sync {
+    fn emit_transfer_update(&self, snapshot: &TransferSnapshot) -> Result<(), String>;
+    fn emit_incoming_transfer(&self, transfer: &IncomingTransfer) -> Result<(), String>;
+}
+
+struct TauriEventSink {
     app: AppHandle,
+}
+
+impl EventSink for TauriEventSink {
+    fn emit_transfer_update(&self, snapshot: &TransferSnapshot) -> Result<(), String> {
+        self.app
+            .emit("transfer-update", snapshot)
+            .map_err(|error| error.to_string())
+    }
+
+    fn emit_incoming_transfer(&self, transfer: &IncomingTransfer) -> Result<(), String> {
+        self.app
+            .emit("incoming-transfer", transfer)
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct TransferTracker {
+    events: Arc<dyn EventSink>,
     lifecycle: TransferLifecycle,
     snapshot: TransferSnapshot,
     last_progress_emit: Option<Instant>,
@@ -132,14 +155,14 @@ struct TransferTracker {
 
 impl TransferTracker {
     fn new(
-        app: AppHandle,
+        events: Arc<dyn EventSink>,
         id: &str,
         direction: &str,
         phase: TransferPhase,
         device_name: &str,
     ) -> Self {
         Self {
-            app,
+            events,
             lifecycle: TransferLifecycle::new(phase),
             snapshot: TransferSnapshot {
                 id: id.to_string(),
@@ -158,7 +181,7 @@ impl TransferTracker {
     }
 
     fn emit(&self) {
-        if let Err(error) = self.app.emit("transfer-update", &self.snapshot) {
+        if let Err(error) = self.events.emit_transfer_update(&self.snapshot) {
             eprintln!(
                 "[dead-drop][transfer] could not emit update for {}: {error}",
                 self.snapshot.id
@@ -233,49 +256,65 @@ impl TransferTracker {
 }
 
 pub fn start_listener(std_listener: StdTcpListener, state: Arc<AppState>, app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        let listener = match TcpListener::from_std(std_listener) {
-            Ok(listener) => listener,
-            Err(error) => {
-                eprintln!("[dead-drop][network] could not start transfer listener: {error}");
-                return;
-            }
+    let events = Arc::new(TauriEventSink { app });
+    tauri::async_runtime::spawn(run_listener(std_listener, state, events));
+}
+
+#[cfg(any(test, feature = "integration-tests"))]
+pub(crate) fn start_listener_for_test(
+    std_listener: StdTcpListener,
+    state: Arc<AppState>,
+    events: Arc<dyn EventSink>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_listener(std_listener, state, events))
+}
+
+async fn run_listener(
+    std_listener: StdTcpListener,
+    state: Arc<AppState>,
+    events: Arc<dyn EventSink>,
+) {
+    let listener = match TcpListener::from_std(std_listener) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("[dead-drop][network] could not start transfer listener: {error}");
+            return;
+        }
+    };
+    eprintln!("[dead-drop][network] transfer listener started");
+    let shutdown = state.shutdown_token();
+    loop {
+        let accepted = tokio::select! {
+            result = listener.accept() => result,
+            _ = shutdown.cancelled() => break,
         };
-        eprintln!("[dead-drop][network] transfer listener started");
-        let shutdown = state.shutdown_token();
-        loop {
-            let accepted = tokio::select! {
-                result = listener.accept() => result,
-                _ = shutdown.cancelled() => break,
-            };
-            match accepted {
-                Ok((stream, address)) => {
-                    let Some(permit) = state.try_acquire_connection_slot() else {
-                        eprintln!(
-                            "[dead-drop][network] rejected connection from {address}: connection limit reached"
-                        );
-                        continue;
-                    };
-                    let state = state.clone();
-                    let app = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _permit = permit;
-                        if let Err(error) = handle_incoming(stream, state, app).await {
-                            eprintln!("[dead-drop][network] incoming connection ended: {error:?}");
-                        }
-                    });
-                }
-                Err(error) => {
-                    if state.is_shutting_down() {
-                        break;
+        match accepted {
+            Ok((stream, address)) => {
+                let Some(permit) = state.try_acquire_connection_slot() else {
+                    eprintln!(
+                        "[dead-drop][network] rejected connection from {address}: connection limit reached"
+                    );
+                    continue;
+                };
+                let state = state.clone();
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = handle_incoming(stream, state, events).await {
+                        eprintln!("[dead-drop][network] incoming connection ended: {error:?}");
                     }
-                    eprintln!("[dead-drop][network] listener accept failed: {error}");
-                    sleep(Duration::from_secs(1)).await;
+                });
+            }
+            Err(error) => {
+                if state.is_shutting_down() {
+                    break;
                 }
+                eprintln!("[dead-drop][network] listener accept failed: {error}");
+                sleep(Duration::from_secs(1)).await;
             }
         }
-        eprintln!("[dead-drop][network] transfer listener stopped");
-    });
+    }
+    eprintln!("[dead-drop][network] transfer listener stopped");
 }
 
 pub async fn run_outgoing(
@@ -286,9 +325,28 @@ pub async fn run_outgoing(
     paths: Vec<String>,
     cancellation: Arc<Cancellation>,
 ) {
+    run_outgoing_with_events(
+        Arc::new(TauriEventSink { app }),
+        state,
+        transfer_id,
+        peer,
+        paths,
+        cancellation,
+    )
+    .await;
+}
+
+pub(crate) async fn run_outgoing_with_events(
+    events: Arc<dyn EventSink>,
+    state: Arc<AppState>,
+    transfer_id: String,
+    peer: Peer,
+    paths: Vec<String>,
+    cancellation: Arc<Cancellation>,
+) {
     let shutdown = state.shutdown_token();
     let mut tracker = TransferTracker::new(
-        app.clone(),
+        events.clone(),
         &transfer_id,
         "outgoing",
         TransferPhase::Preparing,
@@ -613,7 +671,7 @@ async fn send_files(
 async fn handle_incoming(
     stream: TcpStream,
     state: Arc<AppState>,
-    app: AppHandle,
+    events: Arc<dyn EventSink>,
 ) -> Result<(), TransferError> {
     let shutdown = state.shutdown_token();
     let connection_cancellation = Cancellation::new();
@@ -705,7 +763,7 @@ async fn handle_incoming(
     }
     let cancellation = state.register_cancellation(transfer_id.clone());
     let result = receive_incoming(
-        &app,
+        &events,
         &state,
         &mut reader,
         &mut writer,
@@ -729,7 +787,7 @@ async fn handle_incoming(
 
 #[allow(clippy::too_many_arguments)]
 async fn receive_incoming(
-    app: &AppHandle,
+    events: &Arc<dyn EventSink>,
     state: &Arc<AppState>,
     reader: &mut tokio::net::tcp::OwnedReadHalf,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
@@ -741,7 +799,7 @@ async fn receive_incoming(
     shutdown: Arc<Cancellation>,
 ) -> Result<(), TransferError> {
     let mut tracker = TransferTracker::new(
-        app.clone(),
+        events.clone(),
         &transfer_id,
         "incoming",
         TransferPhase::WaitingForAcceptance,
@@ -751,15 +809,13 @@ async fn receive_incoming(
     tracker.emit();
     let (approval_sender, approval_receiver) = tokio::sync::oneshot::channel();
     state.add_pending_request(transfer_id.clone(), approval_sender);
-    if let Err(error) = app.emit(
-        "incoming-transfer",
-        IncomingTransfer {
-            id: transfer_id.clone(),
-            from: sender.clone(),
-            files: files.clone(),
-            total_bytes,
-        },
-    ) {
+    let incoming = IncomingTransfer {
+        id: transfer_id.clone(),
+        from: sender.clone(),
+        files: files.clone(),
+        total_bytes,
+    };
+    if let Err(error) = events.emit_incoming_transfer(&incoming) {
         state.clear_pending_request(&transfer_id);
         tracker.finish_error(&TransferError::AppUnavailable);
         send_protocol_error(writer, "Dead Drop could not show the incoming transfer.").await;
@@ -931,7 +987,7 @@ async fn receive_files(
             }
         }
         let final_path = available_destination_path(directory, &expected.name, &mut used_names)?;
-        let temporary = directory.join(format!(".dead-drop-{transfer_id}-{index}.part"));
+        let temporary = temporary_staging_path(directory, transfer_id, index);
         let mut destination = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1135,6 +1191,13 @@ fn checksum_file(
 
 fn digest_matches(expected: &str, actual: &str) -> bool {
     expected.eq_ignore_ascii_case(actual)
+}
+
+fn temporary_staging_path(directory: &Path, transfer_id: &str, index: usize) -> PathBuf {
+    let transfer_component = Uuid::parse_str(transfer_id)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| "invalid".to_string());
+    directory.join(format!(".dead-drop-{transfer_component}-{index}.part"))
 }
 
 fn available_destination_path(
@@ -1725,6 +1788,7 @@ fn speed_for(transferred: u64, started_at: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::io::Write;
     use uuid::Uuid;
 
@@ -1809,11 +1873,72 @@ mod tests {
     }
 
     #[test]
+    fn collision_search_has_a_finite_bound() {
+        let directory =
+            std::env::temp_dir().join(format!("dead-drop-collisions-{}", Uuid::new_v4()));
+        let mut used = HashSet::new();
+        for index in 0..=MAX_COLLISION_ATTEMPTS {
+            let candidate_name = if index == 0 {
+                "collision.txt".to_string()
+            } else {
+                collision_name("collision", "txt", index)
+            };
+            used.insert(path_key(&directory.join(candidate_name)));
+        }
+        assert!(matches!(
+            available_destination_path(&directory, "collision.txt", &mut used),
+            Err(TransferError::Destination { .. })
+        ));
+    }
+
+    #[test]
     fn collision_keys_normalize_unicode_equivalents() {
         assert_eq!(
             path_key(Path::new("café.txt")),
             path_key(Path::new("cafe\u{301}.txt"))
         );
+    }
+
+    #[test]
+    fn temporary_staging_names_do_not_copy_wire_uuid_syntax_to_the_filesystem() {
+        let path = temporary_staging_path(
+            Path::new("/receive"),
+            "urn:uuid:22222222-2222-4222-8222-222222222222",
+            3,
+        );
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("staging path should have a UTF-8 filename");
+        assert!(!name.contains(':'));
+        assert!(!name.contains('/'));
+        assert!(!name.contains('\\'));
+    }
+
+    proptest! {
+        #[test]
+        fn generated_collision_names_are_safe_and_bounded(
+            chars in prop::collection::vec(prop::sample::select(vec!['a', 'b', 'c', 'n', 'o', 't']), 1..=32),
+            index in 1_u32..=MAX_COLLISION_ATTEMPTS,
+        ) {
+            let stem: String = chars.into_iter().collect();
+            let collision = collision_name(&stem, "txt", index);
+            prop_assert!(collision.len() <= MAX_FILENAME_BYTES);
+            prop_assert!(crate::protocol::safe_file_name(&collision));
+        }
+
+        #[test]
+        fn sanitized_wire_names_stay_in_the_receive_directory(
+            chars in prop::collection::vec(any::<char>(), 0..=512),
+        ) {
+            let input: String = chars.into_iter().collect();
+            let name = portable_file_name(&input);
+            let directory = Path::new("/receive");
+            let destination = available_destination_path(directory, &name, &mut HashSet::new())
+                .expect("a sanitized basename should produce a destination");
+            prop_assert_eq!(destination.parent(), Some(directory));
+            prop_assert_eq!(destination.file_name().and_then(|value| value.to_str()), Some(name.as_str()));
+        }
     }
 
     #[test]

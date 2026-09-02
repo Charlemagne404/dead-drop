@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 const CONTROL_FRAME: u8 = 1;
 const DATA_FRAME: u8 = 2;
+const FRAME_HEADER_SIZE: usize = 5;
 pub const MAX_CONTROL_FRAME_SIZE: usize = 512 * 1024;
 pub const MAX_DATA_FRAME_SIZE: usize = 128 * 1024;
 const MAX_REASON_BYTES: usize = 1024;
@@ -27,7 +28,7 @@ pub enum ProtocolError {
     InvalidMessage(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
     Hello {
@@ -95,25 +96,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     kind: u8,
     payload: &[u8],
 ) -> Result<(), ProtocolError> {
-    let maximum = match kind {
-        CONTROL_FRAME => MAX_CONTROL_FRAME_SIZE,
-        DATA_FRAME => MAX_DATA_FRAME_SIZE,
-        _ => {
-            return Err(ProtocolError::InvalidFrame(
-                "unknown frame type".to_string(),
-            ))
-        }
-    };
-    if payload.len() > maximum {
-        return Err(ProtocolError::InvalidFrame(
-            "frame exceeds the size limit".to_string(),
-        ));
-    }
-    if kind == DATA_FRAME && payload.is_empty() {
-        return Err(ProtocolError::InvalidFrame(
-            "data frames cannot be empty".to_string(),
-        ));
-    }
+    validate_frame_length(kind, payload.len())?;
     let length = u32::try_from(payload.len()).map_err(|_| {
         ProtocolError::InvalidFrame("frame length cannot be represented".to_string())
     })?;
@@ -126,16 +109,69 @@ async fn write_frame<W: AsyncWrite + Unpin>(
 
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, ProtocolError> {
     let kind = reader.read_u8().await?;
-    let maximum = match kind {
-        CONTROL_FRAME => MAX_CONTROL_FRAME_SIZE,
-        DATA_FRAME => MAX_DATA_FRAME_SIZE,
-        _ => {
-            return Err(ProtocolError::InvalidFrame(
-                "unknown frame type".to_string(),
-            ))
-        }
-    };
-    let length = reader.read_u32().await? as usize;
+    frame_limit(kind)?;
+    let mut length_bytes = [0_u8; 4];
+    reader.read_exact(&mut length_bytes).await?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
+    validate_frame_length(kind, length)?;
+    let mut payload = vec![0; length];
+    reader.read_exact(&mut payload).await?;
+    decode_frame_payload(kind, &payload)
+}
+
+/// Decode exactly one length-prefixed frame from a byte slice.
+///
+/// The returned byte count makes concatenated frames explicit. The decoder
+/// validates the advertised length before copying data or parsing JSON, so a
+/// hostile prefix cannot request an unbounded allocation.
+#[allow(dead_code)]
+pub fn decode_frame(input: &[u8]) -> Result<(Frame, usize), ProtocolError> {
+    if input.len() < FRAME_HEADER_SIZE {
+        return Err(ProtocolError::InvalidFrame(
+            "truncated frame header".to_string(),
+        ));
+    }
+    let kind = input[0];
+    let length = u32::from_be_bytes([input[1], input[2], input[3], input[4]]) as usize;
+    validate_frame_length(kind, length)?;
+    let frame_length = FRAME_HEADER_SIZE
+        .checked_add(length)
+        .ok_or_else(|| ProtocolError::InvalidFrame("frame length overflow".to_string()))?;
+    if input.len() < frame_length {
+        return Err(ProtocolError::InvalidFrame(
+            "truncated frame payload".to_string(),
+        ));
+    }
+    let frame = decode_frame_payload(kind, &input[FRAME_HEADER_SIZE..frame_length])?;
+    Ok((frame, frame_length))
+}
+
+/// Decode and validate a control-message payload independently of transport.
+/// This cap keeps the helper safe even when it is called outside `read_frame`.
+pub fn decode_control_message(payload: &[u8]) -> Result<ControlMessage, ProtocolError> {
+    if payload.len() > MAX_CONTROL_FRAME_SIZE {
+        return Err(ProtocolError::InvalidMessage(
+            "control message exceeds the size limit".to_string(),
+        ));
+    }
+    let message = serde_json::from_slice(payload)?;
+    validate_control_message(&message)?;
+    Ok(message)
+}
+
+fn decode_frame_payload(kind: u8, payload: &[u8]) -> Result<Frame, ProtocolError> {
+    validate_frame_length(kind, payload.len())?;
+    match kind {
+        CONTROL_FRAME => Ok(Frame::Control(decode_control_message(payload)?)),
+        DATA_FRAME => Ok(Frame::Data(payload.to_vec())),
+        _ => Err(ProtocolError::InvalidFrame(
+            "unknown frame type".to_string(),
+        )),
+    }
+}
+
+fn validate_frame_length(kind: u8, length: usize) -> Result<(), ProtocolError> {
+    let maximum = frame_limit(kind)?;
     if length > maximum {
         return Err(ProtocolError::InvalidFrame(
             "frame exceeds the size limit".to_string(),
@@ -146,15 +182,13 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, P
             "data frames cannot be empty".to_string(),
         ));
     }
-    let mut payload = vec![0; length];
-    reader.read_exact(&mut payload).await?;
+    Ok(())
+}
+
+fn frame_limit(kind: u8) -> Result<usize, ProtocolError> {
     match kind {
-        CONTROL_FRAME => {
-            let message = serde_json::from_slice(&payload)?;
-            validate_control_message(&message)?;
-            Ok(Frame::Control(message))
-        }
-        DATA_FRAME => Ok(Frame::Data(payload)),
+        CONTROL_FRAME => Ok(MAX_CONTROL_FRAME_SIZE),
+        DATA_FRAME => Ok(MAX_DATA_FRAME_SIZE),
         _ => Err(ProtocolError::InvalidFrame(
             "unknown frame type".to_string(),
         )),
@@ -361,7 +395,11 @@ pub fn portable_file_name(name: &str) -> String {
 }
 
 fn is_windows_reserved_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or(name);
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches([' ', '.']);
     matches!(
         stem.to_ascii_uppercase().as_str(),
         "CON"
@@ -439,6 +477,8 @@ fn validate_reason(reason: &str) -> Result<(), ProtocolError> {
 mod tests {
     use super::*;
     use crate::models::{DeviceIdentity, TransferFile, PROTOCOL_VERSION};
+    use proptest::prelude::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use tokio::io::{duplex, AsyncWriteExt};
 
     fn device() -> DeviceIdentity {
@@ -456,6 +496,64 @@ mod tests {
             size: 4,
             sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         }
+    }
+
+    fn encoded_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![kind];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn valid_control_messages() -> impl Strategy<Value = ControlMessage> {
+        prop_oneof![
+            Just(ControlMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                device: device(),
+            }),
+            Just(ControlMessage::ProtocolError {
+                message: "peer rejected the request".to_string(),
+            }),
+            Just(ControlMessage::TransferRequest {
+                transfer_id: "33333333-3333-4333-8333-333333333333".to_string(),
+                files: vec![file("sample.txt")],
+                total_bytes: 4,
+            }),
+            Just(ControlMessage::TransferDecision {
+                transfer_id: "33333333-3333-4333-8333-333333333333".to_string(),
+                accepted: true,
+                reason: None,
+            }),
+            Just(ControlMessage::TransferDecision {
+                transfer_id: "33333333-3333-4333-8333-333333333333".to_string(),
+                accepted: false,
+                reason: Some("Declined by the recipient.".to_string()),
+            }),
+            Just(ControlMessage::FileStart {
+                transfer_id: "33333333-3333-4333-8333-333333333333".to_string(),
+                file_index: 0,
+            }),
+            Just(ControlMessage::FileEnd {
+                transfer_id: "33333333-3333-4333-8333-333333333333".to_string(),
+                file_index: 0,
+            }),
+            Just(ControlMessage::Complete {
+                transfer_id: "33333333-3333-4333-8333-333333333333".to_string(),
+            }),
+            Just(ControlMessage::TransferResult {
+                transfer_id: "33333333-3333-4333-8333-333333333333".to_string(),
+                success: true,
+                reason: None,
+            }),
+            Just(ControlMessage::TransferResult {
+                transfer_id: "33333333-3333-4333-8333-333333333333".to_string(),
+                success: false,
+                reason: Some("recipient reported failure".to_string()),
+            }),
+            Just(ControlMessage::Cancel {
+                transfer_id: "33333333-3333-4333-8333-333333333333".to_string(),
+            }),
+        ]
     }
 
     #[tokio::test]
@@ -516,6 +614,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_frame_types_are_rejected_before_waiting_for_a_length() {
+        let (mut sender, mut receiver) = duplex(32);
+        sender
+            .write_all(&[0xff])
+            .await
+            .expect("test write should work");
+        drop(sender);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            read_frame(&mut receiver),
+        )
+        .await
+        .expect("unknown frame types should not wait for more bytes");
+        assert!(matches!(result, Err(ProtocolError::InvalidFrame(_))));
+    }
+
+    #[tokio::test]
     async fn writers_and_readers_round_trip_control_and_data_frames() {
         let (mut sender, mut receiver) = duplex(1024);
         let writer = tokio::spawn(async move {
@@ -550,9 +665,40 @@ mod tests {
             4
         )
         .is_ok());
+        assert!(validate_transfer_request("33333333-3333-4333-8333-333333333333", &[], 0).is_err());
+        assert!(validate_transfer_request(
+            "33333333-3333-4333-8333-333333333333",
+            &[file("photo.txt")],
+            3
+        )
+        .is_err());
+        assert!(validate_transfer_request(
+            "33333333-3333-4333-8333-333333333333",
+            &vec![file("photo.txt"); MAX_TRANSFER_FILES + 1],
+            4 * (MAX_TRANSFER_FILES as u64 + 1)
+        )
+        .is_err());
+        assert!(validate_transfer_request(
+            "33333333-3333-4333-8333-333333333333",
+            &[
+                TransferFile {
+                    name: "first.bin".to_string(),
+                    size: u64::MAX,
+                    sha256: "0".repeat(64),
+                },
+                TransferFile {
+                    name: "second.bin".to_string(),
+                    size: 1,
+                    sha256: "0".repeat(64),
+                },
+            ],
+            u64::MAX
+        )
+        .is_err());
         assert!(!safe_file_name("../../secret"));
         assert!(!safe_file_name("/absolute"));
         assert!(!safe_file_name("CON.txt"));
+        assert!(!safe_file_name("CON .txt"));
         assert!(!safe_file_name("trailing. "));
         assert!(!safe_file_name("wild*card.txt"));
         assert!(!safe_file_name("LPT9.tar"));
@@ -569,6 +715,10 @@ mod tests {
             device: mismatched_device,
         })
         .is_err());
+        assert!(validate_control_message(&ControlMessage::ProtocolError {
+            message: "x".repeat(MAX_REASON_BYTES + 1),
+        })
+        .is_err());
     }
 
     #[test]
@@ -581,6 +731,7 @@ mod tests {
         assert_eq!(portable_file_name("東京の資料.txt"), "東京の資料.txt");
         assert_eq!(portable_file_name("e\u{301}.txt"), "é.txt");
         assert_eq!(portable_file_name("CON.txt"), "_CON.txt");
+        assert_eq!(portable_file_name("CON .txt"), "_CON .txt");
         assert_eq!(portable_file_name("report:2026.txt"), "report_2026.txt");
         assert_eq!(portable_file_name("../../secret.txt"), ".._.._secret.txt");
         assert_eq!(portable_file_name("trailing. "), "trailing__");
@@ -595,6 +746,22 @@ mod tests {
         let portable = portable_file_name(&"😀".repeat(200));
         assert!(portable.len() <= MAX_FILENAME_BYTES);
         assert!(safe_file_name(&portable));
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_filenames_produce_safe_bounded_basenames(chars in prop::collection::vec(any::<char>(), 0..=512)) {
+            let input: String = chars.into_iter().collect();
+            let outcome = catch_unwind(AssertUnwindSafe(|| portable_file_name(&input)));
+            prop_assert!(outcome.is_ok());
+            let portable = outcome.expect("filename conversion should not panic");
+            prop_assert!(!portable.is_empty());
+            prop_assert!(portable.len() <= MAX_FILENAME_BYTES);
+            prop_assert!(safe_file_name(&portable));
+            prop_assert!(!portable.contains('/') && !portable.contains('\\'));
+            prop_assert!(!is_windows_reserved_name(&portable));
+            prop_assert!(Path::new(&portable).file_name().and_then(|value| value.to_str()) == Some(portable.as_str()));
+        }
     }
 
     #[test]
@@ -631,5 +798,150 @@ mod tests {
             device: remote,
         };
         assert!(validate_control_message(&message).is_ok());
+    }
+
+    #[test]
+    fn every_truncated_frame_prefix_returns_an_error() {
+        let payload = serde_json::to_vec(&ControlMessage::Cancel {
+            transfer_id: "22222222-2222-4222-8222-222222222222".to_string(),
+        })
+        .expect("test message should encode");
+        let frame = encoded_frame(CONTROL_FRAME, &payload);
+        for split in 0..frame.len() {
+            assert!(
+                decode_frame(&frame[..split]).is_err(),
+                "prefix at byte {split} should be rejected"
+            );
+        }
+        let (decoded, consumed) = decode_frame(&frame).expect("complete frame should decode");
+        assert_eq!(consumed, frame.len());
+        assert!(matches!(
+            decoded,
+            Frame::Control(ControlMessage::Cancel { .. })
+        ));
+    }
+
+    #[test]
+    fn concatenated_frames_report_their_exact_boundaries() {
+        let first_payload = serde_json::to_vec(&ControlMessage::Cancel {
+            transfer_id: "22222222-2222-4222-8222-222222222222".to_string(),
+        })
+        .expect("test message should encode");
+        let second_payload = b"payload";
+        let mut bytes = encoded_frame(CONTROL_FRAME, &first_payload);
+        bytes.extend_from_slice(&encoded_frame(DATA_FRAME, second_payload));
+
+        let (first, first_length) = decode_frame(&bytes).expect("first frame should decode");
+        let (second, second_length) =
+            decode_frame(&bytes[first_length..]).expect("second frame should decode");
+        assert!(matches!(
+            first,
+            Frame::Control(ControlMessage::Cancel { .. })
+        ));
+        assert!(matches!(second, Frame::Data(data) if data == second_payload));
+        assert_eq!(first_length + second_length, bytes.len());
+    }
+
+    #[test]
+    fn malformed_message_shapes_are_rejected_as_controlled_errors() {
+        let invalid_messages: &[&[u8]] = &[
+            br#"{"type":"unknown"}"#,
+            br#"{"type":"cancel","transfer_id":"not-a-uuid"}"#,
+            br#"{"type":"file_start","transfer_id":"22222222-2222-4222-8222-222222222222","file_index":999}"#,
+            br#"{"type":"cancel","transfer_id":"22222222-2222-4222-8222-222222222222","transfer_id":"33333333-3333-4333-8333-333333333333"}"#,
+            b"{\"type\":\"cancel\",\"transfer_id\":\"\xff\"}",
+            br#"{"type":"cancel","transfer_id":"22222222-2222-4222-8222-222222222222"} trailing"#,
+        ];
+        for payload in invalid_messages {
+            assert!(decode_control_message(payload).is_err());
+        }
+    }
+
+    #[test]
+    fn oversized_lengths_are_rejected_before_payload_decoding() {
+        assert!(matches!(
+            decode_frame(&[0, 0, 0, 0, 0]),
+            Err(ProtocolError::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            decode_frame(&[DATA_FRAME, 0, 0, 0, 0]),
+            Err(ProtocolError::InvalidFrame(_))
+        ));
+
+        let mut data = vec![DATA_FRAME];
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            decode_frame(&data),
+            Err(ProtocolError::InvalidFrame(_))
+        ));
+
+        let mut control = vec![CONTROL_FRAME];
+        control.extend_from_slice(&((MAX_CONTROL_FRAME_SIZE as u32) + 1).to_be_bytes());
+        assert!(matches!(
+            decode_frame(&control),
+            Err(ProtocolError::InvalidFrame(_))
+        ));
+
+        let oversized_payload = vec![b' '; MAX_CONTROL_FRAME_SIZE + 1];
+        assert!(matches!(
+            decode_control_message(&oversized_payload),
+            Err(ProtocolError::InvalidMessage(_))
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_frame_bytes_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..=8192)) {
+            let outcome = catch_unwind(AssertUnwindSafe(|| decode_frame(&bytes)));
+            prop_assert!(outcome.is_ok());
+            if let Ok(Ok((_frame, consumed))) = outcome {
+                prop_assert!(consumed >= FRAME_HEADER_SIZE);
+                prop_assert!(consumed <= bytes.len());
+            }
+        }
+
+        #[test]
+        fn arbitrary_control_payloads_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..=8192)) {
+            let outcome = catch_unwind(AssertUnwindSafe(|| decode_control_message(&bytes)));
+            prop_assert!(outcome.is_ok());
+        }
+
+        #[test]
+        fn valid_control_messages_round_trip(message in valid_control_messages()) {
+            let payload = serde_json::to_vec(&message).expect("valid message should encode");
+            let decoded = decode_control_message(&payload).expect("valid message should decode");
+            prop_assert_eq!(decoded, message.clone());
+
+            let frame = encoded_frame(CONTROL_FRAME, &payload);
+            let (decoded_frame, consumed) = decode_frame(&frame).expect("valid frame should decode");
+            prop_assert_eq!(consumed, frame.len());
+            prop_assert!(matches!(decoded_frame, Frame::Control(decoded) if decoded == message));
+        }
+
+        #[test]
+        fn valid_data_frames_round_trip(data in prop::collection::vec(any::<u8>(), 1..=4096)) {
+            let frame = encoded_frame(DATA_FRAME, &data);
+            let (decoded, consumed) = decode_frame(&frame).expect("valid data frame should decode");
+            prop_assert_eq!(consumed, frame.len());
+            prop_assert!(matches!(decoded, Frame::Data(decoded) if decoded == data));
+        }
+
+        #[test]
+        fn arbitrary_transfer_metadata_never_panic(
+            id_chars in prop::collection::vec(any::<char>(), 0..=128),
+            name_chars in prop::collection::vec(any::<char>(), 0..=512),
+            sha_chars in prop::collection::vec(any::<char>(), 0..=128),
+            size in any::<u64>(),
+            total in any::<u64>(),
+        ) {
+            let transfer_id: String = id_chars.into_iter().collect();
+            let name: String = name_chars.into_iter().collect();
+            let sha256: String = sha_chars.into_iter().collect();
+            let files = [TransferFile { name, size, sha256 }];
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                validate_transfer_request(&transfer_id, &files, total)
+            }));
+            prop_assert!(outcome.is_ok());
+        }
     }
 }

@@ -2,6 +2,8 @@ mod discovery;
 mod models;
 mod platform;
 mod protocol;
+#[cfg(any(test, feature = "integration-tests"))]
+pub mod test_support;
 mod transfer;
 
 use models::{AppState, Preferences, PreferencesDraft, StartupSnapshot};

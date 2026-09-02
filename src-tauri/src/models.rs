@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
+    io::{self, Read},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -19,8 +20,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_TRANSFER_FILES: usize = 256;
 pub const MAX_FILENAME_BYTES: usize = 255;
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
+const MAX_PERSISTED_SETTINGS_BYTES: u64 = 64 * 1024;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceIdentity {
     pub id: String,
@@ -46,7 +48,7 @@ pub struct Peer {
     pub endpoint_candidates: Vec<SocketAddr>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferFile {
     pub name: String,
@@ -195,6 +197,7 @@ pub struct AppState {
     pending_requests: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     cancellations: Mutex<HashMap<String, Arc<Cancellation>>>,
     active_transfer: Mutex<Option<String>>,
+    transfer_changed: Notify,
     connection_slots: Arc<Semaphore>,
     shutdown: Arc<Cancellation>,
     listener_port: u16,
@@ -258,29 +261,42 @@ impl AppState {
             });
         let stored_device_name = stored.device_name.trim().to_string();
 
-        let state = Self {
-            device: RwLock::new(DeviceIdentity {
+        let state = Self::new(
+            DeviceIdentity {
                 id: stored.device_id,
                 name: stored_device_name.clone(),
                 os: platform::platform_name(),
                 protocol_version: PROTOCOL_VERSION,
-            }),
-            preferences: RwLock::new(Preferences {
+            },
+            Preferences {
                 device_name: stored_device_name,
                 destination: stored.destination,
-            }),
-            peers: RwLock::new(HashMap::new()),
-            pending_requests: Mutex::new(HashMap::new()),
-            cancellations: Mutex::new(HashMap::new()),
-            active_transfer: Mutex::new(None),
-            connection_slots: Arc::new(Semaphore::new(8)),
-            shutdown: Arc::new(Cancellation::new()),
+            },
             listener_port,
-        };
+        );
         if let Err(error) = state.persist() {
             eprintln!("[dead-drop][settings] could not persist startup settings: {error}");
         }
         state
+    }
+
+    pub(crate) fn new(
+        device: DeviceIdentity,
+        preferences: Preferences,
+        listener_port: u16,
+    ) -> Self {
+        Self {
+            device: RwLock::new(device),
+            preferences: RwLock::new(preferences),
+            peers: RwLock::new(HashMap::new()),
+            pending_requests: Mutex::new(HashMap::new()),
+            cancellations: Mutex::new(HashMap::new()),
+            active_transfer: Mutex::new(None),
+            transfer_changed: Notify::new(),
+            connection_slots: Arc::new(Semaphore::new(8)),
+            shutdown: Arc::new(Cancellation::new()),
+            listener_port,
+        }
     }
 
     fn settings_path() -> Option<PathBuf> {
@@ -302,6 +318,9 @@ impl AppState {
     }
 
     pub fn try_begin_transfer(&self, id: &str) -> Result<(), String> {
+        if !valid_transfer_id(id) {
+            return Err("Invalid transfer id.".to_string());
+        }
         if self.is_shutting_down() {
             return Err("Dead Drop is shutting down.".to_string());
         }
@@ -313,6 +332,7 @@ impl AppState {
             return Err("Finish the active transfer before starting another one.".to_string());
         }
         *active = Some(id.to_string());
+        self.transfer_changed.notify_waiters();
         Ok(())
     }
 
@@ -325,6 +345,7 @@ impl AppState {
         }
         self.clear_cancellation(id);
         self.clear_pending_request(id);
+        self.transfer_changed.notify_waiters();
     }
 
     pub fn try_acquire_connection_slot(&self) -> Option<OwnedSemaphorePermit> {
@@ -354,6 +375,23 @@ impl AppState {
             let _ = sender.send(false);
         }
         *self.active_transfer.lock() = None;
+        self.transfer_changed.notify_waiters();
+    }
+
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.active_transfer.lock().is_none()
+    }
+
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub(crate) async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.transfer_changed.notified();
+            if self.is_idle() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn update_preferences(&self, draft: PreferencesDraft) -> Result<Preferences, String> {
@@ -531,6 +569,14 @@ fn default_destination() -> PathBuf {
 }
 
 fn valid_device_id(value: &str) -> bool {
+    valid_uuid(value)
+}
+
+fn valid_transfer_id(value: &str) -> bool {
+    valid_uuid(value)
+}
+
+fn valid_uuid(value: &str) -> bool {
     Uuid::parse_str(value)
         .map(|id| !id.is_nil())
         .unwrap_or(false)
@@ -555,14 +601,35 @@ fn load_persisted_settings() -> Option<PersistedSettings> {
     let preferred = platform::settings_path();
     let legacy = platform::legacy_settings_path();
     for path in [preferred, legacy].into_iter().flatten() {
-        let Ok(raw) = fs::read_to_string(path) else {
+        let Ok(raw) = read_persisted_settings(&path) else {
             continue;
         };
-        if let Ok(settings) = serde_json::from_str::<PersistedSettings>(&raw) {
+        if let Some(settings) = parse_persisted_settings(raw.as_bytes()) {
             return Some(settings);
         }
     }
     None
+}
+
+fn read_persisted_settings(path: &Path) -> io::Result<String> {
+    let file = fs::File::open(path)?;
+    let mut limited = file.take(MAX_PERSISTED_SETTINGS_BYTES.saturating_add(1));
+    let mut raw = String::new();
+    limited.read_to_string(&mut raw)?;
+    if raw.len() as u64 > MAX_PERSISTED_SETTINGS_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted settings exceed the size limit",
+        ));
+    }
+    Ok(raw)
+}
+
+fn parse_persisted_settings(raw: &[u8]) -> Option<PersistedSettings> {
+    if raw.len() as u64 > MAX_PERSISTED_SETTINGS_BYTES {
+        return None;
+    }
+    serde_json::from_slice(raw).ok()
 }
 
 fn resolve_destination(value: &str, fallback: &Path) -> PathBuf {
@@ -620,6 +687,40 @@ fn persist_settings(path: &Path, value: &PersistedSettings) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState::new(
+            DeviceIdentity {
+                id: "11111111-1111-4111-8111-111111111111".to_string(),
+                name: "Test device".to_string(),
+                os: "Test OS".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            Preferences {
+                device_name: "Test device".to_string(),
+                destination: "/tmp".to_string(),
+            },
+            4040,
+        ))
+    }
+
+    fn phase_strategy() -> impl Strategy<Value = TransferPhase> {
+        prop::sample::select(vec![
+            TransferPhase::Preparing,
+            TransferPhase::Requesting,
+            TransferPhase::WaitingForAcceptance,
+            TransferPhase::Accepted,
+            TransferPhase::Transferring,
+            TransferPhase::Verifying,
+            TransferPhase::Completing,
+            TransferPhase::Completed,
+            TransferPhase::Rejected,
+            TransferPhase::Failed,
+            TransferPhase::Canceled,
+        ])
+    }
 
     #[test]
     fn transfer_lifecycle_rejects_impossible_transitions() {
@@ -632,6 +733,83 @@ mod tests {
             .is_ok());
         assert!(lifecycle.transition(TransferPhase::Rejected).is_ok());
         assert!(lifecycle.transition(TransferPhase::Failed).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn lifecycle_never_changes_on_an_illegal_transition(
+            current in phase_strategy(),
+            next in phase_strategy(),
+        ) {
+            let mut lifecycle = TransferLifecycle::new(current);
+            let result = lifecycle.transition(next);
+            if result.is_ok() {
+                prop_assert_eq!(lifecycle.phase(), next);
+            } else {
+                prop_assert_eq!(lifecycle.phase(), current);
+            }
+            if current.is_terminal() {
+                prop_assert_eq!(result.is_ok(), current == next);
+            }
+        }
+    }
+
+    #[test]
+    fn transfer_registry_rejects_invalid_and_stale_ids() {
+        let state = test_state();
+        assert!(state.try_begin_transfer("not-a-uuid").is_err());
+        assert!(state.is_idle());
+
+        let old_id = "22222222-2222-4222-8222-222222222222";
+        let new_id = "33333333-3333-4333-8333-333333333333";
+        assert!(state.try_begin_transfer(old_id).is_ok());
+        let old_cancellation = state.register_cancellation(old_id.to_string());
+        state.finish_transfer(old_id);
+        assert!(!old_cancellation.is_cancelled());
+
+        assert!(state.try_begin_transfer(new_id).is_ok());
+        let new_cancellation = state.register_cancellation(new_id.to_string());
+        state.finish_transfer(old_id);
+        assert!(!state.is_idle());
+        assert!(!new_cancellation.is_cancelled());
+        assert!(state.cancel_transfer(old_id).is_err());
+        assert!(state.cancel_transfer(new_id).is_ok());
+        assert!(new_cancellation.is_cancelled());
+        state.finish_transfer(new_id);
+        assert!(state.is_idle());
+    }
+
+    #[tokio::test]
+    async fn idle_wait_and_repeated_cancellation_are_idempotent() {
+        let state = test_state();
+        let id = "22222222-2222-4222-8222-222222222222";
+        assert!(state.try_begin_transfer(id).is_ok());
+        let waiting_state = state.clone();
+        let waiter = tokio::spawn(async move { waiting_state.wait_until_idle().await });
+        state.finish_transfer(id);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("idle waiter should finish")
+            .expect("idle waiter should not panic");
+
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancellation.cancelled())
+            .await
+            .expect("repeated cancellation should remain immediately observable");
+    }
+
+    #[tokio::test]
+    async fn repeated_pending_decisions_cannot_mutate_a_completed_request() {
+        let state = test_state();
+        let id = "22222222-2222-4222-8222-222222222222";
+        let (sender, receiver) = oneshot::channel();
+        state.add_pending_request(id.to_string(), sender);
+        assert!(state.resolve_pending_request(id, false).is_ok());
+        assert!(state.resolve_pending_request(id, true).is_err());
+        assert!(!receiver.await.expect("decision should be received"));
     }
 
     #[test]
@@ -666,12 +844,16 @@ mod tests {
             destination: directory.to_string_lossy().to_string(),
         };
         let serialized = serde_json::to_string(&value).expect("settings should serialize");
-        let parsed: PersistedSettings =
-            serde_json::from_str(&serialized).expect("settings should parse");
+        let parsed =
+            parse_persisted_settings(serialized.as_bytes()).expect("settings should parse");
         assert!(valid_device_id(&parsed.device_id));
         assert!(valid_device_name(&parsed.device_name));
         assert!(usable_destination(Path::new(&parsed.destination)));
-        assert!(serde_json::from_str::<PersistedSettings>("{\"device_id\":null}").is_err());
+        assert!(parse_persisted_settings(br#"{"device_id":null}"#).is_none());
+        assert!(parse_persisted_settings(
+            br#"{"device_id":"11111111-1111-4111-8111-111111111111","device_name":"x","destination":"/tmp","device_id":"22222222-2222-4222-8222-222222222222"}"#
+        )
+        .is_none());
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -706,5 +888,44 @@ mod tests {
         );
         assert!(!candidate.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_persisted_settings_are_rejected_before_json_parsing() {
+        let oversized = vec![b' '; MAX_PERSISTED_SETTINGS_BYTES as usize + 1];
+        assert!(parse_persisted_settings(&oversized).is_none());
+
+        let path = std::env::temp_dir().join(format!("dead-drop-settings-{}.json", Uuid::new_v4()));
+        fs::write(&path, &oversized).expect("oversized settings fixture should be written");
+        assert!(read_persisted_settings(&path).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_settings_bytes_never_panic(raw in prop::collection::vec(any::<u8>(), 0..=8192)) {
+            let outcome = catch_unwind(AssertUnwindSafe(|| parse_persisted_settings(&raw)));
+            prop_assert!(outcome.is_ok());
+        }
+
+        #[test]
+        fn arbitrary_device_names_never_panic(chars in prop::collection::vec(any::<char>(), 0..=256)) {
+            let value: String = chars.into_iter().collect();
+            let outcome = catch_unwind(AssertUnwindSafe(|| valid_device_name(&value)));
+            prop_assert!(outcome.is_ok());
+            if valid_device_name(&value) {
+                prop_assert!(!value.trim().is_empty());
+                prop_assert!(value.trim().len() <= 64);
+                prop_assert!(value.trim().chars().count() <= 64);
+                prop_assert!(!value.trim().chars().any(|character| character.is_control()));
+            }
+        }
+
+        #[test]
+        fn arbitrary_transfer_ids_are_controlled(chars in prop::collection::vec(any::<char>(), 0..=128)) {
+            let value: String = chars.into_iter().collect();
+            let outcome = catch_unwind(AssertUnwindSafe(|| valid_transfer_id(&value)));
+            prop_assert!(outcome.is_ok());
+        }
     }
 }

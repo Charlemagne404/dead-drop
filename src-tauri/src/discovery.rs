@@ -1,4 +1,4 @@
-use crate::models::{AppState, DeviceIdentity, Peer};
+use crate::models::{AppState, DeviceIdentity, Peer, PROTOCOL_VERSION};
 use crate::protocol::validate_device;
 use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::{
@@ -171,12 +171,12 @@ fn wait_for_retry(state: &AppState) -> bool {
 }
 
 fn peer_from_service(service: &mdns_sd::ResolvedService, local_id: &str) -> Option<Peer> {
-    if !service.is_valid()
-        || service.ty_domain != SERVICE_TYPE
-        || service.get_port() == 0
-        || service
-            .get_property_val_str("transport")
-            .is_some_and(|transport| !transport.eq_ignore_ascii_case(SERVICE_TRANSPORT))
+    if !service.is_valid() || service.ty_domain != SERVICE_TYPE || service.get_port() == 0 {
+        return None;
+    }
+    if !service
+        .get_property_val_str("transport")
+        .is_some_and(|transport| transport.eq_ignore_ascii_case(SERVICE_TRANSPORT))
     {
         return None;
     }
@@ -188,8 +188,10 @@ fn peer_from_service(service: &mdns_sd::ResolvedService, local_id: &str) -> Opti
     }
     let protocol_version = service
         .get_property_val_str("protocol")
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(0);
+        .and_then(|value| value.parse::<u16>().ok())?;
+    if protocol_version != PROTOCOL_VERSION {
+        return None;
+    }
     let identity = DeviceIdentity {
         id: id.clone(),
         name: bounded_property(service.get_property_val_str("name"), "Unnamed device", 64),
@@ -271,6 +273,8 @@ fn report_failure(app: &AppHandle, detail: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[test]
     fn endpoint_selection_keeps_all_usable_ipv4_addresses() {
@@ -348,5 +352,118 @@ mod tests {
         .expect("test service should be valid")
         .as_resolved_service();
         assert!(peer_from_service(&service, local_id).is_none());
+    }
+
+    #[test]
+    fn missing_malformed_and_unsupported_protocol_records_are_ignored() {
+        let local_id = "00000000-0000-0000-0000-000000000001";
+        let peer_id = "00000000-0000-0000-0000-000000000002";
+
+        let missing_protocol = [
+            ("id", peer_id),
+            ("name", "Missing protocol"),
+            ("os", "Linux"),
+            ("transport", SERVICE_TRANSPORT),
+        ];
+        let service = ServiceInfo::new(
+            SERVICE_TYPE,
+            "Dead Drop peer",
+            "dead-drop-peer.local.",
+            "192.168.1.20",
+            4040,
+            &missing_protocol[..],
+        )
+        .expect("test service should be valid")
+        .as_resolved_service();
+        assert!(peer_from_service(&service, local_id).is_none());
+
+        for protocol in ["not-a-version", "0", "2", "65535"] {
+            let properties = [
+                ("id", peer_id),
+                ("name", "Unsupported protocol"),
+                ("os", "Linux"),
+                ("protocol", protocol),
+                ("transport", SERVICE_TRANSPORT),
+            ];
+            let service = ServiceInfo::new(
+                SERVICE_TYPE,
+                "Dead Drop peer",
+                "dead-drop-peer.local.",
+                "192.168.1.20",
+                4040,
+                &properties[..],
+            )
+            .expect("test service should be valid")
+            .as_resolved_service();
+            assert!(peer_from_service(&service, local_id).is_none());
+        }
+    }
+
+    #[test]
+    fn missing_transport_is_not_treated_as_an_ipv4_dead_drop_peer() {
+        let local_id = "00000000-0000-0000-0000-000000000001";
+        let peer_id = "00000000-0000-0000-0000-000000000002";
+        let properties = [
+            ("id", peer_id),
+            ("name", "Missing transport"),
+            ("os", "Linux"),
+            ("protocol", "1"),
+        ];
+        let service = ServiceInfo::new(
+            SERVICE_TYPE,
+            "Dead Drop peer",
+            "dead-drop-peer.local.",
+            "192.168.1.20",
+            4040,
+            &properties[..],
+        )
+        .expect("test service should be valid")
+        .as_resolved_service();
+        assert!(peer_from_service(&service, local_id).is_none());
+    }
+
+    #[test]
+    fn huge_and_controlled_txt_values_use_bounded_fallbacks() {
+        let huge = "x".repeat(100_000);
+        assert_eq!(bounded_property(Some(&huge), "fallback", 64), "fallback");
+        assert_eq!(bounded_property(Some(" \n"), "fallback", 64), "fallback");
+        assert_eq!(bounded_property(None, "fallback", 64), "fallback");
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_txt_values_never_panic(chars in prop::collection::vec(any::<char>(), 0..=512)) {
+            let input: String = chars.into_iter().collect();
+            let outcome = catch_unwind(AssertUnwindSafe(|| bounded_property(Some(&input), "fallback", 64)));
+            prop_assert!(outcome.is_ok());
+            let value = outcome.expect("TXT value handling should not panic");
+            prop_assert!(!value.is_empty());
+            prop_assert!(value.len() <= 64);
+            prop_assert!(!value.chars().any(|character| character.is_control()));
+        }
+
+        #[test]
+        fn arbitrary_ipv4_addresses_only_yield_usable_deduplicated_endpoints(
+            addresses in prop::collection::vec(any::<u32>(), 0..=32),
+            port in any::<u16>(),
+        ) {
+            let input = addresses.into_iter().map(Ipv4Addr::from).collect::<Vec<_>>();
+            let outcome = catch_unwind(AssertUnwindSafe(|| ipv4_endpoints(input, port)));
+            prop_assert!(outcome.is_ok());
+            let endpoints = outcome.expect("endpoint handling should not panic");
+            let mut unique = endpoints.clone();
+            unique.sort();
+            unique.dedup();
+            prop_assert_eq!(unique.len(), endpoints.len());
+            for endpoint in endpoints {
+                prop_assert_eq!(endpoint.port(), port);
+                prop_assert!(!endpoint.ip().is_loopback());
+                prop_assert!(!endpoint.ip().is_unspecified());
+                prop_assert!(!endpoint.ip().is_multicast());
+                if let std::net::IpAddr::V4(address) = endpoint.ip() {
+                    prop_assert!(!address.is_broadcast());
+                }
+            }
+        }
     }
 }
