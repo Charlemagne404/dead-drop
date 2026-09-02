@@ -46,7 +46,7 @@ async fn send_files(
         return Err("That device is no longer available.".to_string());
     }
     if peer.protocol_version != models::PROTOCOL_VERSION {
-        return Err("That device uses a different Dead Drop protocol version.".to_string());
+        return Err("That device uses a different Drop protocol version.".to_string());
     }
     if paths.is_empty() {
         return Err("Choose at least one file to send.".to_string());

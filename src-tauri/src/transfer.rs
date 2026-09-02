@@ -54,7 +54,7 @@ enum TransferError {
     Connection(String),
     #[error("protocol failure: {0}")]
     Protocol(String),
-    #[error("incompatible Dead Drop protocol version")]
+    #[error("incompatible Drop protocol version")]
     IncompatibleVersion,
     #[error("invalid response from the other device: {0}")]
     InvalidPeerResponse(String),
@@ -80,7 +80,7 @@ impl TransferError {
     fn user_message(&self) -> String {
         match self {
             Self::Canceled | Self::RemoteCanceled => "Transfer was cancelled.".to_string(),
-            Self::ShuttingDown => "Dead Drop is closing.".to_string(),
+            Self::ShuttingDown => "Drop is closing.".to_string(),
             Self::Timeout("connect") => "Connection timed out.".to_string(),
             Self::Timeout("decision") => "The transfer request expired.".to_string(),
             Self::Timeout("read") => "Device went offline.".to_string(),
@@ -88,7 +88,7 @@ impl TransferError {
             Self::Timeout(_) => "The other device stopped responding.".to_string(),
             Self::Connection(_) => "Device went offline.".to_string(),
             Self::Protocol(_) => "Transfer protocol error.".to_string(),
-            Self::IncompatibleVersion => "Incompatible Dead Drop version.".to_string(),
+            Self::IncompatibleVersion => "Incompatible Drop version.".to_string(),
             Self::InvalidPeerResponse(_) => {
                 "The other device sent an invalid response.".to_string()
             }
@@ -100,7 +100,7 @@ impl TransferError {
             Self::Destination { .. } => "Destination is unavailable.".to_string(),
             Self::DiskFull => "Not enough space.".to_string(),
             Self::Verification { .. } => "File verification failed.".to_string(),
-            Self::AppUnavailable => "Dead Drop could not show the incoming transfer.".to_string(),
+            Self::AppUnavailable => "Drop could not show the incoming transfer.".to_string(),
         }
     }
 
@@ -691,11 +691,11 @@ async fn handle_incoming(
             device,
         } if protocol_version == crate::models::PROTOCOL_VERSION => device,
         ControlMessage::Hello { .. } => {
-            send_protocol_error(&mut writer, "Incompatible Dead Drop version.").await;
+            send_protocol_error(&mut writer, "Incompatible Drop version.").await;
             return Err(TransferError::IncompatibleVersion);
         }
         _ => {
-            send_protocol_error(&mut writer, "Expected a Dead Drop hello message.").await;
+            send_protocol_error(&mut writer, "Expected a Drop hello message.").await;
             return Err(TransferError::InvalidPeerResponse(
                 "expected a hello message".to_string(),
             ));
@@ -818,7 +818,7 @@ async fn receive_incoming(
     if let Err(error) = events.emit_incoming_transfer(&incoming) {
         state.clear_pending_request(&transfer_id);
         tracker.finish_error(&TransferError::AppUnavailable);
-        send_protocol_error(writer, "Dead Drop could not show the incoming transfer.").await;
+        send_protocol_error(writer, "Drop could not show the incoming transfer.").await;
         eprintln!("[dead-drop][transfer] incoming event failed: {error}");
         return Err(TransferError::AppUnavailable);
     }

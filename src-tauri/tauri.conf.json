@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Dead Drop",
+  "productName": "Drop",
   "version": "0.1.0",
   "identifier": "com.continental.deaddrop",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Dead Drop",
+        "title": "Drop",
         "width": 1120,
         "height": 760,
         "minWidth": 780,
@@ -32,7 +32,7 @@
     "publisher": "Continental",
     "category": "Utility",
     "shortDescription": "Direct file transfer over your local network",
-    "longDescription": "Dead Drop sends files directly between nearby computers on a trusted local network.",
+    "longDescription": "Drop sends files directly between nearby computers on a trusted local network.",
     "copyright": "Copyright © 2026 Continental",
     "icon": [
       "icons/32x32.png",

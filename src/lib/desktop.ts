@@ -75,7 +75,7 @@ export const isNativeRuntime = () =>
 
 export async function chooseFiles(): Promise<string[]> {
   const picked = await open({
-    title: "Choose files to send",
+    title: "Choose files",
     multiple: true,
     directory: false,
   });
@@ -85,7 +85,7 @@ export async function chooseFiles(): Promise<string[]> {
 
 export async function chooseDirectory(): Promise<string | null> {
   const picked = await open({
-    title: "Choose received files folder",
+    title: "Choose receive folder",
     multiple: false,
     directory: true,
   });

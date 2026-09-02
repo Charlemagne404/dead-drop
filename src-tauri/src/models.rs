@@ -322,11 +322,11 @@ impl AppState {
             return Err("Invalid transfer id.".to_string());
         }
         if self.is_shutting_down() {
-            return Err("Dead Drop is shutting down.".to_string());
+            return Err("Drop is shutting down.".to_string());
         }
         let mut active = self.active_transfer.lock();
         if self.is_shutting_down() {
-            return Err("Dead Drop is shutting down.".to_string());
+            return Err("Drop is shutting down.".to_string());
         }
         if active.is_some() {
             return Err("Finish the active transfer before starting another one.".to_string());
@@ -598,9 +598,12 @@ fn usable_destination(path: &Path) -> bool {
 }
 
 fn load_persisted_settings() -> Option<PersistedSettings> {
-    let preferred = platform::settings_path();
-    let legacy = platform::legacy_settings_path();
-    for path in [preferred, legacy].into_iter().flatten() {
+    let paths = [
+        platform::settings_path(),
+        platform::previous_settings_path(),
+        platform::legacy_settings_path(),
+    ];
+    for path in paths.into_iter().flatten() {
         let Ok(raw) = read_persisted_settings(&path) else {
             continue;
         };

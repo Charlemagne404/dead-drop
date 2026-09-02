@@ -5,7 +5,12 @@ use std::{
 
 const QUALIFIER: &str = "com";
 const ORGANIZATION: &str = "Continental";
-const APPLICATION: &str = "Dead Drop";
+const APPLICATION: &str = "Drop";
+const LEGACY_APPLICATION: &str = "Dead Drop";
+
+fn project_dirs(application: &str) -> Option<directories::ProjectDirs> {
+    directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, application)
+}
 
 /// v1 deliberately keeps the transport IPv4-only. Discovery disables IPv6
 /// advertisements as well, so an IPv6 address can never be handed to the
@@ -26,28 +31,33 @@ pub fn default_destination() -> PathBuf {
         .and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
         .filter(|path| path.is_absolute())
     {
-        return downloads.join("Dead Drop");
+        return downloads.join("Drop");
     }
 
     // A missing XDG/known Downloads directory should not silently send files
     // to a volatile temporary directory. Keep a persistent, OS-managed app
     // data location as the next-best fallback.
-    if let Some(project_dirs) = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
-    {
-        return project_dirs.data_local_dir().join("Received");
+    if let Some(dirs) = project_dirs(APPLICATION) {
+        return dirs.data_local_dir().join("Received");
     }
 
-    std::env::temp_dir().join("Dead Drop")
+    std::env::temp_dir().join("Drop")
 }
 
 pub fn settings_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
-        .map(|dirs| dirs.config_local_dir().join("settings.json"))
+    project_dirs(APPLICATION).map(|dirs| dirs.config_local_dir().join("settings.json"))
 }
 
+/// The pre-Plain release stored settings in the application data directory.
+/// Keep this path readable during the display-name migration.
 pub fn legacy_settings_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
-        .map(|dirs| dirs.data_local_dir().join("settings.json"))
+    project_dirs(LEGACY_APPLICATION).map(|dirs| dirs.data_local_dir().join("settings.json"))
+}
+
+/// Releases before the settings hardening pass used the old display name for
+/// the normal per-user configuration directory.
+pub fn previous_settings_path() -> Option<PathBuf> {
+    project_dirs(LEGACY_APPLICATION).map(|dirs| dirs.config_local_dir().join("settings.json"))
 }
 
 pub fn default_case_insensitive_filesystem() -> bool {
@@ -216,6 +226,9 @@ mod tests {
             assert!(path.is_absolute());
         }
         if let Some(path) = legacy_settings_path() {
+            assert!(path.is_absolute());
+        }
+        if let Some(path) = previous_settings_path() {
             assert!(path.is_absolute());
         }
     }

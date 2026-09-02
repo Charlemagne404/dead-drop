@@ -1,6 +1,8 @@
-# Dead Drop
+# Drop
 
-Dead Drop is a small, LAN-only desktop utility for sending files directly between nearby computers. There are no accounts, cloud relays, web dashboard, or telemetry.
+**PLAIN/**
+
+Plain / Drop is the formal product name. Inside the app, it is simply Drop: a small, LAN-only desktop utility for sending files directly between nearby computers. Plain/ is the utility collection; Continental is the parent organization. There are no accounts, cloud relays, web dashboard, or telemetry.
 
 ## Platform support status
 
@@ -14,7 +16,7 @@ The repository has native build paths for each first-class desktop target. “Bu
 | Linux x86_64, Ubuntu/Debian priority | Build-ready | `.deb`, AppImage | Native build and desktop/runtime testing still required |
 | Other Linux distributions and compositor combinations | Untested | Tauri targets may work | Validate WebKitGTK, GTK, file chooser, scaling, and desktop integration on the target distro |
 
-The normal workflow is intended to be identical on all three first-class targets: install Dead Drop, open it, select an automatically discovered peer, choose or drop files, accept on the receiver, and wait for completion. No manual IP configuration is part of the normal flow.
+The normal workflow is intended to be identical on all three first-class targets: install Drop, open it, select an automatically discovered peer, choose or drop files, accept on the receiver, and wait for completion. No manual IP configuration is part of the normal flow.
 
 ## Run it from source
 
@@ -23,11 +25,11 @@ npm ci
 npm run tauri dev
 ```
 
-The native app advertises `_dead-drop._tcp.local.` over mDNS/DNS-SD, discovers peers running the same protocol version, and listens on a random local TCP port.
+The native app advertises `_dead-drop._tcp.local.` over mDNS/DNS-SD, discovers peers running the same protocol version, and listens on a random local TCP port. The service type is retained as a compatibility identifier from the earlier release.
 
 ## LAN and firewall behavior
 
-Dead Drop uses the embedded `mdns-sd` implementation rather than requiring an Avahi or Bonjour daemon. The service follows the same DNS-SD shape on Windows, macOS, and Linux:
+Drop uses the embedded `mdns-sd` implementation rather than requiring an Avahi or Bonjour daemon. The service follows the same DNS-SD shape on Windows, macOS, and Linux:
 
 - service type: `_dead-drop._tcp.local.`
 - stable instance and host names derived from the device UUID
@@ -35,17 +37,19 @@ Dead Drop uses the embedded `mdns-sd` implementation rather than requiring an Av
 - the service advertises every usable local IPv4 address and the receiver tries the candidates in order
 - a device ignores its own UUID and stale or removed services disappear from the peer list
 
-v1 is intentionally IPv4-only. IPv6 advertisements are disabled and IPv6-only networks are not supported until the listener, discovery, and endpoint handling are made dual-stack together. VPN, virtual-machine, bridge, and other local IPv4 addresses are retained as candidates; Dead Drop does not implement Tailscale or remote peer discovery.
+v1 is intentionally IPv4-only. IPv6 advertisements are disabled and IPv6-only networks are not supported until the listener, discovery, and endpoint handling are made dual-stack together. VPN, virtual-machine, bridge, and other local IPv4 addresses are retained as candidates; Drop does not implement Tailscale or remote peer discovery.
 
-The transfer listener binds an ephemeral TCP port on the local IPv4 interfaces so it can survive ordinary Wi-Fi/Ethernet address changes. mDNS uses UDP port 5353. If the operating-system firewall prompts, allow Dead Drop inbound TCP on the trusted private/local network and UDP 5353 multicast. The transfer port is dynamic and is shown in Settings for diagnosis; Dead Drop does not modify firewall rules automatically. Do not expose the listener beyond a trusted LAN: v1 has no transport encryption or trusted-device authentication.
+The transfer listener binds an ephemeral TCP port on the local IPv4 interfaces so it can survive ordinary Wi-Fi/Ethernet address changes. mDNS uses UDP port 5353. If the operating-system firewall prompts, allow Drop inbound TCP on the trusted private/local network and UDP 5353 multicast. The transfer port is dynamic and is shown in Settings for diagnosis; Drop does not modify firewall rules automatically. Do not expose the listener beyond a trusted LAN: v1 has no transport encryption or trusted-device authentication.
 
-After sleep, wake, Wi-Fi changes, DHCP changes, or a temporary mDNS failure, Dead Drop retries discovery and removes stale peers. An active transfer that loses its connection fails cleanly; v1 does not resume partial transfers.
+After sleep, wake, Wi-Fi changes, DHCP changes, or a temporary mDNS failure, Drop retries discovery and removes stale peers. An active transfer that loses its connection fails cleanly; v1 does not resume partial transfers.
 
 ## Filesystem behavior
 
-The default receive folder is the operating system’s Downloads directory followed by `Dead Drop` (for example, `Downloads/Dead Drop`). If that directory is unavailable, Dead Drop falls back to a persistent application-data location rather than silently choosing a volatile temporary directory. A previously saved device ID and name are retained even when a saved destination has been deleted or becomes unavailable. Settings use the platform’s normal per-user configuration directory, and Settings includes the native folder picker. If a receive folder disappears while the app is running—especially a removable or network volume—the transfer fails with a destination error instead of recreating a local directory at the old mount path; choose a new folder in Settings.
+The default receive folder is the operating system’s Downloads directory followed by `Drop` (for example, `Downloads/Drop`). If that directory is unavailable, Drop falls back to a persistent application-data location rather than silently choosing a volatile temporary directory. A previously saved device ID and name are retained even when a saved destination has been deleted or becomes unavailable. Settings use the platform’s normal per-user configuration directory, and Settings includes the native folder picker. If a receive folder disappears while the app is running—especially a removable or network volume—the transfer fails with a destination error instead of recreating a local directory at the old mount path; choose a new folder in Settings.
 
-Received files are content transfers, not filesystem clones. Dead Drop writes ordinary files with the destination filesystem’s default permissions. It does not preserve executable bits, timestamps, extended attributes, quarantine metadata, or Windows ACLs.
+Existing settings are read from both the new Drop location and the previous Dead Drop locations. They are written to the new location on startup. An existing destination is kept exactly as saved; Drop does not move or rename folders that may contain received files.
+
+Received files are content transfers, not filesystem clones. Drop writes ordinary files with the destination filesystem’s default permissions. It does not preserve executable bits, timestamps, extended attributes, quarantine metadata, or Windows ACLs.
 
 Incoming names are normalized to Unicode NFC and converted to a safe representation before any filesystem write. Control characters, separators, Windows-forbidden characters, trailing spaces/dots, and reserved names such as `CON` and `LPT1` are handled safely; for example, `CON.txt` becomes `_CON.txt`. UTF-8 names are bounded without splitting a character, collisions receive a suffix, and an existing file is never overwritten. Wire names cannot escape the configured destination through path traversal. Directories are rejected intentionally in v1; choose regular files.
 
@@ -90,7 +94,7 @@ sudo apt-get install --no-install-recommends \
   librsvg2-dev
 ```
 
-The `.deb` declares the common runtime dependencies `libwebkit2gtk-4.1-0`, `libgtk-3-0`, `libayatana-appindicator3-1`, and `librsvg2-2`. AppImage is also configured, but it still relies on a compatible glibc, WebKitGTK/GTK desktop stack, display server, and file chooser environment. Wayland and X11 are supported through the Tauri/WebKitGTK stack in principle; both compositor paths remain runtime-test items. Dead Drop does not require root for normal use. Avahi is not a Dead Drop runtime requirement because discovery is embedded, but UDP 5353 multicast must be permitted on the local network.
+The `.deb` declares the common runtime dependencies `libwebkit2gtk-4.1-0`, `libgtk-3-0`, `libayatana-appindicator3-1`, and `librsvg2-2`. AppImage is also configured, but it still relies on a compatible glibc, WebKitGTK/GTK desktop stack, display server, and file chooser environment. Wayland and X11 are supported through the Tauri/WebKitGTK stack in principle; both compositor paths remain runtime-test items. Drop does not require root for normal use. Avahi is not a Drop runtime requirement because discovery is embedded, but UDP 5353 multicast must be permitted on the local network.
 
 ## Native packaging commands
 
@@ -121,6 +125,12 @@ The repository’s workflow at `.github/workflows/platform.yml` prepares Linux, 
 - Only one transfer is admitted at a time. Additional requests are declined with a clear busy response instead of competing for shared UI or destination state.
 
 There is no transport encryption, trusted-device authentication, replay protection, internet/port-forwarding support, resume, clipboard sharing, folder sync, or automatic updating in v1. Those protections must be designed before remote support is considered.
+
+## Plain identity and compatibility
+
+`PLAIN/` is the shared Plain wordmark and `/` is its small recurring mark. Drop uses a quiet monochrome interface and Inter typography. The Tauri application identifier remains `com.continental.deaddrop`, and the DNS-SD service type remains `_dead-drop._tcp.local.` so existing upgrades, settings, and peer discovery keep their established identity. The internal Cargo package, crate, and native executable names remain technical build identifiers rather than user-facing product names, avoiding unnecessary target and generated-reference churn.
+
+Inter is bundled from `@fontsource/inter` under the SIL Open Font License 1.1; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Automated local integration tests
 

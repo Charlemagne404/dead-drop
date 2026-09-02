@@ -3,6 +3,10 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { createRoot } from "react-dom/client";
+import "@fontsource/inter/400.css";
+import "@fontsource/inter/500.css";
+import "@fontsource/inter/600.css";
+import "@fontsource/inter/700.css";
 import {
   chooseFiles,
   chooseDirectory,
@@ -37,7 +41,7 @@ const previewPeers: Peer[] = [
 
 const initialPreferences: Preferences = {
   deviceName: "This computer",
-  destination: "Downloads/Dead Drop",
+  destination: "Downloads/Drop",
 };
 
 const previewDiagnostics: RuntimeDiagnostics = {
@@ -85,7 +89,7 @@ function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(
-    native ? null : "Preview mode — local discovery and transfer run in the desktop app.",
+    native ? null : "Preview only — transfers run in the desktop app.",
   );
   const dragDepth = useRef(0);
   const selectedPeerRef = useRef<Peer | null>(null);
@@ -110,7 +114,7 @@ function App() {
           else unlisten();
         })
         .catch(() => {
-          if (mounted) setNotice("Dead Drop could not connect to its local service.");
+          if (mounted) setNotice("Drop could not connect to its local service.");
         });
 
     const start = async () => {
@@ -147,7 +151,7 @@ function App() {
           setNotice("Your receive folder is unavailable. Choose another folder in Settings.");
         }
       } catch {
-        if (mounted) setNotice("Dead Drop could not connect to its local service.");
+        if (mounted) setNotice("Drop could not connect to its local service.");
       }
       if (!mounted) return;
       try {
@@ -199,7 +203,7 @@ function App() {
       return;
     }
     if (peer.protocolVersion !== 1) {
-      setNotice("That device uses a different Dead Drop version.");
+      setNotice("That device uses a different Drop version.");
       return;
     }
     const selectedPaths = paths.filter((path) => path.trim().length > 0);
@@ -230,7 +234,7 @@ function App() {
     try {
       await command.sendFiles(peer.id, selectedPaths);
     } catch (error) {
-      setNotice(userFacingError(error, "Dead Drop could not start the transfer."));
+      setNotice(userFacingError(error, "Drop could not start the transfer."));
     }
   };
   startTransferRef.current = startTransfer;
@@ -252,7 +256,7 @@ function App() {
       const paths = await chooseFiles();
       if (paths.length) await startTransfer(paths);
     } catch (error) {
-      setNotice(userFacingError(error, "Dead Drop could not open the file picker."));
+      setNotice(userFacingError(error, "Drop could not open the file picker."));
     }
   };
 
@@ -289,10 +293,9 @@ function App() {
 
   return (
     <main className="shell" onDragOver={(event) => event.preventDefault()}>
-      <aside className="sidebar" aria-label="Dead Drop navigation">
+      <aside className="sidebar" aria-label="Drop navigation">
         <div className="sidebar-drag" data-tauri-drag-region />
-        <div className="brand" data-tauri-drag-region aria-label="Dead Drop">
-          <span>Dead</span>
+        <div className="brand" data-tauri-drag-region aria-label="Drop">
           <span>Drop</span>
         </div>
         <section className="device-section" aria-label="Nearby devices">
@@ -319,7 +322,7 @@ function App() {
                   <DeviceIcon os={peer.os} />
                   <span className="device-copy">
                     <span title={peer.name}>{peer.name}</span>
-                    <small>{compatible ? peer.os : "Needs a Dead Drop update"}</small>
+                    <small>{compatible ? peer.os : "Needs a Drop update"}</small>
                   </span>
                   <span
                     className={`online-dot ${peer.online ? "" : "is-offline"}`}
@@ -471,14 +474,14 @@ function SendPanel({ peer, onChoose }: { peer: Peer; onChoose: () => void }) {
       <div className="target-context">
         <p className="eyebrow">Send to</p>
         <h1 title={peer.name}>{peer.name}</h1>
-        <p>{compatible ? peer.os : "This device needs a matching Dead Drop version."}</p>
+        <p>{compatible ? peer.os : "This device needs a matching Drop version."}</p>
       </div>
       <div className="drop-prompt">
         <FileIcon />
         <h2>Drop files anywhere</h2>
-        <p>{compatible ? "or choose from your device" : "Choose another nearby device"}</p>
+        <p>{compatible ? "or choose files" : "Choose another nearby device"}</p>
         <button className="outline-button" type="button" onClick={onChoose} disabled={!compatible}>
-          Choose from device
+          Choose files
         </button>
       </div>
     </div>
@@ -491,7 +494,7 @@ function NoDevicePanel() {
       <div className="no-device-copy">
         <RadarIcon />
         <h1>Waiting for a device</h1>
-        <p>Dead Drop will show nearby computers here automatically.</p>
+        <p>Nearby devices appear here automatically.</p>
       </div>
     </div>
   );
@@ -542,7 +545,7 @@ function TransferPanel({
       </div>
       {terminal ? (
         <div className="terminal-copy" aria-live="polite">
-          <p>{complete ? "Transfer complete" : transfer.message ?? phaseLabel(transfer.phase)}</p>
+          <p>{complete ? (transfer.direction === "incoming" ? "Received." : "Sent.") : transfer.message ?? phaseLabel(transfer.phase)}</p>
           <button type="button" className="text-button" onClick={onDone}>Done</button>
         </div>
       ) : (
@@ -563,7 +566,7 @@ function TransferPanel({
             <span>{transferProgressLabel(transfer)}</span>
           </div>
           <button className="text-button" type="button" onClick={() => void cancel()} disabled={cancelling}>
-            {cancelling ? "Cancelling…" : "Cancel transfer"}
+            {cancelling ? "Cancelling…" : "Cancel"}
           </button>
         </>
       )}
@@ -602,7 +605,7 @@ function IncomingPanel({ incoming, onRespond }: { incoming: IncomingTransfer; on
         <button className="primary-button" type="button" onClick={() => void respond(true)} disabled={responding}>Accept</button>
         <button className="outline-button" type="button" onClick={() => void respond(false)} disabled={responding}>Decline</button>
       </div>
-      {responding && <p className="response-caption" aria-live="polite">Sending your decision…</p>}
+      {responding && <p className="response-caption" aria-live="polite">Responding…</p>}
     </div>
   );
 }
@@ -645,13 +648,12 @@ function SettingsPanel({
         void save();
       }}
     >
-      <p className="eyebrow">Settings</p>
-      <h1>Make it yours.</h1>
-      <p className="settings-intro">Dead Drop stays local. It stores only this device name and your chosen receiving folder.</p>
+      <h1>Settings</h1>
+      <p className="settings-intro">Drop stays local. It stores only this device name and receiving folder.</p>
       <div className={`settings-health ${diagnostics?.receiveDirectoryAvailable === false ? "is-warning" : ""}`} role="status">
         <span className="health-mark" aria-hidden="true" />
         <span>
-          <strong>{diagnostics?.receiveDirectoryAvailable === false ? "Receive folder unavailable" : "Ready for local transfers"}</strong>
+          <strong>{diagnostics?.receiveDirectoryAvailable === false ? "Receive folder unavailable" : "Ready"}</strong>
           <small>
             {diagnostics?.transport ?? "IPv4"} mDNS · UDP 5353 · {diagnostics?.listenerPort ? `TCP ${diagnostics.listenerPort}` : "automatic transfer port"}
           </small>
@@ -675,9 +677,15 @@ function SettingsPanel({
       </label>
       {error && <p id="settings-error" className="settings-error" role="alert">{error}</p>}
       <div className="settings-actions">
-        <button type="submit" className="primary-button" disabled={saving}>{saving ? "Saving…" : "Save settings"}</button>
+        <button type="submit" className="primary-button" disabled={saving}>{saving ? "Saving…" : "Save"}</button>
         <button type="button" className="text-button" onClick={onClose} disabled={saving}>Close</button>
       </div>
+      <section className="about-section" aria-labelledby="about-heading">
+        <p className="eyebrow" id="about-heading">About</p>
+        <p className="plain-wordmark">PLAIN/</p>
+        <p className="about-product">Plain / Drop</p>
+        <p className="about-credit">Made by Continental</p>
+      </section>
       {!native && <p className="preview-caption">Changes are shown only in this preview.</p>}
     </form>
   );
@@ -716,17 +724,17 @@ function formatEta(seconds: number) {
 
 function transferStatus(phase: Transfer["phase"], direction: Transfer["direction"]) {
   switch (phase) {
-    case "preparing": return "Preparing files";
-    case "requesting": return direction === "incoming" ? "Connecting" : "Connecting to";
+    case "preparing": return "Preparing";
+    case "requesting": return "Connecting";
     case "waiting_for_acceptance": return "Waiting for acceptance";
     case "accepted": return "Accepted";
-    case "transferring": return direction === "incoming" ? "Receiving from" : "Sending to";
-    case "verifying": return "Verifying files";
-    case "completing": return "Finishing transfer";
+    case "transferring": return direction === "incoming" ? "Receiving" : "Sending";
+    case "verifying": return "Verifying";
+    case "completing": return "Saving";
     case "completed": return direction === "incoming" ? "Received" : "Sent";
-    case "rejected": return "Request declined";
-    case "canceled": return "Transfer cancelled";
-    case "failed": return "Transfer failed";
+    case "rejected": return "Declined";
+    case "canceled": return "Cancelled";
+    case "failed": return "Failed";
   }
 }
 
