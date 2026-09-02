@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 const CONTROL_FRAME: u8 = 1;
@@ -48,11 +49,11 @@ pub enum ControlMessage {
     },
     FileStart {
         transfer_id: String,
-        file_index: usize,
+        file_index: u32,
     },
     FileEnd {
         transfer_id: String,
-        file_index: usize,
+        file_index: u32,
     },
     Complete {
         transfer_id: String,
@@ -217,7 +218,7 @@ pub fn validate_control_message(message: &ControlMessage) -> Result<(), Protocol
             file_index,
         } => {
             validate_transfer_id(transfer_id)?;
-            if *file_index >= MAX_TRANSFER_FILES {
+            if *file_index >= MAX_TRANSFER_FILES as u32 {
                 return Err(ProtocolError::InvalidMessage(
                     "file index exceeds the transfer limit".to_string(),
                 ));
@@ -315,8 +316,53 @@ pub fn safe_file_name(name: &str) -> bool {
     {
         return false;
     }
+    !is_windows_reserved_name(name)
+}
+
+/// Convert a local filename into a portable wire filename. Unix can create
+/// names that Windows cannot represent, while macOS may provide decomposed
+/// Unicode. The original path is never sent; only this safe basename is.
+pub fn portable_file_name(name: &str) -> String {
+    let mut portable = name
+        .nfc()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+
+    if portable.is_empty() {
+        portable.push('_');
+    }
+    replace_trailing_windows_markers(&mut portable);
+    truncate_utf8(&mut portable, MAX_FILENAME_BYTES);
+    if portable.is_empty() {
+        portable.push('_');
+    }
+    replace_trailing_windows_markers(&mut portable);
+    if is_windows_reserved_name(&portable) {
+        portable.insert(0, '_');
+        truncate_utf8(&mut portable, MAX_FILENAME_BYTES);
+        replace_trailing_windows_markers(&mut portable);
+    }
+    if safe_file_name(&portable) {
+        portable
+    } else {
+        "_".to_string()
+    }
+}
+
+fn is_windows_reserved_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name);
-    !matches!(
+    matches!(
         stem.to_ascii_uppercase().as_str(),
         "CON"
             | "PRN"
@@ -340,7 +386,38 @@ pub fn safe_file_name(name: &str) -> bool {
             | "LPT7"
             | "LPT8"
             | "LPT9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
     )
+}
+
+fn replace_trailing_windows_markers(value: &mut String) {
+    let mut trailing_bytes = 0;
+    let mut trailing_characters = 0;
+    for character in value.chars().rev() {
+        if matches!(character, ' ' | '.') {
+            trailing_bytes += character.len_utf8();
+            trailing_characters += 1;
+        } else {
+            break;
+        }
+    }
+    if trailing_bytes > 0 {
+        value.truncate(value.len() - trailing_bytes);
+        for _ in 0..trailing_characters {
+            value.push('_');
+        }
+    }
+}
+
+fn truncate_utf8(value: &mut String, maximum_bytes: usize) {
+    while value.len() > maximum_bytes {
+        value.pop();
+    }
 }
 
 fn valid_bounded_text(value: &str, maximum_bytes: usize) -> bool {
@@ -478,6 +555,7 @@ mod tests {
         assert!(!safe_file_name("CON.txt"));
         assert!(!safe_file_name("trailing. "));
         assert!(!safe_file_name("wild*card.txt"));
+        assert!(!safe_file_name("LPT9.tar"));
         assert!(!safe_file_name(&"a".repeat(MAX_FILENAME_BYTES + 1)));
         assert!(validate_control_message(&ControlMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
@@ -490,6 +568,57 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             device: mismatched_device,
         })
+        .is_err());
+    }
+
+    #[test]
+    fn portable_file_names_preserve_valid_unicode_and_map_invalid_windows_names() {
+        assert_eq!(portable_file_name("photo copy.txt"), "photo copy.txt");
+        assert_eq!(portable_file_name("archive.tar.gz"), "archive.tar.gz");
+        assert_eq!(portable_file_name(".env"), ".env");
+        assert_eq!(portable_file_name("zero-byte"), "zero-byte");
+        assert_eq!(portable_file_name("åäö 📦.txt"), "åäö 📦.txt");
+        assert_eq!(portable_file_name("東京の資料.txt"), "東京の資料.txt");
+        assert_eq!(portable_file_name("e\u{301}.txt"), "é.txt");
+        assert_eq!(portable_file_name("CON.txt"), "_CON.txt");
+        assert_eq!(portable_file_name("report:2026.txt"), "report_2026.txt");
+        assert_eq!(portable_file_name("../../secret.txt"), ".._.._secret.txt");
+        assert_eq!(portable_file_name("trailing. "), "trailing__");
+        assert_eq!(portable_file_name("."), "_");
+        assert!(safe_file_name(&portable_file_name(
+            "a".repeat(400).as_str()
+        )));
+    }
+
+    #[test]
+    fn portable_file_names_are_bounded_without_splitting_utf8() {
+        let portable = portable_file_name(&"😀".repeat(200));
+        assert!(portable.len() <= MAX_FILENAME_BYTES);
+        assert!(safe_file_name(&portable));
+    }
+
+    #[test]
+    fn large_file_sizes_use_u64_without_overflowing_the_request_contract() {
+        let size = 5_u64 * 1024 * 1024 * 1024;
+        assert!(validate_transfer_request(
+            "33333333-3333-4333-8333-333333333333",
+            &[TransferFile {
+                name: "large.bin".to_string(),
+                size,
+                sha256: "0".repeat(64),
+            }],
+            size,
+        )
+        .is_ok());
+        assert!(validate_transfer_request(
+            "33333333-3333-4333-8333-333333333333",
+            &[TransferFile {
+                name: "overflow.bin".to_string(),
+                size: u64::MAX,
+                sha256: "0".repeat(64),
+            }],
+            u64::MAX,
+        )
         .is_err());
     }
 

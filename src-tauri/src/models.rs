@@ -1,9 +1,10 @@
-use directories::ProjectDirs;
+use crate::platform;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -41,6 +42,8 @@ pub struct Peer {
     pub service_fullname: String,
     #[serde(skip)]
     pub last_seen: Option<Instant>,
+    #[serde(skip)]
+    pub endpoint_candidates: Vec<SocketAddr>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,6 +169,15 @@ pub struct StartupSnapshot {
     pub device: DeviceIdentity,
     pub preferences: Preferences,
     pub peers: Vec<Peer>,
+    pub diagnostics: RuntimeDiagnostics,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeDiagnostics {
+    pub transport: String,
+    pub listener_port: u16,
+    pub receive_directory_available: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -228,13 +240,16 @@ impl AppState {
                 "[dead-drop][settings] could not prepare the default receive folder: {error}"
             );
         }
-        let stored = Self::settings_path()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|raw| serde_json::from_str::<PersistedSettings>(&raw).ok())
+        let stored = load_persisted_settings()
             .filter(|settings| {
-                valid_device_id(&settings.device_id)
-                    && valid_device_name(&settings.device_name)
-                    && usable_destination(Path::new(&settings.destination))
+                valid_device_id(&settings.device_id) && valid_device_name(&settings.device_name)
+            })
+            .map(|settings| PersistedSettings {
+                device_id: settings.device_id,
+                device_name: settings.device_name,
+                destination: resolve_destination(&settings.destination, &fallback_destination)
+                    .to_string_lossy()
+                    .to_string(),
             })
             .unwrap_or_else(|| PersistedSettings {
                 device_id: Uuid::new_v4().to_string(),
@@ -247,7 +262,7 @@ impl AppState {
             device: RwLock::new(DeviceIdentity {
                 id: stored.device_id,
                 name: stored_device_name.clone(),
-                os: platform_name(),
+                os: platform::platform_name(),
                 protocol_version: PROTOCOL_VERSION,
             }),
             preferences: RwLock::new(Preferences {
@@ -269,8 +284,7 @@ impl AppState {
     }
 
     fn settings_path() -> Option<PathBuf> {
-        ProjectDirs::from("com", "Continental", "Dead Drop")
-            .map(|dirs| dirs.data_local_dir().join("settings.json"))
+        platform::settings_path()
     }
 
     fn persist(&self) -> Result<(), String> {
@@ -406,6 +420,7 @@ impl AppState {
             let changed = existing.name != peer.name
                 || existing.os != peer.os
                 || existing.endpoint != peer.endpoint
+                || existing.endpoint_candidates != peer.endpoint_candidates
                 || existing.protocol_version != peer.protocol_version
                 || existing.online != peer.online
                 || existing.service_fullname != peer.service_fullname;
@@ -423,6 +438,15 @@ impl AppState {
         let before = peers.len();
         peers.retain(|_, peer| peer.service_fullname != service_fullname);
         peers.len() != before
+    }
+
+    pub fn clear_peers(&self) -> bool {
+        let mut peers = self.peers.write();
+        if peers.is_empty() {
+            return false;
+        }
+        peers.clear();
+        true
     }
 
     pub fn remove_stale_peers(&self, now: Instant, stale_after: std::time::Duration) -> bool {
@@ -480,34 +504,30 @@ impl AppState {
             device: self.device(),
             preferences: self.preferences(),
             peers: self.peers(),
+            diagnostics: self.runtime_diagnostics(),
         }
     }
-}
 
-fn platform_name() -> String {
-    match std::env::consts::OS {
-        "macos" => "macOS".to_string(),
-        "windows" => "Windows".to_string(),
-        "linux" => "Linux".to_string(),
-        other => other.to_string(),
+    pub fn runtime_diagnostics(&self) -> RuntimeDiagnostics {
+        let preferences = self.preferences();
+        RuntimeDiagnostics {
+            transport: platform::TRANSPORT_NAME.to_string(),
+            listener_port: self.listener_port,
+            receive_directory_available: usable_destination(Path::new(&preferences.destination)),
+        }
     }
 }
 
 fn default_device_name() -> String {
     hostname::get()
         .ok()
-        .and_then(|value| value.into_string().ok())
-        .map(|value| value.trim().to_string())
+        .map(|value| value.to_string_lossy().trim().to_string())
         .filter(|value| valid_device_name(value))
         .unwrap_or_else(|| "This computer".to_string())
 }
 
 fn default_destination() -> PathBuf {
-    directories::UserDirs::new()
-        .and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Dead Drop")
+    platform::default_destination()
 }
 
 fn valid_device_id(value: &str) -> bool {
@@ -527,8 +547,30 @@ fn valid_device_name(value: &str) -> bool {
 fn usable_destination(path: &Path) -> bool {
     path.is_absolute()
         && fs::metadata(path)
-            .map(|metadata| metadata.is_dir())
+            .map(|metadata| metadata.is_dir() && !metadata.permissions().readonly())
             .unwrap_or(false)
+}
+
+fn load_persisted_settings() -> Option<PersistedSettings> {
+    let preferred = platform::settings_path();
+    let legacy = platform::legacy_settings_path();
+    for path in [preferred, legacy].into_iter().flatten() {
+        let Ok(raw) = fs::read_to_string(path) else {
+            continue;
+        };
+        if let Ok(settings) = serde_json::from_str::<PersistedSettings>(&raw) {
+            return Some(settings);
+        }
+    }
+    None
+}
+
+fn resolve_destination(value: &str, fallback: &Path) -> PathBuf {
+    let candidate = PathBuf::from(value.trim());
+    if candidate.is_absolute() && usable_destination(&candidate) {
+        return candidate;
+    }
+    fallback.to_path_buf()
 }
 
 fn ensure_destination(path: &Path) -> Result<(), String> {
@@ -545,6 +587,9 @@ fn ensure_destination(path: &Path) -> Result<(), String> {
     let metadata = fs::metadata(path).map_err(|_| "Destination is unavailable.".to_string())?;
     if !metadata.is_dir() {
         return Err("Destination is unavailable.".to_string());
+    }
+    if metadata.permissions().readonly() {
+        return Err("Destination is unavailable or read-only.".to_string());
     }
     Ok(())
 }
@@ -566,11 +611,7 @@ fn persist_settings(path: &Path, value: &PersistedSettings) -> Result<(), String
         let _ = fs::remove_file(&temporary);
         return Err(error.to_string());
     }
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| error.to_string())?;
-    }
-    fs::rename(&temporary, path).map_err(|error| {
+    platform::replace_file(&temporary, path).map_err(|error| {
         let _ = fs::remove_file(&temporary);
         error.to_string()
     })
@@ -632,5 +673,38 @@ mod tests {
         assert!(usable_destination(Path::new(&parsed.destination)));
         assert!(serde_json::from_str::<PersistedSettings>("{\"device_id\":null}").is_err());
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn peer_serialization_keeps_the_ui_endpoint_contract_private() {
+        let peer = Peer {
+            id: "11111111-1111-4111-8111-111111111111".to_string(),
+            name: "Test peer".to_string(),
+            os: "Linux".to_string(),
+            endpoint: "192.168.1.20:4040".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            online: true,
+            service_fullname: "Test peer._dead-drop._tcp.local.".to_string(),
+            last_seen: None,
+            endpoint_candidates: vec!["192.168.1.20:4040".parse().unwrap()],
+        };
+        let value = serde_json::to_value(peer).expect("peer should serialize");
+        assert_eq!(value["endpoint"], "192.168.1.20:4040");
+        assert!(value.get("endpointCandidates").is_none());
+        assert!(value.get("serviceFullname").is_none());
+    }
+
+    #[test]
+    fn unavailable_persisted_destination_falls_back_without_recreating_a_mount_path() {
+        let root = std::env::temp_dir().join(format!("dead-drop-destination-{}", Uuid::new_v4()));
+        let candidate = root.join("removed-volume").join("Dead Drop");
+        let fallback = root.join("fallback");
+        fs::create_dir_all(&fallback).expect("fallback directory should be created");
+        assert_eq!(
+            resolve_destination(&candidate.to_string_lossy(), &fallback),
+            fallback
+        );
+        assert!(!candidate.exists());
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -57,10 +57,17 @@ export type Preferences = {
   destination: string;
 };
 
+export type RuntimeDiagnostics = {
+  transport: string;
+  listenerPort: number;
+  receiveDirectoryAvailable: boolean;
+};
+
 export type InitialState = {
   device: Device;
   preferences: Preferences;
   peers: Peer[];
+  diagnostics: RuntimeDiagnostics;
 };
 
 export const isNativeRuntime = () =>
@@ -74,6 +81,15 @@ export async function chooseFiles(): Promise<string[]> {
   });
   if (!picked) return [];
   return Array.isArray(picked) ? picked.map(String) : [String(picked)];
+}
+
+export async function chooseDirectory(): Promise<string | null> {
+  const picked = await open({
+    title: "Choose received files folder",
+    multiple: false,
+    directory: true,
+  });
+  return picked ? String(picked) : null;
 }
 
 export const command = {

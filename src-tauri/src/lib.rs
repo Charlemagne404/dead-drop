@@ -1,5 +1,6 @@
 mod discovery;
 mod models;
+mod platform;
 mod protocol;
 mod transfer;
 

@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 directories = "6"
 hostname = "0.4"
+libc = "0.2"
 mdns-sd = "0.21"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
@@ -24,5 +25,5 @@ tauri = { version = "2.11", features = [] }
 tauri-plugin-dialog = "2.7"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
-

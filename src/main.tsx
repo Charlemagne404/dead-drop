@@ -5,11 +5,13 @@ import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { createRoot } from "react-dom/client";
 import {
   chooseFiles,
+  chooseDirectory,
   command,
   isNativeRuntime,
   type IncomingTransfer,
   type Peer,
   type Preferences,
+  type RuntimeDiagnostics,
   type Transfer,
 } from "./lib/desktop";
 import "./styles.css";
@@ -36,6 +38,12 @@ const previewPeers: Peer[] = [
 const initialPreferences: Preferences = {
   deviceName: "This computer",
   destination: "Downloads/Dead Drop",
+};
+
+const previewDiagnostics: RuntimeDiagnostics = {
+  transport: "IPv4",
+  listenerPort: 0,
+  receiveDirectoryAvailable: true,
 };
 
 const phaseOrder: Record<Transfer["phase"], number> = {
@@ -69,6 +77,9 @@ function App() {
   const [peers, setPeers] = useState<Peer[]>(native ? [] : previewPeers);
   const [selectedId, setSelectedId] = useState<string | null>(native ? null : previewPeers[0].id);
   const [preferences, setPreferences] = useState<Preferences>(initialPreferences);
+  const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics | null>(
+    native ? null : previewDiagnostics,
+  );
   const [activeTransfer, setActiveTransfer] = useState<Transfer | null>(null);
   const [incoming, setIncoming] = useState<IncomingTransfer | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -131,6 +142,10 @@ function App() {
         if (!mounted) return;
         setPeers(snapshot.peers);
         setPreferences(snapshot.preferences);
+        setDiagnostics(snapshot.diagnostics);
+        if (!snapshot.diagnostics.receiveDirectoryAvailable) {
+          setNotice("Your receive folder is unavailable. Choose another folder in Settings.");
+        }
       } catch {
         if (mounted) setNotice("Dead Drop could not connect to its local service.");
       }
@@ -368,6 +383,7 @@ function App() {
             <SettingsPanel
               native={native}
               preferences={preferences}
+              diagnostics={diagnostics}
               onClose={() => setIsSettingsOpen(false)}
               onSave={async (draft) => {
                 if (!native) {
@@ -377,6 +393,9 @@ function App() {
                 }
                 const saved = await command.updatePreferences(draft);
                 setPreferences(saved);
+                setDiagnostics((current) =>
+                  current ? { ...current, receiveDirectoryAvailable: true } : current,
+                );
                 setNotice("Settings saved. Nearby devices will refresh shortly.");
               }}
             />
@@ -591,11 +610,13 @@ function IncomingPanel({ incoming, onRespond }: { incoming: IncomingTransfer; on
 function SettingsPanel({
   native,
   preferences,
+  diagnostics,
   onClose,
   onSave,
 }: {
   native: boolean;
   preferences: Preferences;
+  diagnostics: RuntimeDiagnostics | null;
   onClose: () => void;
   onSave: (draft: Preferences) => Promise<void>;
 }) {
@@ -627,11 +648,30 @@ function SettingsPanel({
       <p className="eyebrow">Settings</p>
       <h1>Make it yours.</h1>
       <p className="settings-intro">Dead Drop stays local. It stores only this device name and your chosen receiving folder.</p>
+      <div className={`settings-health ${diagnostics?.receiveDirectoryAvailable === false ? "is-warning" : ""}`} role="status">
+        <span className="health-mark" aria-hidden="true" />
+        <span>
+          <strong>{diagnostics?.receiveDirectoryAvailable === false ? "Receive folder unavailable" : "Ready for local transfers"}</strong>
+          <small>
+            {diagnostics?.transport ?? "IPv4"} mDNS · UDP 5353 · {diagnostics?.listenerPort ? `TCP ${diagnostics.listenerPort}` : "automatic transfer port"}
+          </small>
+        </span>
+      </div>
       <label htmlFor="device-name">Device name
         <input id="device-name" value={draft.deviceName} maxLength={64} autoComplete="off" aria-invalid={Boolean(error)} aria-describedby={error ? "settings-error" : undefined} onChange={(event) => setDraft({ ...draft, deviceName: event.target.value })} />
       </label>
       <label htmlFor="received-folder">Received files folder
-        <input id="received-folder" value={draft.destination} inputMode="text" autoComplete="off" spellCheck={false} aria-invalid={Boolean(error)} aria-describedby={error ? "settings-error" : undefined} onChange={(event) => setDraft({ ...draft, destination: event.target.value })} />
+        <span className="path-field">
+          <input id="received-folder" value={draft.destination} inputMode="text" autoComplete="off" spellCheck={false} aria-invalid={Boolean(error)} aria-describedby={error ? "settings-error" : undefined} onChange={(event) => setDraft({ ...draft, destination: event.target.value })} />
+          {native && <button type="button" className="outline-button path-button" onClick={async () => {
+            try {
+              const destination = await chooseDirectory();
+              if (destination) setDraft((current) => ({ ...current, destination }));
+            } catch (reason) {
+              setError(userFacingError(reason, "The folder picker could not be opened."));
+            }
+          }}>Choose…</button>}
+        </span>
       </label>
       {error && <p id="settings-error" className="settings-error" role="alert">{error}</p>}
       <div className="settings-actions">

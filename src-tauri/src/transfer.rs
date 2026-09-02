@@ -1,18 +1,20 @@
 use crate::{
     models::{
         AppState, Cancellation, DeviceIdentity, IncomingTransfer, Peer, TransferFile,
-        TransferLifecycle, TransferPhase, TransferSnapshot, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES,
+        TransferLifecycle, TransferPhase, TransferSnapshot, MAX_FILENAME_BYTES, MAX_TRANSFER_BYTES,
+        MAX_TRANSFER_FILES,
     },
+    platform,
     protocol::{
-        read_frame, validate_transfer_request, write_control, write_data, ControlMessage, Frame,
-        ProtocolError,
+        portable_file_name, read_frame, validate_transfer_request, write_control, write_data,
+        ControlMessage, Frame, ProtocolError,
     },
 };
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     io::ErrorKind,
-    net::TcpListener as StdTcpListener,
+    net::{SocketAddr, TcpListener as StdTcpListener},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -64,8 +66,6 @@ enum TransferError {
     Prepare { detail: String },
     #[error("selected item is not a regular file")]
     UnsupportedSelection,
-    #[error("selected file name is not supported")]
-    UnsupportedFileName,
     #[error("destination error: {detail}")]
     Destination { detail: String },
     #[error("destination ran out of space")]
@@ -97,7 +97,6 @@ impl TransferError {
             }
             Self::FileRead { .. } | Self::Prepare { .. } => "File could not be read.".to_string(),
             Self::UnsupportedSelection => "Only files can be sent.".to_string(),
-            Self::UnsupportedFileName => "That file name is not supported.".to_string(),
             Self::Destination { .. } => "Destination is unavailable.".to_string(),
             Self::DiskFull => "Not enough space.".to_string(),
             Self::Verification { .. } => "File verification failed.".to_string(),
@@ -355,7 +354,13 @@ async fn send_files(
     tracker.transition(TransferPhase::Requesting, None);
     check_cancelled(cancellation, shutdown)?;
 
-    let stream = connect_to_peer(&peer.endpoint, cancellation, shutdown).await?;
+    let stream = connect_to_peer(
+        &peer.endpoint_candidates,
+        &peer.endpoint,
+        cancellation,
+        shutdown,
+    )
+    .await?;
     let _ = stream.set_nodelay(true);
     let (mut reader, mut writer) = stream.into_split();
     write_control_with_timeout(
@@ -487,7 +492,7 @@ async fn send_files(
                 &mut writer,
                 &ControlMessage::FileStart {
                     transfer_id: transfer_id.to_string(),
-                    file_index: index,
+                    file_index: index as u32,
                 },
                 cancellation,
                 shutdown,
@@ -542,7 +547,7 @@ async fn send_files(
                 &mut writer,
                 &ControlMessage::FileEnd {
                     transfer_id: transfer_id.to_string(),
-                    file_index: index,
+                    file_index: index as u32,
                 },
                 cancellation,
                 shutdown,
@@ -612,6 +617,7 @@ async fn handle_incoming(
 ) -> Result<(), TransferError> {
     let shutdown = state.shutdown_token();
     let connection_cancellation = Cancellation::new();
+    let _ = stream.set_nodelay(true);
     let (mut reader, mut writer) = stream.into_split();
     let sender = match read_control_with_timeout(
         &mut reader,
@@ -815,8 +821,14 @@ async fn receive_incoming(
         return finish_incoming_error(writer, &mut tracker, &transfer_id, &error, &mut Vec::new())
             .await;
     }
-    if let Err(error) = fs::create_dir_all(&directory).await {
-        let error = destination_error(error);
+    let directory_available = fs::metadata(&directory)
+        .await
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false);
+    if !directory_available {
+        let error = TransferError::Destination {
+            detail: "configured destination folder is unavailable".to_string(),
+        };
         return finish_incoming_error(writer, &mut tracker, &transfer_id, &error, &mut Vec::new())
             .await;
     }
@@ -903,7 +915,7 @@ async fn receive_files(
             ControlMessage::FileStart {
                 transfer_id: received_id,
                 file_index,
-            } if received_id == transfer_id && file_index == index => {}
+            } if received_id == transfer_id && file_index == index as u32 => {}
             ControlMessage::Cancel {
                 transfer_id: received_id,
             } if received_id == transfer_id => return Err(TransferError::RemoteCanceled),
@@ -967,7 +979,7 @@ async fn receive_files(
                 Frame::Control(ControlMessage::FileEnd {
                     transfer_id: received_id,
                     file_index,
-                }) if received_id == transfer_id && file_index == index => break,
+                }) if received_id == transfer_id && file_index == index as u32 => break,
                 Frame::Control(ControlMessage::Cancel {
                     transfer_id: received_id,
                 }) if received_id == transfer_id => return Err(TransferError::RemoteCanceled),
@@ -1028,9 +1040,8 @@ async fn prepare_files(
         let source = PathBuf::from(&raw_path);
         let source_name = source
             .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("selected item")
-            .to_string();
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "selected item".to_string());
         let metadata = fs::metadata(&source).await.map_err(|error| {
             eprintln!("[dead-drop][file] could not access {source_name}: {error}");
             TransferError::FileRead {
@@ -1041,12 +1052,7 @@ async fn prepare_files(
         if !metadata.is_file() {
             return Err(TransferError::UnsupportedSelection);
         }
-        let name = source
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| crate::protocol::safe_file_name(name))
-            .ok_or(TransferError::UnsupportedFileName)?
-            .to_string();
+        let name = portable_file_name(&source_name);
         total_bytes =
             total_bytes
                 .checked_add(metadata.len())
@@ -1097,9 +1103,8 @@ fn checksum_file(
     let mut file = std::fs::File::open(path).map_err(|error| TransferError::FileRead {
         name: path
             .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("selected file")
-            .to_string(),
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "selected file".to_string()),
         detail: error.to_string(),
     })?;
     let mut hasher = Sha256::new();
@@ -1116,9 +1121,8 @@ fn checksum_file(
             .map_err(|error| TransferError::FileRead {
                 name: path
                     .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("selected file")
-                    .to_string(),
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "selected file".to_string()),
                 detail: error.to_string(),
             })?;
         if count == 0 {
@@ -1147,8 +1151,8 @@ fn available_destination_path(
     for index in 0..=MAX_COLLISION_ATTEMPTS {
         let candidate_name = match (index, extension) {
             (0, _) => name.to_string(),
-            (_, Some(extension)) => format!("{stem} ({index}).{extension}"),
-            (_, None) => format!("{stem} ({index})"),
+            (_, Some(extension)) => collision_name(stem, extension, index),
+            (_, None) => collision_name(stem, "", index),
         };
         let candidate = directory.join(candidate_name);
         let key = path_key(&candidate);
@@ -1161,10 +1165,57 @@ fn available_destination_path(
     })
 }
 
+fn collision_name(stem: &str, extension: &str, index: u32) -> String {
+    let suffix = format!(" ({index})");
+    let extension = extension.strip_prefix('.').unwrap_or(extension);
+    if extension.is_empty() {
+        let mut truncated_stem = stem.to_string();
+        truncate_utf8(
+            &mut truncated_stem,
+            MAX_FILENAME_BYTES.saturating_sub(suffix.len()),
+        );
+        return format!("{truncated_stem}{suffix}");
+    }
+
+    let extension_budget = MAX_FILENAME_BYTES
+        .saturating_sub(suffix.len())
+        .saturating_sub(1);
+    let extension = truncate_utf8_copy(extension, extension_budget);
+    if extension.is_empty() {
+        let mut truncated_stem = stem.to_string();
+        truncate_utf8(
+            &mut truncated_stem,
+            MAX_FILENAME_BYTES.saturating_sub(suffix.len()),
+        );
+        return format!("{truncated_stem}{suffix}");
+    }
+    let stem_budget = MAX_FILENAME_BYTES
+        .saturating_sub(suffix.len())
+        .saturating_sub(extension.len())
+        .saturating_sub(1);
+    let mut truncated_stem = stem.to_string();
+    truncate_utf8(&mut truncated_stem, stem_budget);
+    format!("{truncated_stem}{suffix}.{extension}")
+}
+
+fn truncate_utf8(value: &mut String, maximum_bytes: usize) {
+    while value.len() > maximum_bytes {
+        value.pop();
+    }
+}
+
+fn truncate_utf8_copy(value: &str, maximum_bytes: usize) -> String {
+    let mut copy = value.to_string();
+    truncate_utf8(&mut copy, maximum_bytes);
+    copy
+}
+
 fn path_key(path: &Path) -> String {
-    let value = path.to_string_lossy().to_string();
-    if cfg!(windows) {
-        value.to_ascii_lowercase()
+    use unicode_normalization::UnicodeNormalization;
+
+    let value: String = path.to_string_lossy().nfc().collect();
+    if platform::default_case_insensitive_filesystem() {
+        value.to_lowercase()
     } else {
         value
     }
@@ -1177,17 +1228,12 @@ async fn finalize_staged_file(
 ) -> Result<(), TransferError> {
     let mut final_path = staged.final_path.clone();
     for index in 0..=MAX_COLLISION_ATTEMPTS {
-        match fs::hard_link(&staged.temporary, &final_path).await {
+        match move_staged_file(&staged.temporary, &final_path).await {
             Ok(()) => {
-                if let Err(error) = fs::remove_file(&staged.temporary).await {
-                    eprintln!(
-                        "[dead-drop][file] could not remove temporary file after finalization: {error}"
-                    );
-                }
                 staged.final_path = final_path;
                 return Ok(());
             }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            Err(error) if is_already_exists(&error) => {
                 if index == MAX_COLLISION_ATTEMPTS {
                     break;
                 }
@@ -1199,6 +1245,35 @@ async fn finalize_staged_file(
     Err(TransferError::Destination {
         detail: "could not reserve a unique destination name".to_string(),
     })
+}
+
+async fn move_staged_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    match platform::move_file_without_overwrite(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if can_fallback_to_hard_link(&error) => {
+            fs::hard_link(source, destination).await?;
+            if let Err(remove_error) = fs::remove_file(source).await {
+                eprintln!(
+                    "[dead-drop][file] could not remove temporary file after hard-link finalization: {remove_error}"
+                );
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_already_exists(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::AlreadyExists
+        || matches!(error.raw_os_error(), Some(17) | Some(80) | Some(183))
+}
+
+fn can_fallback_to_hard_link(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::Unsupported
+        || matches!(
+            error.raw_os_error(),
+            Some(1) | Some(22) | Some(38) | Some(45) | Some(50) | Some(87) | Some(95) | Some(524)
+        )
 }
 
 async fn cleanup_staged(staged: &[StagedFile]) {
@@ -1295,21 +1370,46 @@ async fn write_decision(
 }
 
 async fn connect_to_peer(
-    endpoint: &str,
+    endpoints: &[SocketAddr],
+    fallback_endpoint: &str,
     cancellation: &Cancellation,
     shutdown: &Cancellation,
 ) -> Result<TcpStream, TransferError> {
-    tokio::select! {
-        result = timeout(CONNECT_TIMEOUT, TcpStream::connect(endpoint)) => {
-            match result {
-                Ok(Ok(stream)) => Ok(stream),
-                Ok(Err(error)) => Err(TransferError::Connection(error.to_string())),
-                Err(_) => Err(TransferError::Timeout("connect")),
-            }
+    let mut candidates = endpoints.to_vec();
+    if candidates.is_empty() {
+        if let Ok(endpoint) = fallback_endpoint.parse::<SocketAddr>() {
+            candidates.push(endpoint);
         }
-        _ = cancellation.cancelled() => Err(TransferError::Canceled),
-        _ = shutdown.cancelled() => Err(TransferError::ShuttingDown),
     }
+    if candidates.is_empty() {
+        return Err(TransferError::Connection(
+            "peer did not advertise a usable IPv4 endpoint".to_string(),
+        ));
+    }
+
+    let mut last_error = None;
+    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    for endpoint in candidates {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            last_error = Some("connection timed out".to_string());
+            break;
+        }
+        tokio::select! {
+            result = timeout(remaining, TcpStream::connect(endpoint)) => {
+                match result {
+                    Ok(Ok(stream)) => return Ok(stream),
+                    Ok(Err(error)) => last_error = Some(error.to_string()),
+                    Err(_) => last_error = Some("connection timed out".to_string()),
+                }
+            }
+            _ = cancellation.cancelled() => return Err(TransferError::Canceled),
+            _ = shutdown.cancelled() => return Err(TransferError::ShuttingDown),
+        }
+    }
+    Err(TransferError::Connection(
+        last_error.unwrap_or_else(|| "could not connect to peer".to_string()),
+    ))
 }
 
 async fn read_frame_with_timeout(
@@ -1608,7 +1708,7 @@ fn same_device_id(left: &str, right: &str) -> bool {
 
 fn destination_error(error: std::io::Error) -> TransferError {
     eprintln!("[dead-drop][file] destination operation failed: {error}");
-    if matches!(error.raw_os_error(), Some(28) | Some(112)) {
+    if matches!(error.raw_os_error(), Some(28) | Some(39) | Some(112)) {
         TransferError::DiskFull
     } else {
         TransferError::Destination {
@@ -1652,6 +1752,20 @@ mod tests {
     }
 
     #[test]
+    fn checksum_supports_zero_byte_files() {
+        let path = std::env::temp_dir().join(format!("dead-drop-empty-{}.bin", Uuid::new_v4()));
+        std::fs::File::create(&path).expect("empty test file should be created");
+        let cancellation = Arc::new(Cancellation::new());
+        let digest = checksum_file(&path, cancellation.as_ref(), cancellation.as_ref())
+            .expect("empty file hash should work");
+        assert_eq!(
+            digest,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn destination_collision_names_are_unique_within_a_batch() {
         let directory = std::env::temp_dir().join(format!("dead-drop-dir-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&directory).expect("test directory should be created");
@@ -1671,6 +1785,35 @@ mod tests {
             Some("file (2).txt")
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn collision_names_remain_within_the_platform_filename_limit() {
+        let directory =
+            std::env::temp_dir().join(format!("dead-drop-long-name-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("test directory should be created");
+        let name = format!("{}.txt", "a".repeat(MAX_FILENAME_BYTES - 4));
+        std::fs::write(directory.join(&name), b"existing")
+            .expect("existing long file should be written");
+        let mut used = HashSet::new();
+        let collision = available_destination_path(&directory, &name, &mut used)
+            .expect("long collision path should be available");
+        assert!(
+            collision
+                .file_name()
+                .expect("collision should have a filename")
+                .len()
+                <= MAX_FILENAME_BYTES
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn collision_keys_normalize_unicode_equivalents() {
+        assert_eq!(
+            path_key(Path::new("café.txt")),
+            path_key(Path::new("cafe\u{301}.txt"))
+        );
     }
 
     #[test]
