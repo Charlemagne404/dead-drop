@@ -1,0 +1,11 @@
+hello	{"type":"hello","protocol_version":1,"device":{"id":"11111111-1111-4111-8111-111111111111","name":"Test device","os":"Test OS","protocolVersion":1}}
+protocol_error	{"type":"protocol_error","message":"peer rejected the request"}
+transfer_request	{"type":"transfer_request","transfer_id":"33333333-3333-4333-8333-333333333333","files":[{"name":"sample.txt","size":4,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"},{"name":"archive.tar.gz","size":5,"sha256":"1111111111111111111111111111111111111111111111111111111111111111"}],"total_bytes":9}
+transfer_decision_accept	{"type":"transfer_decision","transfer_id":"33333333-3333-4333-8333-333333333333","accepted":true,"reason":null}
+transfer_decision_decline	{"type":"transfer_decision","transfer_id":"33333333-3333-4333-8333-333333333333","accepted":false,"reason":"Declined by the recipient."}
+file_start	{"type":"file_start","transfer_id":"33333333-3333-4333-8333-333333333333","file_index":1}
+file_end	{"type":"file_end","transfer_id":"33333333-3333-4333-8333-333333333333","file_index":1}
+complete	{"type":"complete","transfer_id":"33333333-3333-4333-8333-333333333333"}
+transfer_result_success	{"type":"transfer_result","transfer_id":"33333333-3333-4333-8333-333333333333","success":true,"reason":null}
+transfer_result_failure	{"type":"transfer_result","transfer_id":"33333333-3333-4333-8333-333333333333","success":false,"reason":"File verification failed."}
+cancel	{"type":"cancel","transfer_id":"33333333-3333-4333-8333-333333333333"}

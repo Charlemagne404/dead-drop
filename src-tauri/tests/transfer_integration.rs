@@ -1,6 +1,6 @@
 use dead_drop_lib::test_support::{
-    DeviceIdentity, IncomingTransfer, Peer, TestEventSink, TestPeer, TransferPhase, TransferRun,
-    TransferSnapshot, PROTOCOL_VERSION,
+    DeviceIdentity, Endpoint, EndpointSource, IncomingTransfer, Peer, RouteClass, TestEventSink,
+    TestPeer, TransferPhase, TransferRun, TransferSnapshot, PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -242,17 +242,19 @@ fn fake_identity(name: &str) -> DeviceIdentity {
 }
 
 fn fake_peer(identity: &DeviceIdentity, address: SocketAddr) -> Peer {
-    Peer {
-        id: identity.id.clone(),
-        name: identity.name.clone(),
-        os: identity.os.clone(),
-        endpoint: address.to_string(),
-        protocol_version: identity.protocol_version,
-        online: true,
-        service_fullname: format!("{}._dead-drop._tcp.local.", identity.id),
-        last_seen: None,
-        endpoint_candidates: vec![address],
-    }
+    Peer::new(
+        identity.clone(),
+        vec![Endpoint::new(
+            address,
+            EndpointSource::new(
+                "test-discovery",
+                "ipv4",
+                format!("{}._dead-drop._tcp.local.", identity.id),
+            ),
+            RouteClass::DirectLocal,
+            std::time::Instant::now(),
+        )],
+    )
 }
 
 async fn run_fake_peer_until_data_disconnect(listener: TcpListener, identity: DeviceIdentity) {

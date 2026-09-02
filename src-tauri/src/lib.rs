@@ -1,7 +1,9 @@
 mod discovery;
 mod models;
+mod peer;
 mod platform;
 mod protocol;
+mod routing;
 #[cfg(any(test, feature = "integration-tests"))]
 pub mod test_support;
 mod transfer;
@@ -42,7 +44,7 @@ async fn send_files(
     let peer = state
         .peer(&peer_id)
         .ok_or_else(|| "That device is no longer available.".to_string())?;
-    if !peer.online {
+    if !peer.is_online() {
         return Err("That device is no longer available.".to_string());
     }
     if peer.protocol_version != models::PROTOCOL_VERSION {

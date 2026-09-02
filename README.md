@@ -115,6 +115,9 @@ The repository’s workflow at `.github/workflows/platform.yml` prepares Linux, 
 
 ## Transfer contract
 
+The formal v1 discovery, framing, message, integrity, and compatibility
+contract is documented in [docs/PROTOCOL_V1.md](docs/PROTOCOL_V1.md).
+
 - Each connection begins with a versioned `Hello` exchange.
 - A `TransferRequest` includes every filename, byte size, and SHA-256 digest.
 - The recipient must explicitly accept or decline each request.

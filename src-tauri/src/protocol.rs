@@ -79,9 +79,17 @@ pub async fn write_control<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &ControlMessage,
 ) -> Result<(), ProtocolError> {
-    validate_control_message(message)?;
-    let payload = serde_json::to_vec(message)?;
+    let payload = encode_control_message(message)?;
     write_frame(writer, CONTROL_FRAME, &payload).await
+}
+
+/// Encode one validated v1 control message as compact UTF-8 JSON.
+///
+/// The JSON object shape is the wire contract; object member ordering is only
+/// fixed here so local golden fixtures can detect accidental serializer drift.
+pub fn encode_control_message(message: &ControlMessage) -> Result<Vec<u8>, ProtocolError> {
+    validate_control_message(message)?;
+    Ok(serde_json::to_vec(message)?)
 }
 
 pub async fn write_data<W: AsyncWrite + Unpin>(
@@ -300,6 +308,11 @@ pub fn validate_transfer_id(value: &str) -> Result<(), ProtocolError> {
             "transfer id cannot be empty".to_string(),
         ));
     }
+    if id.to_string() != value {
+        return Err(ProtocolError::InvalidMessage(
+            "transfer id must use canonical lowercase hyphenated UUID format".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -479,7 +492,7 @@ mod tests {
     use crate::models::{DeviceIdentity, TransferFile, PROTOCOL_VERSION};
     use proptest::prelude::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     fn device() -> DeviceIdentity {
         DeviceIdentity {
@@ -503,6 +516,112 @@ mod tests {
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload);
         frame
+    }
+
+    fn golden_payload(name: &str) -> &'static [u8] {
+        include_str!("../protocol-fixtures/v1-control.golden")
+            .lines()
+            .find_map(|line| {
+                let (fixture_name, payload) = line.split_once('\t')?;
+                (fixture_name == name).then_some(payload.as_bytes())
+            })
+            .unwrap_or_else(|| panic!("missing v1 control fixture {name}"))
+    }
+
+    fn golden_messages() -> Vec<(&'static str, ControlMessage)> {
+        let transfer_id = "33333333-3333-4333-8333-333333333333".to_string();
+        let zero_digest = "0".repeat(64);
+        let one_digest = "1".repeat(64);
+        vec![
+            (
+                "hello",
+                ControlMessage::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    device: device(),
+                },
+            ),
+            (
+                "protocol_error",
+                ControlMessage::ProtocolError {
+                    message: "peer rejected the request".to_string(),
+                },
+            ),
+            (
+                "transfer_request",
+                ControlMessage::TransferRequest {
+                    transfer_id: transfer_id.clone(),
+                    files: vec![
+                        TransferFile {
+                            name: "sample.txt".to_string(),
+                            size: 4,
+                            sha256: zero_digest,
+                        },
+                        TransferFile {
+                            name: "archive.tar.gz".to_string(),
+                            size: 5,
+                            sha256: one_digest,
+                        },
+                    ],
+                    total_bytes: 9,
+                },
+            ),
+            (
+                "transfer_decision_accept",
+                ControlMessage::TransferDecision {
+                    transfer_id: transfer_id.clone(),
+                    accepted: true,
+                    reason: None,
+                },
+            ),
+            (
+                "transfer_decision_decline",
+                ControlMessage::TransferDecision {
+                    transfer_id: transfer_id.clone(),
+                    accepted: false,
+                    reason: Some("Declined by the recipient.".to_string()),
+                },
+            ),
+            (
+                "file_start",
+                ControlMessage::FileStart {
+                    transfer_id: transfer_id.clone(),
+                    file_index: 1,
+                },
+            ),
+            (
+                "file_end",
+                ControlMessage::FileEnd {
+                    transfer_id: transfer_id.clone(),
+                    file_index: 1,
+                },
+            ),
+            (
+                "complete",
+                ControlMessage::Complete {
+                    transfer_id: transfer_id.clone(),
+                },
+            ),
+            (
+                "transfer_result_success",
+                ControlMessage::TransferResult {
+                    transfer_id: transfer_id.clone(),
+                    success: true,
+                    reason: None,
+                },
+            ),
+            (
+                "transfer_result_failure",
+                ControlMessage::TransferResult {
+                    transfer_id: transfer_id.clone(),
+                    success: false,
+                    reason: Some("File verification failed.".to_string()),
+                },
+            ),
+            (
+                "cancel",
+                ControlMessage::Cancel { transfer_id },
+            ),
+        ]
     }
 
     fn valid_control_messages() -> impl Strategy<Value = ControlMessage> {
@@ -658,6 +777,67 @@ mod tests {
     }
 
     #[test]
+    fn v1_control_payloads_match_golden_fixtures() {
+        for (name, message) in golden_messages() {
+            let encoded = encode_control_message(&message).expect("message should encode");
+            assert_eq!(encoded, golden_payload(name), "fixture {name} changed");
+            assert_eq!(
+                decode_control_message(golden_payload(name)).expect("fixture should decode"),
+                message,
+                "fixture {name} no longer describes its message"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_frame_writer_uses_the_stable_header_and_network_byte_order() {
+        let message = golden_messages()
+            .into_iter()
+            .find(|(name, _)| *name == "transfer_request")
+            .map(|(_, message)| message)
+            .expect("transfer request fixture should exist");
+        let payload = golden_payload("transfer_request");
+        let (mut sender, mut receiver) = duplex(payload.len() + FRAME_HEADER_SIZE + 16);
+        let writer = tokio::spawn(async move {
+            write_control(&mut sender, &message)
+                .await
+                .expect("control frame should write");
+        });
+        let mut encoded = vec![0_u8; FRAME_HEADER_SIZE + payload.len()];
+        receiver
+            .read_exact(&mut encoded)
+            .await
+            .expect("complete control frame should be readable");
+        writer.await.expect("control writer should finish");
+
+        assert_eq!(&encoded[..FRAME_HEADER_SIZE], &[CONTROL_FRAME, 0, 0, 1, 68]);
+        let mut expected = vec![CONTROL_FRAME];
+        expected.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        expected.extend_from_slice(payload);
+        assert_eq!(encoded, expected);
+    }
+
+    #[tokio::test]
+    async fn data_frame_writer_uses_the_same_five_byte_big_endian_header() {
+        let (mut sender, mut receiver) = duplex(32);
+        let writer = tokio::spawn(async move {
+            write_data(&mut sender, b"payload")
+                .await
+                .expect("data frame should write");
+        });
+        let mut encoded = vec![0_u8; FRAME_HEADER_SIZE + 7];
+        receiver
+            .read_exact(&mut encoded)
+            .await
+            .expect("complete data frame should be readable");
+        writer.await.expect("data writer should finish");
+        assert_eq!(
+            encoded,
+            [vec![DATA_FRAME, 0, 0, 0, 7], b"payload".to_vec()].concat()
+        );
+    }
+
+    #[test]
     fn request_and_filename_limits_are_defensive() {
         assert!(validate_transfer_request(
             "33333333-3333-4333-8333-333333333333",
@@ -798,6 +978,53 @@ mod tests {
             device: remote,
         };
         assert!(validate_control_message(&message).is_ok());
+    }
+
+    #[test]
+    fn known_messages_ignore_unknown_optional_fields_but_unknown_types_are_not_extensions() {
+        let hello = br#"{"type":"hello","protocol_version":1,"device":{"id":"11111111-1111-4111-8111-111111111111","name":"Test device","os":"Test OS","protocolVersion":1,"future_capability":true},"future_optional":true}"#;
+        assert!(matches!(
+            decode_control_message(hello),
+            Ok(ControlMessage::Hello { .. })
+        ));
+
+        let cancel = br#"{"type":"cancel","transfer_id":"33333333-3333-4333-8333-333333333333","future_optional":true}"#;
+        assert!(matches!(
+            decode_control_message(cancel),
+            Ok(ControlMessage::Cancel { .. })
+        ));
+
+        let request = br#"{"type":"transfer_request","transfer_id":"33333333-3333-4333-8333-333333333333","files":[{"name":"sample.txt","size":4,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","future_metadata":{"kind":"opaque"}}],"total_bytes":4,"future_optional":null}"#;
+        assert!(matches!(
+            decode_control_message(request),
+            Ok(ControlMessage::TransferRequest { .. })
+        ));
+
+        let decision_without_reason = br#"{"type":"transfer_decision","transfer_id":"33333333-3333-4333-8333-333333333333","accepted":true}"#;
+        assert!(matches!(
+            decode_control_message(decision_without_reason),
+            Ok(ControlMessage::TransferDecision { reason: None, .. })
+        ));
+
+        assert!(decode_control_message(br#"{"type":"future_message"}"#).is_err());
+    }
+
+    #[test]
+    fn transfer_ids_are_canonical_before_the_v1_wire_contract_is_frozen() {
+        assert!(validate_transfer_id("33333333-3333-4333-8333-333333333333").is_ok());
+        let canonical = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert!(validate_transfer_id(canonical).is_ok());
+        let uppercase = canonical.to_ascii_uppercase();
+        for alternate in [
+            "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa",
+            uppercase.as_str(),
+            "urn:uuid:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        ] {
+            assert!(
+                validate_transfer_id(alternate).is_err(),
+                "alternate UUID spelling should be rejected: {alternate}"
+            );
+        }
     }
 
     #[test]

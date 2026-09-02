@@ -9,9 +9,12 @@ use std::{
 use tokio::{sync::Notify, task::JoinHandle, time::timeout};
 use uuid::Uuid;
 
-pub use crate::models::{
-    DeviceIdentity, IncomingTransfer, Peer, Preferences, TransferFile, TransferPhase,
-    TransferSnapshot, PROTOCOL_VERSION,
+pub use crate::{
+    models::{
+        DeviceIdentity, IncomingTransfer, Peer, Preferences, TransferFile, TransferPhase,
+        TransferSnapshot, PROTOCOL_VERSION,
+    },
+    peer::{Endpoint, EndpointSource, RouteClass},
 };
 
 /// In-memory event sink for protocol and transfer tests. It keeps test runs
@@ -362,17 +365,19 @@ impl TestPeer {
     }
 
     pub fn peer_record(&self) -> Peer {
-        Peer {
-            id: self.identity.id.clone(),
-            name: self.identity.name.clone(),
-            os: self.identity.os.clone(),
-            endpoint: self.address.to_string(),
-            protocol_version: self.identity.protocol_version,
-            online: true,
-            service_fullname: format!("{}._dead-drop._tcp.local.", self.identity.id),
-            last_seen: Some(Instant::now()),
-            endpoint_candidates: vec![self.address],
-        }
+        Peer::new(
+            self.identity.clone(),
+            vec![Endpoint::new(
+                self.address,
+                EndpointSource::new(
+                    "test-discovery",
+                    "ipv4",
+                    format!("{}._dead-drop._tcp.local.", self.identity.id),
+                ),
+                RouteClass::DirectLocal,
+                Instant::now(),
+            )],
+        )
     }
 
     pub fn start_send_to(
@@ -575,17 +580,20 @@ mod tests {
         let events = Arc::new(RecordingEventSink::default());
         let id = "22222222-2222-4222-8222-222222222222";
         assert!(state.try_begin_transfer(id).is_ok());
-        let peer = crate::models::Peer {
-            id: "33333333-3333-4333-8333-333333333333".to_string(),
-            name: "Test peer".to_string(),
-            os: "Test OS".to_string(),
-            endpoint: "127.0.0.1:1".to_string(),
-            protocol_version: PROTOCOL_VERSION,
-            online: true,
-            service_fullname: "test._dead-drop._tcp.local.".to_string(),
-            last_seen: None,
-            endpoint_candidates: Vec::new(),
-        };
+        let peer = crate::models::Peer::new(
+            crate::models::DeviceIdentity {
+                id: "33333333-3333-4333-8333-333333333333".to_string(),
+                name: "Test peer".to_string(),
+                os: "Test OS".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            vec![crate::peer::Endpoint::new(
+                "127.0.0.1:1".parse().unwrap(),
+                crate::models::EndpointSource::new("test", "ipv4", "test"),
+                crate::peer::RouteClass::DirectLocal,
+                std::time::Instant::now(),
+            )],
+        );
         transfer::run_outgoing_with_events(
             events.clone(),
             state.clone(),

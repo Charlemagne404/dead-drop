@@ -1,3 +1,6 @@
+pub use crate::peer::{
+    DeviceIdentity, DiscoveryObservation, EndpointSource, Peer, PeerRegistry, PeerSnapshot,
+};
 use crate::platform;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -5,13 +8,11 @@ use std::{
     collections::HashMap,
     fs,
     io::{self, Read},
-    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Instant,
 };
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -21,32 +22,6 @@ pub const MAX_TRANSFER_FILES: usize = 256;
 pub const MAX_FILENAME_BYTES: usize = 255;
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 const MAX_PERSISTED_SETTINGS_BYTES: u64 = 64 * 1024;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceIdentity {
-    pub id: String,
-    pub name: String,
-    pub os: String,
-    pub protocol_version: u16,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Peer {
-    pub id: String,
-    pub name: String,
-    pub os: String,
-    pub endpoint: String,
-    pub protocol_version: u16,
-    pub online: bool,
-    #[serde(skip)]
-    pub service_fullname: String,
-    #[serde(skip)]
-    pub last_seen: Option<Instant>,
-    #[serde(skip)]
-    pub endpoint_candidates: Vec<SocketAddr>,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,7 +145,7 @@ pub struct PreferencesDraft {
 pub struct StartupSnapshot {
     pub device: DeviceIdentity,
     pub preferences: Preferences,
-    pub peers: Vec<Peer>,
+    pub peers: Vec<PeerSnapshot>,
     pub diagnostics: RuntimeDiagnostics,
 }
 
@@ -193,7 +168,7 @@ struct PersistedSettings {
 pub struct AppState {
     device: RwLock<DeviceIdentity>,
     preferences: RwLock<Preferences>,
-    peers: RwLock<HashMap<String, Peer>>,
+    peers: RwLock<PeerRegistry>,
     pending_requests: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     cancellations: Mutex<HashMap<String, Arc<Cancellation>>>,
     active_transfer: Mutex<Option<String>>,
@@ -288,7 +263,7 @@ impl AppState {
         Self {
             device: RwLock::new(device),
             preferences: RwLock::new(preferences),
-            peers: RwLock::new(HashMap::new()),
+            peers: RwLock::new(PeerRegistry::new()),
             pending_requests: Mutex::new(HashMap::new()),
             cancellations: Mutex::new(HashMap::new()),
             active_transfer: Mutex::new(None),
@@ -437,65 +412,32 @@ impl AppState {
         self.preferences.read().clone()
     }
 
-    pub fn peers(&self) -> Vec<Peer> {
-        let mut peers: Vec<_> = self.peers.read().values().cloned().collect();
-        peers.sort_by(|left, right| {
-            left.name
-                .to_lowercase()
-                .cmp(&right.name.to_lowercase())
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        peers
+    pub fn peers(&self) -> Vec<PeerSnapshot> {
+        self.peers.read().snapshots()
     }
 
     pub fn peer(&self, id: &str) -> Option<Peer> {
-        self.peers.read().get(id).cloned()
+        self.peers.read().peer(id)
     }
 
-    pub fn upsert_peer(&self, peer: Peer) -> bool {
-        let mut peers = self.peers.write();
-        if let Some(existing) = peers.get_mut(&peer.id) {
-            let changed = existing.name != peer.name
-                || existing.os != peer.os
-                || existing.endpoint != peer.endpoint
-                || existing.endpoint_candidates != peer.endpoint_candidates
-                || existing.protocol_version != peer.protocol_version
-                || existing.online != peer.online
-                || existing.service_fullname != peer.service_fullname;
-            existing.last_seen = peer.last_seen;
-            if !changed {
-                return false;
-            }
-        }
-        peers.insert(peer.id.clone(), peer);
-        true
+    pub fn apply_discovery_observation(&self, observation: DiscoveryObservation) -> bool {
+        self.peers.write().apply_observation(observation)
     }
 
-    pub fn remove_peer_by_service(&self, service_fullname: &str) -> bool {
-        let mut peers = self.peers.write();
-        let before = peers.len();
-        peers.retain(|_, peer| peer.service_fullname != service_fullname);
-        peers.len() != before
+    pub fn remove_endpoint_source(&self, source: &EndpointSource) -> bool {
+        self.peers.write().remove_endpoint_source(source)
     }
 
-    pub fn clear_peers(&self) -> bool {
-        let mut peers = self.peers.write();
-        if peers.is_empty() {
-            return false;
-        }
-        peers.clear();
-        true
+    pub fn remove_discovery_source(&self, discovery: &str) -> bool {
+        self.peers.write().remove_discovery_source(discovery)
     }
 
-    pub fn remove_stale_peers(&self, now: Instant, stale_after: std::time::Duration) -> bool {
-        let mut peers = self.peers.write();
-        let before = peers.len();
-        peers.retain(|_, peer| {
-            peer.last_seen
-                .map(|last_seen| now.saturating_duration_since(last_seen) <= stale_after)
-                .unwrap_or(false)
-        });
-        peers.len() != before
+    pub fn remove_stale_peers(
+        &self,
+        now: std::time::Instant,
+        stale_after: std::time::Duration,
+    ) -> bool {
+        self.peers.write().remove_stale(now, stale_after)
     }
 
     pub fn add_pending_request(&self, id: String, sender: oneshot::Sender<bool>) {
@@ -690,6 +632,7 @@ fn persist_settings(path: &Path, value: &PersistedSettings) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::{Endpoint, EndpointSource, RouteClass};
     use proptest::prelude::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -862,18 +805,22 @@ mod tests {
 
     #[test]
     fn peer_serialization_keeps_the_ui_endpoint_contract_private() {
-        let peer = Peer {
-            id: "11111111-1111-4111-8111-111111111111".to_string(),
-            name: "Test peer".to_string(),
-            os: "Linux".to_string(),
-            endpoint: "192.168.1.20:4040".to_string(),
-            protocol_version: PROTOCOL_VERSION,
-            online: true,
-            service_fullname: "Test peer._dead-drop._tcp.local.".to_string(),
-            last_seen: None,
-            endpoint_candidates: vec!["192.168.1.20:4040".parse().unwrap()],
-        };
-        let value = serde_json::to_value(peer).expect("peer should serialize");
+        let peer = Peer::new(
+            DeviceIdentity {
+                id: "11111111-1111-4111-8111-111111111111".to_string(),
+                name: "Test peer".to_string(),
+                os: "Linux".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            vec![Endpoint::new(
+                "192.168.1.20:4040".parse().unwrap(),
+                EndpointSource::new("mdns", "ipv4", "test-service"),
+                RouteClass::DirectLocal,
+                std::time::Instant::now(),
+            )],
+        );
+        let value = serde_json::to_value(PeerSnapshot::from(&peer))
+            .expect("peer snapshot should serialize");
         assert_eq!(value["endpoint"], "192.168.1.20:4040");
         assert!(value.get("endpointCandidates").is_none());
         assert!(value.get("serviceFullname").is_none());

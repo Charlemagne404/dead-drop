@@ -412,13 +412,8 @@ async fn send_files(
     tracker.transition(TransferPhase::Requesting, None);
     check_cancelled(cancellation, shutdown)?;
 
-    let stream = connect_to_peer(
-        &peer.endpoint_candidates,
-        &peer.endpoint,
-        cancellation,
-        shutdown,
-    )
-    .await?;
+    let route_candidates = peer.route_candidates();
+    let stream = connect_to_peer(&route_candidates, cancellation, shutdown).await?;
     let _ = stream.set_nodelay(true);
     let (mut reader, mut writer) = stream.into_split();
     write_control_with_timeout(
@@ -1434,17 +1429,10 @@ async fn write_decision(
 
 async fn connect_to_peer(
     endpoints: &[SocketAddr],
-    fallback_endpoint: &str,
     cancellation: &Cancellation,
     shutdown: &Cancellation,
 ) -> Result<TcpStream, TransferError> {
-    let mut candidates = endpoints.to_vec();
-    if candidates.is_empty() {
-        if let Ok(endpoint) = fallback_endpoint.parse::<SocketAddr>() {
-            candidates.push(endpoint);
-        }
-    }
-    if candidates.is_empty() {
+    if endpoints.is_empty() {
         return Err(TransferError::Connection(
             "peer did not advertise a usable IPv4 endpoint".to_string(),
         ));
@@ -1452,7 +1440,7 @@ async fn connect_to_peer(
 
     let mut last_error = None;
     let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
-    for endpoint in candidates {
+    for endpoint in endpoints {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             last_error = Some("connection timed out".to_string());
@@ -1788,8 +1776,9 @@ fn speed_for(transferred: u64, started_at: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::{Endpoint, EndpointSource, RouteClass};
     use proptest::prelude::*;
-    use std::io::Write;
+    use std::{io::Write, net::Ipv4Addr};
     use uuid::Uuid;
 
     #[test]
@@ -1984,5 +1973,45 @@ mod tests {
         );
         assert!(!temporary.exists());
         let _ = fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn connection_falls_back_to_the_next_ranked_endpoint() {
+        let preferred_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("temporary listener should bind");
+        let preferred_address = preferred_listener
+            .local_addr()
+            .expect("temporary listener address should be available");
+        drop(preferred_listener);
+
+        let fallback_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("fallback listener should bind");
+        let fallback_address = fallback_listener
+            .local_addr()
+            .expect("fallback listener address should be available");
+        let source = EndpointSource::new("test", "ipv4", "test-source");
+        let now = Instant::now();
+        let endpoints = vec![
+            Endpoint::new(
+                preferred_address,
+                source.clone(),
+                RouteClass::DirectLocal,
+                now,
+            ),
+            Endpoint::new(fallback_address, source, RouteClass::Overlay, now),
+        ];
+
+        let candidates = crate::routing::ordered_addresses(&endpoints);
+        let stream = connect_to_peer(&candidates, &Cancellation::new(), &Cancellation::new())
+            .await
+            .expect("connection should fall back to the second endpoint");
+        let (_accepted, accepted_address) = fallback_listener
+            .accept()
+            .await
+            .expect("fallback listener should accept the connection");
+        assert!(accepted_address.ip().is_loopback());
+        drop(stream);
     }
 }

@@ -1,5 +1,8 @@
-use crate::models::{AppState, DeviceIdentity, Peer, PROTOCOL_VERSION};
 use crate::protocol::validate_device;
+use crate::{
+    models::{AppState, DeviceIdentity, PROTOCOL_VERSION},
+    peer::{DiscoveryObservation, DiscoverySource, Endpoint, RouteClass},
+};
 use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -12,9 +15,28 @@ use uuid::Uuid;
 
 const SERVICE_TYPE: &str = "_dead-drop._tcp.local.";
 const SERVICE_TRANSPORT: &str = "ipv4";
+const MDNS_SOURCE_ID: &str = "mdns";
 const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_STALE_AFTER: Duration = Duration::from_secs(75);
 const DISCOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+struct MdnsDiscoverySource;
+
+impl DiscoverySource for MdnsDiscoverySource {
+    fn id(&self) -> &'static str {
+        MDNS_SOURCE_ID
+    }
+}
+
+impl MdnsDiscoverySource {
+    fn observe(
+        &self,
+        service: &mdns_sd::ResolvedService,
+        local_id: &str,
+    ) -> Option<DiscoveryObservation> {
+        observation_from_service(service, local_id)
+    }
+}
 
 pub fn start(state: Arc<AppState>, app: AppHandle) {
     let failure_app = app.clone();
@@ -33,7 +55,7 @@ fn run(state: Arc<AppState>, app: AppHandle) {
             Ok(()) => return,
             Err(_error) if state.is_shutting_down() => return,
             Err(error) => {
-                if state.clear_peers() {
+                if state.remove_discovery_source(MDNS_SOURCE_ID) {
                     emit_peers(&app, &state);
                 }
                 report_failure(&app, &error);
@@ -75,6 +97,7 @@ fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
         }
     };
     eprintln!("[dead-drop][discovery] advertising and browsing for IPv4 peers");
+    let source = MdnsDiscoverySource;
     let local_id = state.device().id;
     let mut advertised_name = state.device().name;
     let mut last_purge = Instant::now();
@@ -99,14 +122,16 @@ fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
         match receiver.recv_timeout(EVENT_POLL_INTERVAL) {
             Ok(event) => match event {
                 ServiceEvent::ServiceResolved(service) => {
-                    if let Some(peer) = peer_from_service(&service, &local_id) {
-                        if state.upsert_peer(peer) {
+                    if let Some(observation) = source.observe(&service, &local_id) {
+                        if state.apply_discovery_observation(observation) {
                             emit_peers(app, state);
                         }
                     }
                 }
                 ServiceEvent::ServiceRemoved(_, service_fullname)
-                    if state.remove_peer_by_service(&service_fullname) =>
+                    if state.remove_endpoint_source(
+                        &source.endpoint_source(SERVICE_TRANSPORT, &service_fullname),
+                    ) =>
                 {
                     emit_peers(app, state);
                 }
@@ -170,7 +195,10 @@ fn wait_for_retry(state: &AppState) -> bool {
     true
 }
 
-fn peer_from_service(service: &mdns_sd::ResolvedService, local_id: &str) -> Option<Peer> {
+fn observation_from_service(
+    service: &mdns_sd::ResolvedService,
+    local_id: &str,
+) -> Option<DiscoveryObservation> {
     if !service.is_valid() || service.ty_domain != SERVICE_TYPE || service.get_port() == 0 {
         return None;
     }
@@ -202,18 +230,25 @@ fn peer_from_service(service: &mdns_sd::ResolvedService, local_id: &str) -> Opti
         eprintln!("[dead-drop][discovery] ignored peer with invalid identity");
         return None;
     }
-    let endpoint_candidates = ipv4_endpoints(service.get_addresses_v4(), service.get_port());
-    let endpoint = endpoint_candidates.first()?.to_string();
-    Some(Peer {
-        id,
-        name: identity.name,
-        os: identity.os,
-        endpoint,
-        protocol_version,
-        online: true,
-        service_fullname: service.get_fullname().to_string(),
-        last_seen: Some(Instant::now()),
-        endpoint_candidates,
+    let discovery_source = MdnsDiscoverySource;
+    let endpoint_source =
+        discovery_source.endpoint_source(SERVICE_TRANSPORT, service.get_fullname());
+    let last_seen = Instant::now();
+    let endpoints = ipv4_endpoints(service.get_addresses_v4(), service.get_port())
+        .into_iter()
+        .map(|address| {
+            Endpoint::new(
+                address,
+                endpoint_source.clone(),
+                RouteClass::DirectLocal,
+                last_seen,
+            )
+        })
+        .collect();
+    Some(DiscoveryObservation {
+        identity,
+        source: endpoint_source,
+        endpoints,
     })
 }
 
@@ -319,10 +354,17 @@ mod tests {
         )
         .expect("test service should be valid")
         .as_resolved_service();
-        let peer = peer_from_service(&service, local_id).expect("peer should parse");
-        assert_eq!(peer.endpoint, "10.0.0.20:4040");
+        let observation = observation_from_service(&service, local_id).expect("peer should parse");
         assert_eq!(
-            peer.endpoint_candidates,
+            observation.endpoints[0].address,
+            "10.0.0.20:4040".parse().unwrap()
+        );
+        assert_eq!(
+            observation
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.address)
+                .collect::<Vec<_>>(),
             vec![
                 SocketAddr::from((Ipv4Addr::new(10, 0, 0, 20), 4040)),
                 SocketAddr::from((Ipv4Addr::new(192, 168, 1, 20), 4040)),
@@ -351,7 +393,7 @@ mod tests {
         )
         .expect("test service should be valid")
         .as_resolved_service();
-        assert!(peer_from_service(&service, local_id).is_none());
+        assert!(observation_from_service(&service, local_id).is_none());
     }
 
     #[test]
@@ -375,7 +417,7 @@ mod tests {
         )
         .expect("test service should be valid")
         .as_resolved_service();
-        assert!(peer_from_service(&service, local_id).is_none());
+        assert!(observation_from_service(&service, local_id).is_none());
 
         for protocol in ["not-a-version", "0", "2", "65535"] {
             let properties = [
@@ -395,7 +437,7 @@ mod tests {
             )
             .expect("test service should be valid")
             .as_resolved_service();
-            assert!(peer_from_service(&service, local_id).is_none());
+            assert!(observation_from_service(&service, local_id).is_none());
         }
     }
 
@@ -419,7 +461,7 @@ mod tests {
         )
         .expect("test service should be valid")
         .as_resolved_service();
-        assert!(peer_from_service(&service, local_id).is_none());
+        assert!(observation_from_service(&service, local_id).is_none());
     }
 
     #[test]
