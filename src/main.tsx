@@ -11,7 +11,6 @@ import {
   type Peer,
   type Preferences,
   type Transfer,
-  type TransferFile,
 } from "./lib/desktop";
 import "./styles.css";
 
@@ -39,6 +38,32 @@ const initialPreferences: Preferences = {
   destination: "Downloads/Dead Drop",
 };
 
+const phaseOrder: Record<Transfer["phase"], number> = {
+  preparing: 0,
+  requesting: 1,
+  waiting_for_acceptance: 2,
+  accepted: 3,
+  transferring: 4,
+  verifying: 5,
+  completing: 6,
+  rejected: 100,
+  canceled: 100,
+  failed: 100,
+  completed: 100,
+};
+
+function isTerminalPhase(phase: Transfer["phase"]) {
+  return phaseOrder[phase] === 100;
+}
+
+function shouldAcceptTransferUpdate(current: Transfer | null, next: Transfer) {
+  if (!current) return true;
+  if (current.id !== next.id) return isTerminalPhase(current.phase);
+  if (isTerminalPhase(current.phase)) return false;
+  if (isTerminalPhase(next.phase)) return true;
+  return phaseOrder[next.phase] >= phaseOrder[current.phase];
+}
+
 function App() {
   const native = isNativeRuntime();
   const [peers, setPeers] = useState<Peer[]>(native ? [] : previewPeers);
@@ -52,67 +77,91 @@ function App() {
     native ? null : "Preview mode — local discovery and transfer run in the desktop app.",
   );
   const dragDepth = useRef(0);
+  const selectedPeerRef = useRef<Peer | null>(null);
+  const lockedRef = useRef(false);
+  const startTransferRef = useRef<(paths: string[]) => Promise<void>>(async () => undefined);
   const selectedPeer = useMemo(
     () => peers.find((peer) => peer.id === selectedId) ?? null,
     [peers, selectedId],
   );
+  const viewLocked = Boolean(activeTransfer || incoming || isSettingsOpen);
+  selectedPeerRef.current = selectedPeer;
+  lockedRef.current = viewLocked;
 
   useEffect(() => {
+    if (!native) return;
     let mounted = true;
     const unlisteners: UnlistenFn[] = [];
+    const attach = <T,>(event: string, handler: (payload: T) => void) =>
+      listen<T>(event, (eventPayload) => handler(eventPayload.payload))
+        .then((unlisten) => {
+          if (mounted) unlisteners.push(unlisten);
+          else unlisten();
+        })
+        .catch(() => {
+          if (mounted) setNotice("Dead Drop could not connect to its local service.");
+        });
+
     const start = async () => {
-      if (!native) return;
+      await Promise.all([
+        attach<Peer[]>("peers-updated", (nextPeers) => {
+          setPeers(nextPeers);
+          setSelectedId((current) =>
+            current && !nextPeers.some((peer) => peer.id === current) ? null : current,
+          );
+        }),
+        attach<Transfer>("transfer-update", (nextTransfer) => {
+          setActiveTransfer((current) =>
+            shouldAcceptTransferUpdate(current, nextTransfer) ? nextTransfer : current,
+          );
+          if (nextTransfer.phase !== "waiting_for_acceptance") {
+            setIncoming((current) => (current?.id === nextTransfer.id ? null : current));
+          }
+        }),
+        attach<IncomingTransfer>("incoming-transfer", (nextIncoming) => {
+          setIncoming(nextIncoming);
+          setActiveTransfer((current) => (current?.id === nextIncoming.id ? null : current));
+          setIsSettingsOpen(false);
+        }),
+        attach<string>("discovery-status", (status) => setNotice(status)),
+      ]);
+      if (!mounted) return;
       try {
         const snapshot = await command.initialState();
         if (!mounted) return;
         setPeers(snapshot.peers);
         setPreferences(snapshot.preferences);
       } catch {
-        setNotice("Dead Drop could not connect to its local service.");
+        if (mounted) setNotice("Dead Drop could not connect to its local service.");
       }
-      unlisteners.push(
-        await listen<Peer[]>("peers-updated", (event) => {
-          setPeers(event.payload);
-          setSelectedId((current) =>
-            current && !event.payload.some((peer) => peer.id === current) ? null : current,
-          );
-        }),
-      );
-      unlisteners.push(
-        await listen<Transfer>("transfer-update", (event) => {
-          setActiveTransfer(event.payload);
-          if (["completed", "rejected", "failed", "canceled"].includes(event.payload.phase)) {
-            setIncoming((current) => (current?.id === event.payload.id ? null : current));
-          }
-        }),
-      );
-      unlisteners.push(
-        await listen<IncomingTransfer>("incoming-transfer", (event) => {
-          setIncoming(event.payload);
-          setIsSettingsOpen(false);
-          setActiveTransfer(null);
-        }),
-      );
+      if (!mounted) return;
       try {
         const unlistenDrag = await getCurrentWebviewWindow().onDragDropEvent((event) => {
           if (event.payload.type === "over") setIsDragging(true);
-          if (event.payload.type === "leave") setIsDragging(false);
-          if (event.payload.type === "drop") {
+          if (event.payload.type === "leave") {
+            dragDepth.current = 0;
             setIsDragging(false);
-            void startTransfer(event.payload.paths);
+          }
+          if (event.payload.type === "drop") {
+            dragDepth.current = 0;
+            setIsDragging(false);
+            const paths = event.payload.paths.filter((path) => path.trim().length > 0);
+            if (!paths.length) setNotice("Drop a file to send.");
+            else void startTransferRef.current(paths);
           }
         });
-        unlisteners.push(unlistenDrag);
+        if (mounted) unlisteners.push(unlistenDrag);
+        else unlistenDrag();
       } catch {
-        // Native file picking remains available if a platform does not expose drag events.
+        // The native picker remains available on platforms without webview drag events.
       }
     };
     void start();
     return () => {
       mounted = false;
-      unlisteners.forEach((unlisten) => unlisten());
+      unlisteners.splice(0).forEach((unlisten) => unlisten());
     };
-  }, [native, selectedId]);
+  }, [native]);
 
   useEffect(() => {
     if (!notice) return;
@@ -121,22 +170,39 @@ function App() {
   }, [notice]);
 
   const startTransfer = async (paths: string[]) => {
-    if (!selectedPeer) {
+    if (lockedRef.current) {
+      setNotice("Finish the current transfer before starting another one.");
+      return;
+    }
+    const peer = selectedPeerRef.current;
+    if (!peer) {
       setNotice("Choose a nearby device first.");
       return;
     }
-    if (!paths.length) return;
+    if (!peer.online) {
+      setNotice("That device is no longer online.");
+      return;
+    }
+    if (peer.protocolVersion !== 1) {
+      setNotice("That device uses a different Dead Drop version.");
+      return;
+    }
+    const selectedPaths = paths.filter((path) => path.trim().length > 0);
+    if (!selectedPaths.length) {
+      setNotice("Choose at least one file to send.");
+      return;
+    }
     if (!native) {
-      const previewFiles = paths.map((path) => ({
-        name: path.split(/[/\\]/).at(-1) || "File",
+      const previewFiles = selectedPaths.map((path) => ({
+        name: fileNameFromPath(path),
         size: 0,
         sha256: "",
       }));
       setActiveTransfer({
         id: "preview-transfer",
         direction: "outgoing",
-        phase: "awaiting_acceptance",
-        deviceName: selectedPeer.name,
+        phase: "waiting_for_acceptance",
+        deviceName: peer.name,
         files: previewFiles,
         totalBytes: 0,
         transferredBytes: 0,
@@ -147,14 +213,19 @@ function App() {
       return;
     }
     try {
-      await command.sendFiles(selectedPeer.id, paths);
+      await command.sendFiles(peer.id, selectedPaths);
     } catch (error) {
-      setNotice(String(error));
+      setNotice(userFacingError(error, "Dead Drop could not start the transfer."));
     }
   };
+  startTransferRef.current = startTransfer;
 
   const chooseAndSend = async () => {
-    if (!selectedPeer) {
+    if (lockedRef.current) {
+      setNotice("Finish the current transfer before starting another one.");
+      return;
+    }
+    if (!selectedPeerRef.current) {
       setNotice("Choose a nearby device first.");
       return;
     }
@@ -163,9 +234,10 @@ function App() {
       return;
     }
     try {
-      await startTransfer(await chooseFiles());
+      const paths = await chooseFiles();
+      if (paths.length) await startTransfer(paths);
     } catch (error) {
-      setNotice(String(error));
+      setNotice(userFacingError(error, "Dead Drop could not open the file picker."));
     }
   };
 
@@ -173,58 +245,87 @@ function App() {
     event.preventDefault();
     dragDepth.current = 0;
     setIsDragging(false);
-    if (!native) {
-      void startTransfer([...event.dataTransfer.files].map((file) => file.name));
+    if (native) return;
+    const items = [...event.dataTransfer.items];
+    if (items.some((item) => item.kind !== "file")) {
+      setNotice("Only files can be sent.");
+      return;
     }
+    void startTransfer([...event.dataTransfer.files].map((file) => file.name));
   };
 
   const titlebarAction = async (action: "minimize" | "toggleMaximize" | "close") => {
     if (!native) return;
-    const window = getCurrentWindow();
-    await window[action]();
+    try {
+      const window = getCurrentWindow();
+      await window[action]();
+    } catch {
+      setNotice("The window action could not be completed.");
+    }
   };
+
+  const headerStatus = incoming
+    ? "Incoming request"
+    : activeTransfer
+      ? transferStatus(activeTransfer.phase, activeTransfer.direction)
+      : peers.length
+        ? "Ready"
+        : "Searching";
 
   return (
     <main className="shell" onDragOver={(event) => event.preventDefault()}>
-      <aside className="sidebar">
+      <aside className="sidebar" aria-label="Dead Drop navigation">
         <div className="sidebar-drag" data-tauri-drag-region />
-        <div className="brand" data-tauri-drag-region>
+        <div className="brand" data-tauri-drag-region aria-label="Dead Drop">
           <span>Dead</span>
           <span>Drop</span>
         </div>
         <section className="device-section" aria-label="Nearby devices">
           <p className="eyebrow">Devices</p>
           <div className="device-list">
-            {peers.map((peer) => (
-              <button
-                className={`device-row ${peer.id === selectedId ? "is-selected" : ""}`}
-                key={peer.id}
-                onClick={() => {
-                  setSelectedId(peer.id);
-                  setActiveTransfer(null);
-                  setIncoming(null);
-                  setIsSettingsOpen(false);
-                }}
-                type="button"
-              >
-                <DeviceIcon os={peer.os} />
-                <span className="device-copy">
-                  <span>{peer.name}</span>
-                  <small>{peer.os}</small>
-                </span>
-                <span className="online-dot" aria-label="Online" />
-              </button>
-            ))}
+            {peers.map((peer) => {
+              const compatible = peer.protocolVersion === 1;
+              return (
+                <button
+                  aria-current={peer.id === selectedId ? "true" : undefined}
+                  aria-disabled={viewLocked ? "true" : undefined}
+                  className={`device-row ${peer.id === selectedId ? "is-selected" : ""} ${viewLocked ? "is-locked" : ""}`}
+                  key={peer.id}
+                  onClick={() => {
+                    if (lockedRef.current) {
+                      setNotice("Finish the current transfer before changing devices.");
+                      return;
+                    }
+                    setSelectedId(peer.id);
+                    setIsSettingsOpen(false);
+                  }}
+                  type="button"
+                >
+                  <DeviceIcon os={peer.os} />
+                  <span className="device-copy">
+                    <span title={peer.name}>{peer.name}</span>
+                    <small>{compatible ? peer.os : "Needs a Dead Drop update"}</small>
+                  </span>
+                  <span
+                    className={`online-dot ${peer.online ? "" : "is-offline"}`}
+                    aria-label={peer.online ? "Online" : "Offline"}
+                  />
+                </button>
+              );
+            })}
             {!peers.length && <p className="device-empty">Looking for nearby devices</p>}
           </div>
         </section>
         <button
-          className={`settings-link ${isSettingsOpen ? "is-active" : ""}`}
+          aria-disabled={viewLocked ? "true" : undefined}
+          className={`settings-link ${isSettingsOpen ? "is-active" : ""} ${viewLocked ? "is-locked" : ""}`}
           type="button"
           onClick={() => {
+            if (lockedRef.current) {
+              setNotice("Finish the current transfer before opening settings.");
+              return;
+            }
             setIsSettingsOpen(true);
-            setActiveTransfer(null);
-            setIncoming(null);
           }}
         >
           <GearIcon />
@@ -241,8 +342,8 @@ function App() {
         }}
         onDragLeave={(event) => {
           event.preventDefault();
-          dragDepth.current -= 1;
-          if (dragDepth.current <= 0) setIsDragging(false);
+          dragDepth.current = Math.max(0, dragDepth.current - 1);
+          if (!dragDepth.current) setIsDragging(false);
         }}
         onDrop={handleBrowserDrop}
       >
@@ -251,7 +352,10 @@ function App() {
           <div aria-live="polite" className="quiet-notice">
             {notice}
           </div>
-          <div className="ready"><span />Ready</div>
+          <div className={`ready ${headerStatus === "Searching" ? "is-searching" : ""}`}>
+            <span />
+            {headerStatus}
+          </div>
           <div className="window-controls" aria-label="Window controls">
             <button onClick={() => void titlebarAction("minimize")} type="button" aria-label="Minimize"><MinusIcon /></button>
             <button onClick={() => void titlebarAction("toggleMaximize")} type="button" aria-label="Maximize"><SquareIcon /></button>
@@ -267,13 +371,13 @@ function App() {
               onClose={() => setIsSettingsOpen(false)}
               onSave={async (draft) => {
                 if (!native) {
-                  setPreferences(draft);
+                  setPreferences({ deviceName: draft.deviceName.trim(), destination: draft.destination.trim() });
                   setNotice("Saved in preview.");
                   return;
                 }
                 const saved = await command.updatePreferences(draft);
                 setPreferences(saved);
-                setNotice("Settings saved. Relaunch to advertise a new device name.");
+                setNotice("Settings saved. Nearby devices will refresh shortly.");
               }}
             />
           ) : incoming ? (
@@ -288,7 +392,8 @@ function App() {
                   await command.respondToIncoming(incoming.id, accepted);
                   if (!accepted) setIncoming(null);
                 } catch (error) {
-                  setNotice(String(error));
+                  setNotice(userFacingError(error, "That transfer request is no longer available."));
+                  throw error;
                 }
               }}
             />
@@ -303,7 +408,8 @@ function App() {
                 try {
                   await command.cancelTransfer(activeTransfer.id);
                 } catch (error) {
-                  setNotice(String(error));
+                  setNotice(userFacingError(error, "That transfer is no longer active."));
+                  throw error;
                 }
               }}
               onDone={() => setActiveTransfer(null)}
@@ -314,10 +420,13 @@ function App() {
             <NoDevicePanel />
           )}
         </div>
-        {isDragging && selectedPeer && (
+        {isDragging && (
           <div className="drop-state" aria-live="polite">
-            <p>Drop to send</p>
-            <span><ArrowIcon /> {selectedPeer.name}</span>
+            <p>{viewLocked ? "Transfer in progress" : selectedPeer ? "Drop to send" : "Choose a device first"}</p>
+            <span>
+              <ArrowIcon />
+              {viewLocked ? "Finish the current transfer" : selectedPeer ? selectedPeer.name : "Select a nearby device"}
+            </span>
           </div>
         )}
       </section>
@@ -326,25 +435,32 @@ function App() {
         className="visually-hidden"
         type="file"
         multiple
-        onChange={(event) => void startTransfer([...event.currentTarget.files ?? []].map((file) => file.name))}
+        onChange={(event) => {
+          const paths = [...(event.currentTarget.files ?? [])].map((file) => file.name);
+          event.currentTarget.value = "";
+          void startTransfer(paths);
+        }}
       />
     </main>
   );
 }
 
 function SendPanel({ peer, onChoose }: { peer: Peer; onChoose: () => void }) {
+  const compatible = peer.online && peer.protocolVersion === 1;
   return (
     <div className="send-panel state-panel">
       <div className="target-context">
         <p className="eyebrow">Send to</p>
-        <h1>{peer.name}</h1>
-        <p>{peer.os}</p>
+        <h1 title={peer.name}>{peer.name}</h1>
+        <p>{compatible ? peer.os : "This device needs a matching Dead Drop version."}</p>
       </div>
       <div className="drop-prompt">
         <FileIcon />
         <h2>Drop files anywhere</h2>
-        <p>or choose from your device</p>
-        <button className="outline-button" type="button" onClick={onChoose}>Choose from device</button>
+        <p>{compatible ? "or choose from your device" : "Choose another nearby device"}</p>
+        <button className="outline-button" type="button" onClick={onChoose} disabled={!compatible}>
+          Choose from device
+        </button>
       </div>
     </div>
   );
@@ -362,22 +478,43 @@ function NoDevicePanel() {
   );
 }
 
-function TransferPanel({ transfer, onCancel, onDone }: { transfer: Transfer; onCancel: () => void; onDone: () => void }) {
+function TransferPanel({
+  transfer,
+  onCancel,
+  onDone,
+}: {
+  transfer: Transfer;
+  onCancel: () => Promise<void>;
+  onDone: () => void;
+}) {
   const complete = transfer.phase === "completed";
-  const terminal = ["completed", "rejected", "failed", "canceled"].includes(transfer.phase);
-  const percentage = transfer.totalBytes ? Math.min(100, (transfer.transferredBytes / transfer.totalBytes) * 100) : 0;
+  const terminal = isTerminalPhase(transfer.phase);
+  const [cancelling, setCancelling] = useState(false);
+  const percentage = transfer.totalBytes
+    ? Math.min(100, (transfer.transferredBytes / transfer.totalBytes) * 100)
+    : 0;
   const primaryFile = transfer.files[0];
+  const status = transferStatus(transfer.phase, transfer.direction);
+  const cancel = async () => {
+    if (cancelling) return;
+    setCancelling(true);
+    try {
+      await onCancel();
+    } catch {
+      setCancelling(false);
+    }
+  };
   return (
     <div className={`transfer-panel state-panel ${terminal ? "is-terminal" : ""}`}>
       <div className="transfer-heading">
         {complete ? <CheckIcon /> : <TransferIcon />}
-        <p className="eyebrow">{complete ? "Sent" : transfer.direction === "incoming" ? "Receiving from" : "Sending to"}</p>
-        <h1>{transfer.deviceName}</h1>
+        <p className="eyebrow">{status}</p>
+        <h1 title={transfer.deviceName}>{transfer.deviceName}</h1>
       </div>
       <div className="transfer-card">
         <FileIcon />
         <div>
-          <strong>{primaryFile?.name ?? "Preparing files"}</strong>
+          <strong title={primaryFile?.name}>{primaryFile?.name ?? "Preparing files"}</strong>
           <small>
             {transfer.files.length > 1 ? `${transfer.files.length} files · ` : ""}
             {formatBytes(transfer.totalBytes)}
@@ -385,60 +522,124 @@ function TransferPanel({ transfer, onCancel, onDone }: { transfer: Transfer; onC
         </div>
       </div>
       {terminal ? (
-        <div className="terminal-copy">
+        <div className="terminal-copy" aria-live="polite">
           <p>{complete ? "Transfer complete" : transfer.message ?? phaseLabel(transfer.phase)}</p>
           <button type="button" className="text-button" onClick={onDone}>Done</button>
         </div>
       ) : (
         <>
-          <div className="progress-track" aria-label={`${Math.round(percentage)}% transferred`}><span style={{ width: `${percentage}%` }} /></div>
-          <div className="progress-meta">
+          <div
+            className="progress-track"
+            role="progressbar"
+            aria-label={`${Math.round(percentage)}% transferred`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(percentage)}
+          >
+            <span style={{ width: `${percentage}%` }} />
+          </div>
+          <div className="progress-meta" aria-live="polite">
             <span>{Math.round(percentage)}%</span>
             <span>{formatBytes(transfer.transferredBytes)} of {formatBytes(transfer.totalBytes)}</span>
-            <span>{transfer.phase === "awaiting_acceptance" ? "Waiting for acceptance" : `${formatBytes(transfer.bytesPerSecond)}/s${transfer.etaSeconds ? ` · ${formatEta(transfer.etaSeconds)}` : ""}`}</span>
+            <span>{transferProgressLabel(transfer)}</span>
           </div>
-          <button className="text-button" type="button" onClick={onCancel}>Cancel transfer</button>
+          <button className="text-button" type="button" onClick={() => void cancel()} disabled={cancelling}>
+            {cancelling ? "Cancelling…" : "Cancel transfer"}
+          </button>
         </>
       )}
     </div>
   );
 }
 
-function IncomingPanel({ incoming, onRespond }: { incoming: IncomingTransfer; onRespond: (accepted: boolean) => void }) {
+function IncomingPanel({ incoming, onRespond }: { incoming: IncomingTransfer; onRespond: (accepted: boolean) => Promise<void> }) {
+  const [responding, setResponding] = useState(false);
   const file = incoming.files[0];
+  const respond = async (accepted: boolean) => {
+    if (responding) return;
+    setResponding(true);
+    try {
+      await onRespond(accepted);
+    } catch {
+      setResponding(false);
+      return;
+    }
+    if (accepted) setResponding(true);
+    else setResponding(false);
+  };
   return (
     <div className="incoming-panel state-panel">
       <div className="incoming-device"><DeviceIcon os={incoming.from.os} /></div>
       <p className="eyebrow">Incoming from</p>
-      <h1>{incoming.from.name}</h1>
-      <div className="incoming-file"><FileIcon /><div><strong>{file?.name}</strong><small>{incoming.files.length > 1 ? `${incoming.files.length} files · ` : ""}{formatBytes(incoming.totalBytes)}</small></div></div>
-      <div className="incoming-actions">
-        <button className="primary-button" type="button" onClick={() => void onRespond(true)}>Accept</button>
-        <button className="outline-button" type="button" onClick={() => void onRespond(false)}>Decline</button>
+      <h1 title={incoming.from.name}>{incoming.from.name}</h1>
+      <div className="incoming-file">
+        <FileIcon />
+        <div>
+          <strong title={file?.name}>{file?.name ?? "Incoming files"}</strong>
+          <small>{incoming.files.length > 1 ? `${incoming.files.length} files · ` : ""}{formatBytes(incoming.totalBytes)}</small>
+        </div>
       </div>
+      <div className="incoming-actions">
+        <button className="primary-button" type="button" onClick={() => void respond(true)} disabled={responding}>Accept</button>
+        <button className="outline-button" type="button" onClick={() => void respond(false)} disabled={responding}>Decline</button>
+      </div>
+      {responding && <p className="response-caption" aria-live="polite">Sending your decision…</p>}
     </div>
   );
 }
 
-function SettingsPanel({ native, preferences, onClose, onSave }: { native: boolean; preferences: Preferences; onClose: () => void; onSave: (draft: Preferences) => Promise<void> }) {
+function SettingsPanel({
+  native,
+  preferences,
+  onClose,
+  onSave,
+}: {
+  native: boolean;
+  preferences: Preferences;
+  onClose: () => void;
+  onSave: (draft: Preferences) => Promise<void>;
+}) {
   const [draft, setDraft] = useState(preferences);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => setDraft(preferences), [preferences]);
   const save = async () => {
-    setSaving(true); setError(null);
-    try { await onSave(draft); } catch (reason) { setError(String(reason)); } finally { setSaving(false); }
+    if (saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await onSave({ deviceName: draft.deviceName.trim(), destination: draft.destination.trim() });
+    } catch (reason) {
+      setError(userFacingError(reason, "Settings could not be saved."));
+    } finally {
+      setSaving(false);
+    }
   };
   return (
-    <div className="settings-panel state-panel">
+    <form
+      className="settings-panel state-panel"
+      noValidate
+      onSubmit={(event) => {
+        event.preventDefault();
+        void save();
+      }}
+    >
       <p className="eyebrow">Settings</p>
       <h1>Make it yours.</h1>
       <p className="settings-intro">Dead Drop stays local. It stores only this device name and your chosen receiving folder.</p>
-      <label>Device name<input value={draft.deviceName} maxLength={64} onChange={(event) => setDraft({ ...draft, deviceName: event.target.value })} /></label>
-      <label>Received files folder<input value={draft.destination} onChange={(event) => setDraft({ ...draft, destination: event.target.value })} /></label>
-      {error && <p className="settings-error">{error}</p>}
-      <div className="settings-actions"><button type="button" className="primary-button" disabled={saving} onClick={() => void save()}>{saving ? "Saving…" : "Save settings"}</button><button type="button" className="text-button" onClick={onClose}>Close</button></div>
+      <label htmlFor="device-name">Device name
+        <input id="device-name" value={draft.deviceName} maxLength={64} autoComplete="off" aria-invalid={Boolean(error)} aria-describedby={error ? "settings-error" : undefined} onChange={(event) => setDraft({ ...draft, deviceName: event.target.value })} />
+      </label>
+      <label htmlFor="received-folder">Received files folder
+        <input id="received-folder" value={draft.destination} inputMode="text" autoComplete="off" spellCheck={false} aria-invalid={Boolean(error)} aria-describedby={error ? "settings-error" : undefined} onChange={(event) => setDraft({ ...draft, destination: event.target.value })} />
+      </label>
+      {error && <p id="settings-error" className="settings-error" role="alert">{error}</p>}
+      <div className="settings-actions">
+        <button type="submit" className="primary-button" disabled={saving}>{saving ? "Saving…" : "Save settings"}</button>
+        <button type="button" className="text-button" onClick={onClose} disabled={saving}>Close</button>
+      </div>
       {!native && <p className="preview-caption">Changes are shown only in this preview.</p>}
-    </div>
+    </form>
   );
 }
 
@@ -455,8 +656,71 @@ function MinusIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><path 
 function SquareIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="4" width="8" height="8"/></svg>; }
 function CloseIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>; }
 
-function formatBytes(value: number) { if (!value) return "—"; const units = ["B", "KB", "MB", "GB", "TB"]; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / 1024 ** index).toFixed(index ? (value / 1024 ** index >= 100 ? 0 : 1) : 0)} ${units[index]}`; }
-function formatEta(seconds: number) { return seconds < 60 ? `${seconds}s left` : `${Math.ceil(seconds / 60)}m left`; }
-function phaseLabel(phase: Transfer["phase"]) { return phase === "rejected" ? "Declined" : phase === "canceled" ? "Canceled" : "Could not complete transfer"; }
+function fileNameFromPath(path: string) {
+  return path.split(/[/\\]/).at(-1) || "File";
+}
 
-createRoot(document.getElementById("root")!).render(<App />);
+function formatBytes(value: number) {
+  if (!Number.isFinite(value) || value < 0) return "—";
+  if (value === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  const scaled = value / 1024 ** index;
+  return `${scaled.toFixed(index ? (scaled >= 100 ? 0 : 1) : 0)} ${units[index]}`;
+}
+
+function formatEta(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "";
+  return seconds < 60 ? `${Math.ceil(seconds)}s left` : `${Math.ceil(seconds / 60)}m left`;
+}
+
+function transferStatus(phase: Transfer["phase"], direction: Transfer["direction"]) {
+  switch (phase) {
+    case "preparing": return "Preparing files";
+    case "requesting": return direction === "incoming" ? "Connecting" : "Connecting to";
+    case "waiting_for_acceptance": return "Waiting for acceptance";
+    case "accepted": return "Accepted";
+    case "transferring": return direction === "incoming" ? "Receiving from" : "Sending to";
+    case "verifying": return "Verifying files";
+    case "completing": return "Finishing transfer";
+    case "completed": return direction === "incoming" ? "Received" : "Sent";
+    case "rejected": return "Request declined";
+    case "canceled": return "Transfer cancelled";
+    case "failed": return "Transfer failed";
+  }
+}
+
+function transferProgressLabel(transfer: Transfer) {
+  if (["preparing", "requesting", "waiting_for_acceptance", "accepted"].includes(transfer.phase)) {
+    return transferStatus(transfer.phase, transfer.direction);
+  }
+  if (transfer.phase === "verifying") return "Checking file integrity";
+  if (transfer.phase === "completing") return "Saving files";
+  const speed = `${formatBytes(transfer.bytesPerSecond)}/s`;
+  const eta = transfer.etaSeconds !== null && transfer.etaSeconds > 0 ? ` · ${formatEta(transfer.etaSeconds)}` : "";
+  return `${speed}${eta}`;
+}
+
+function phaseLabel(phase: Transfer["phase"]) {
+  switch (phase) {
+    case "rejected": return "Request declined.";
+    case "canceled": return "Transfer was cancelled.";
+    case "failed": return "Transfer could not be completed.";
+    default: return "Transfer could not be completed.";
+  }
+}
+
+function userFacingError(reason: unknown, fallback: string) {
+  const message = typeof reason === "string" ? reason : reason instanceof Error ? reason.message : "";
+  if (
+    message.trim() &&
+    message.length <= 180 &&
+    ![...message].some((character) => character.charCodeAt(0) < 32)
+  ) {
+    return message.trim();
+  }
+  return fallback;
+}
+
+const root = document.getElementById("root");
+if (root) createRoot(root).render(<App />);

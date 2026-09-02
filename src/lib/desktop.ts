@@ -21,9 +21,12 @@ export type TransferFile = {
 
 export type TransferPhase =
   | "preparing"
-  | "awaiting_acceptance"
-  | "sending"
-  | "receiving"
+  | "requesting"
+  | "waiting_for_acceptance"
+  | "accepted"
+  | "transferring"
+  | "verifying"
+  | "completing"
   | "completed"
   | "rejected"
   | "failed"

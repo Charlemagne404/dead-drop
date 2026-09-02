@@ -4,8 +4,8 @@ mod protocol;
 mod transfer;
 
 use models::{AppState, Preferences, PreferencesDraft, StartupSnapshot};
-use std::{net::TcpListener as StdTcpListener, sync::Arc};
-use tauri::{Manager, State};
+use std::{error::Error, net::TcpListener as StdTcpListener, sync::Arc};
+use tauri::State;
 
 #[tauri::command]
 fn initial_state(state: State<'_, Arc<AppState>>) -> StartupSnapshot {
@@ -39,13 +39,23 @@ async fn send_files(
     let peer = state
         .peer(&peer_id)
         .ok_or_else(|| "That device is no longer available.".to_string())?;
+    if !peer.online {
+        return Err("That device is no longer available.".to_string());
+    }
     if peer.protocol_version != models::PROTOCOL_VERSION {
         return Err("That device uses a different Dead Drop protocol version.".to_string());
     }
     if paths.is_empty() {
         return Err("Choose at least one file to send.".to_string());
     }
+    if paths.len() > models::MAX_TRANSFER_FILES {
+        return Err(format!(
+            "Choose no more than {} files at a time.",
+            models::MAX_TRANSFER_FILES
+        ));
+    }
     let transfer_id = uuid::Uuid::new_v4().to_string();
+    state.try_begin_transfer(&transfer_id)?;
     let cancellation = state.register_cancellation(transfer_id.clone());
     tauri::async_runtime::spawn(transfer::run_outgoing(
         app,
@@ -64,26 +74,26 @@ fn cancel_transfer(state: State<'_, Arc<AppState>>, transfer_id: String) -> Resu
 }
 
 pub fn run() {
-    let std_listener = StdTcpListener::bind(("0.0.0.0", 0))
-        .expect("Dead Drop could not reserve a local transfer port");
-    std_listener
-        .set_nonblocking(true)
-        .expect("Dead Drop could not configure its local transfer port");
-    let listener_port = std_listener
-        .local_addr()
-        .expect("Dead Drop could not read its local transfer port")
-        .port();
-    let state = Arc::new(AppState::load(listener_port));
+    if let Err(error) = run_inner() {
+        eprintln!("[dead-drop] could not start: {error}");
+    }
+}
 
-    tauri::Builder::default()
+fn run_inner() -> Result<(), Box<dyn Error>> {
+    let std_listener = StdTcpListener::bind(("0.0.0.0", 0))?;
+    std_listener.set_nonblocking(true)?;
+    let listener_port = std_listener.local_addr()?.port();
+    let state = Arc::new(AppState::load(listener_port));
+    let setup_state = state.clone();
+    let shutdown_state = state.clone();
+
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .setup(move |app| {
             let app_handle = app.handle().clone();
-            let state = app.state::<Arc<AppState>>().inner().clone();
-            let listener = tokio::net::TcpListener::from_std(std_listener)
-                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
-            transfer::start_listener(listener, state.clone(), app_handle.clone());
+            let state = setup_state.clone();
+            transfer::start_listener(std_listener, state.clone(), app_handle.clone());
             discovery::start(state, app_handle);
             Ok(())
         })
@@ -94,6 +104,14 @@ pub fn run() {
             send_files,
             cancel_transfer
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Dead Drop");
+        .build(tauri::generate_context!())?;
+    app.run(move |_app_handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            shutdown_state.shutdown();
+        }
+    });
+    Ok(())
 }
