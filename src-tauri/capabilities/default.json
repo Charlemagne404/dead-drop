@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Dead Drop desktop capability set",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}
