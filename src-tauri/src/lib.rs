@@ -44,9 +44,9 @@ async fn send_files(
 ) -> Result<String, String> {
     let peer = state
         .peer(&peer_id)
-        .ok_or_else(|| "That device is no longer available.".to_string())?;
+        .ok_or_else(|| "Device went offline.".to_string())?;
     if !peer.is_online() {
-        return Err("That device is no longer available.".to_string());
+        return Err("Device went offline.".to_string());
     }
     if peer.protocol_version != models::PROTOCOL_VERSION {
         return Err("That device uses a different Drop protocol version.".to_string());
@@ -114,7 +114,7 @@ async fn connect_by_address(
                     .peers()
                     .into_iter()
                     .find(|peer| peer.id == peer_id)
-                    .ok_or_else(|| "The device could not be added.".to_string())?;
+                    .ok_or_else(|| "Couldn't add that device.".to_string())?;
                 let _ = app.emit("peers-updated", state.peers());
                 let _ = app.emit("connectivity-diagnostics", state.runtime_diagnostics());
                 return Ok(peer);
@@ -123,7 +123,7 @@ async fn connect_by_address(
         }
     }
     Err(format!(
-        "No compatible Drop device responded at that address{}.",
+        "Couldn't connect to that device{}.",
         last_error
             .map(|error| format!(" ({error})"))
             .unwrap_or_default()

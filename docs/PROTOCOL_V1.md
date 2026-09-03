@@ -2,8 +2,8 @@
 
 Status: internal wire contract and compatibility freeze candidate.
 
-This document describes the protocol implemented by Drop (formerly Dead Drop)
-at the time of the v1 freeze. It is intentionally an implementation contract,
+This document describes the protocol implemented by Drop at the time of the v1
+freeze. It is intentionally an implementation contract,
 not a redesign. The Rust protocol encoder/decoder, transfer state machine, and
 the golden fixtures under `src-tauri/protocol-fixtures/` are the source of
 truth. Changes to any wire-visible behavior require updating this document and
@@ -53,7 +53,7 @@ after removing hyphens:
 
 | DNS-SD item | v1 format |
 | --- | --- |
-| Instance name | `Dead Drop {id_without_hyphens}` |
+| Instance name | `Drop {id_without_hyphens}` |
 | Host name | `dead-drop-{id_without_hyphens}.local.` |
 | SRV port | the fixed TCP service port `39821` |
 | Addresses | automatically advertised usable local IPv4 addresses |
