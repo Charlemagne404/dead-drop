@@ -3,11 +3,22 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "check": "npm run check:workflows && npm run release:check && npm run test:release && npm run build",
+    "check:workflows": "node scripts/check-workflows.mjs",
+    "release:check": "node scripts/release.mjs check",
+    "release:version": "node scripts/release.mjs version",
+    "release:prepare": "node scripts/release.mjs prepare",
+    "release:audit": "node scripts/release.mjs audit-artifacts",
+    "release:prepare-artifacts": "node scripts/release.mjs prepare-artifacts",
+    "test:release": "node --test scripts/release.test.mjs"
   },
   "dependencies": {
     "@fontsource/inter": "^5.3.0",
@@ -23,6 +34,7 @@
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "yaml": "^2.8.1"
   }
 }

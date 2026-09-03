@@ -68,6 +68,8 @@ Transfers support u64 byte counters, up to 256 regular files, and up to 4 TiB pe
 
 All native builds require a current Rust toolchain, Node.js/npm, and the Tauri CLI already declared in `package.json`.
 
+The repeatable versioning, native CI, packaging, checksum, release-note, and signing handoff process is documented in [docs/RELEASE_ENGINEERING.md](docs/RELEASE_ENGINEERING.md).
+
 ### Windows
 
 Build on Windows for the most reliable native installer result. Tauri produces NSIS and MSI installers for x86_64. The configured NSIS mode is per-user, so normal installation does not require elevation. The installer uses the WebView2 download bootstrapper when WebView2 is not already present; Windows 10/11 systems normally provide WebView2, while an offline installation may need it provisioned separately.

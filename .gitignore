@@ -2,5 +2,8 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/
+release-output/
+.release-output/
+.release-output-input/
 .DS_Store
 *.tsbuildinfo
