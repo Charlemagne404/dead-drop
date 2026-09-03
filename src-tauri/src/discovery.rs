@@ -278,11 +278,13 @@ fn local_service_info(state: &AppState) -> Result<ServiceInfo, String> {
     let instance_name = format!("Drop {stable_id}");
     let host_name = format!("dead-drop-{stable_id}.local.");
     let protocol = device.protocol_version.to_string();
+    let fingerprint = device.fingerprint.clone();
     let properties = [
         ("id", device.id.as_str()),
         ("name", device.name.as_str()),
         ("os", device.os.as_str()),
         ("protocol", protocol.as_str()),
+        ("fingerprint", fingerprint.as_str()),
         ("transport", SERVICE_TRANSPORT),
     ];
     ServiceInfo::new(
@@ -341,6 +343,11 @@ fn observation_from_service(
         name: bounded_property(service.get_property_val_str("name"), "Unnamed device", 64),
         os: bounded_property(service.get_property_val_str("os"), "Unknown OS", 32),
         protocol_version,
+        fingerprint: service
+            .get_property_val_str("fingerprint")
+            .filter(|fingerprint| crate::identity::valid_fingerprint(fingerprint))
+            .unwrap_or_default()
+            .to_string(),
     };
     if validate_device(&identity).is_err() {
         return None;
@@ -464,6 +471,7 @@ async fn probe_candidates(
     candidates: Vec<ProbeCandidate>,
 ) -> Vec<ProbeSuccess> {
     let local = state.device();
+    let local_identity = state.local_identity();
     let shutdown = state.shutdown_token();
     let slots = Arc::new(Semaphore::new(MAX_DISCOVERY_PROBES));
     let mut tasks: JoinSet<Result<ProbeSuccess, (ProbeCandidate, ConnectivityError)>> =
@@ -474,6 +482,7 @@ async fn probe_candidates(
             break;
         };
         let local = local.clone();
+        let local_identity = local_identity.clone();
         let shutdown = shutdown.clone();
         tasks.spawn(async move {
             let _slot = slot;
@@ -481,6 +490,7 @@ async fn probe_candidates(
             let result = connect_and_identify(
                 candidate.address,
                 &local,
+                &local_identity,
                 candidate.expected_peer_id.as_deref(),
                 &probe_cancellation,
                 shutdown.as_ref(),
@@ -553,6 +563,11 @@ fn apply_probe_successes(
                 )),
             );
         }
+        // This observation came from the encrypted probe, not from the
+        // untrusted discovery advertisement. Keep its authenticated key
+        // binding so a later spoofed metadata refresh cannot replace the
+        // registry's authoritative fingerprint.
+        state.record_authenticated_identity(identity);
     }
     (sources, visible_change)
 }
@@ -1262,7 +1277,7 @@ mod tests {
             ("id", peer_id),
             ("name", "Office Mac"),
             ("os", "macOS"),
-            ("protocol", "1"),
+            ("protocol", "2"),
             ("transport", SERVICE_TRANSPORT),
         ];
         let service = ServiceInfo::new(
@@ -1301,7 +1316,7 @@ mod tests {
             ("id", peer_id),
             ("name", "IPv6 peer"),
             ("os", "Linux"),
-            ("protocol", "1"),
+            ("protocol", "2"),
             ("transport", "ipv6"),
         ];
         let service = ServiceInfo::new(
@@ -1340,7 +1355,7 @@ mod tests {
         .as_resolved_service();
         assert!(observation_from_service(&service, local_id).is_none());
 
-        for protocol in ["not-a-version", "0", "2", "65535"] {
+        for protocol in ["not-a-version", "0", "1", "65535"] {
             let properties = [
                 ("id", peer_id),
                 ("name", "Unsupported protocol"),
@@ -1370,7 +1385,7 @@ mod tests {
             ("id", peer_id),
             ("name", "Missing transport"),
             ("os", "Linux"),
-            ("protocol", "1"),
+            ("protocol", "2"),
         ];
         let service = ServiceInfo::new(
             SERVICE_TYPE,

@@ -1,6 +1,6 @@
-# Drop protocol v1
+# Drop protocol v1 (historical plaintext contract)
 
-Status: internal wire contract and compatibility freeze candidate.
+Status: frozen historical contract; not accepted by the current v2 listener.
 
 This document describes the protocol implemented by Drop at the time of the v1
 freeze. It is intentionally an implementation contract,
@@ -8,6 +8,14 @@ not a redesign. The Rust protocol encoder/decoder, transfer state machine, and
 the golden fixtures under `src-tauri/protocol-fixtures/` are the source of
 truth. Changes to any wire-visible behavior require updating this document and
 the compatibility tests.
+
+Current Drop uses the same application frame and control-message shapes inside
+the authenticated encrypted v2 channel described in
+[`SECURITY_DESIGN.md`](SECURITY_DESIGN.md). A v2 connection begins with the
+`DROP-SECURE-V2` preface and a Noise XX handshake; it never silently falls back
+to the plaintext framing documented here. These v1 fixtures remain useful for
+migration review and serializer compatibility, but an old v1 installation must
+be upgraded before it can transfer with current Drop.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** describe protocol
 requirements.

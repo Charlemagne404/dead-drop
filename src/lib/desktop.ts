@@ -6,6 +6,7 @@ export type Device = {
   name: string;
   os: string;
   protocolVersion: number;
+  fingerprint?: string;
 };
 
 export type Peer = Device & {
@@ -71,6 +72,8 @@ export type ApplicationDiagnostics = {
 export type LocalDropDiagnostics = {
   deviceId: string;
   deviceName: string;
+  identityFingerprint: string;
+  identityStorageStatus: string;
   receiveDirectoryAvailable: boolean;
   serviceStatus: string;
   serviceDetail: string | null;
@@ -113,11 +116,28 @@ export type PeerDiagnostics = {
   name: string;
   os: string;
   protocolVersion: number;
+  fingerprint: string | null;
   protocolCompatible: boolean;
   selectedRoute: string | null;
   endpoints: EndpointDiagnostics[];
   lastSuccessfulRoute: RouteSuccessDiagnostics | null;
   recentRouteFailures: RouteFailureDiagnostics[];
+};
+
+export type TrustRequest = {
+  id: string;
+  device: Device;
+  shortFingerprint: string;
+  reason: string;
+};
+
+export type TrustedDevice = {
+  id: string;
+  name: string;
+  os: string;
+  fingerprint: string;
+  shortFingerprint: string;
+  lastSeenAt: number;
 };
 
 export type RuntimeDiagnostics = {
@@ -131,6 +151,7 @@ export type RuntimeDiagnostics = {
   };
   logicalPeerCount: number;
   logging: LoggingDiagnostics;
+  trustedDevices: TrustedDevice[];
   peers: PeerDiagnostics[];
 };
 
@@ -172,6 +193,10 @@ export const command = {
     invoke<void>("cancel_transfer", { transferId }),
   respondToIncoming: (transferId: string, accepted: boolean) =>
     invoke<void>("respond_to_incoming", { transferId, accepted }),
+  respondToTrust: (requestId: string, accepted: boolean) =>
+    invoke<void>("respond_to_trust", { requestId, accepted }),
+  forgetTrustedDevice: (fingerprint: string) =>
+    invoke<void>("forget_trusted_device", { fingerprint }),
   connectByAddress: (address: string) =>
     invoke<Peer>("connect_by_address", { address }),
   updatePreferences: (draft: Preferences) =>

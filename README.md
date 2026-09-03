@@ -25,7 +25,7 @@ npm ci
 npm run tauri dev
 ```
 
-The native app advertises `_dead-drop._tcp.local.` over mDNS/DNS-SD, discovers peers running the same protocol version, and listens on the fixed Drop service port `39821` for both identification and transfers. The service type is retained as a compatibility identifier from the earlier release.
+The native app advertises `_dead-drop._tcp.local.` over mDNS/DNS-SD, discovers peers running the same secure protocol version, and listens on the fixed Drop service port `39821` for both secure identification and transfers. The service type is retained as a compatibility identifier from the earlier release.
 
 ## Reachability and firewall behavior
 
@@ -35,14 +35,14 @@ Discovery sources contribute endpoint observations to one backend registry:
 
 - service type: `_dead-drop._tcp.local.`
 - stable instance and host names derived from the device UUID
-- TXT records: `id`, `name`, `os`, `protocol`, and `transport=ipv4`
+- TXT records: `id`, `name`, `os`, `protocol`, `fingerprint`, and `transport=ipv4`; these are discovery hints, not proof of identity
 - mDNS/DNS-SD for ordinary zero-configuration local discovery
 - a small IPv4 broadcast fallback on directly connected local networks when multicast discovery is unavailable
 - local `tailscale status --json` data, when a Tailscale-compatible client is installed and running, followed by Drop identification probes
 - recently successful endpoints, revalidated before they are shown as available
 - an optional private/overlay address fallback under Settings → Connection diagnostics
 
-Every candidate must complete a bounded Drop identification handshake before an endpoint learned from the fallback, Tailscale, remembered, or manual sources is added. Endpoints with the same Drop UUID are merged; route choice is automatic and prefers a recently verified path, then direct local paths, overlay paths, and revalidated remembered paths. If a preferred endpoint fails, Drop makes short staggered attempts to other candidates.
+Every candidate must complete the bounded authenticated Drop v2 handshake before an endpoint learned from the fallback, Tailscale, remembered, or manual sources is added. Endpoints with the same Drop UUID are merged; the cryptographic fingerprint is the trust authority. Route choice is automatic and prefers a recently verified path, then direct local paths, overlay paths, and revalidated remembered paths. If a preferred endpoint fails, Drop makes short staggered attempts to other candidates.
 
 The secondary Connection diagnostics area in Settings can copy or export a
 plain-text support report with local service state, discovery sources, peer
@@ -50,11 +50,11 @@ routes, recent route failures, and bounded structured logs. Reports exclude
 file contents, filenames, receive paths, credentials, Tailscale keys, and
 unrelated system information.
 
-v1 is intentionally IPv4-first. IPv6-only networks are not supported until the listener, discovery, and endpoint handling are made dual-stack together. VPN, virtual-machine, bridge, and other local IPv4 addresses can participate through normal discovery or remembered endpoints; Drop does not implement a VPN or a Tailscale control plane. A Headscale-operated tailnet works through the same local Tailscale client status interface.
+Drop is intentionally IPv4-first. IPv6-only networks are not supported until the listener, discovery, and endpoint handling are made dual-stack together. VPN, virtual-machine, bridge, and other local IPv4 addresses can participate through normal discovery or remembered endpoints; Drop does not implement a VPN or a Tailscale control plane. A Headscale-operated tailnet works through the same local Tailscale client status interface.
 
-The transfer/identification listener binds TCP `39821` on local IPv4 interfaces. The conservative fallback uses UDP `39821` for a small TTL-1 broadcast exchange, and mDNS uses UDP port 5353. If the operating-system firewall prompts, allow Drop inbound TCP/UDP `39821` on trusted private/local networks and UDP 5353 multicast where local mDNS is desired. Drop does not modify firewall rules automatically. Do not expose the listener to the public internet: v1 has no Drop-level authenticated device identity, transport encryption, or replay protection.
+The transfer/identification listener binds TCP `39821` on local IPv4 interfaces. The conservative fallback uses UDP `39821` for a small TTL-1 broadcast exchange, and mDNS uses UDP port 5353. If the operating-system firewall prompts, allow Drop inbound TCP/UDP `39821` on trusted private/local networks and UDP 5353 multicast where local mDNS is desired. Drop does not modify firewall rules automatically. Do not expose the listener to the public internet: Drop has no relay, NAT traversal, account recovery, or public-service abuse controls.
 
-If Tailscale is absent or stopped, Drop continues normally with every other source and does not show a normal-use error. After sleep, wake, Wi-Fi changes, DHCP changes, tailnet reconnects, or a temporary mDNS failure, source workers refresh, remove stale endpoints, and keep a peer visible when another current endpoint remains. An active transfer that loses its connection fails cleanly; v1 does not resume partial transfers.
+If Tailscale is absent or stopped, Drop continues normally with every other source and does not show a normal-use error. After sleep, wake, Wi-Fi changes, DHCP changes, tailnet reconnects, or a temporary mDNS failure, source workers refresh, remove stale endpoints, and keep a peer visible when another current endpoint remains. An active transfer that loses its connection fails cleanly; Drop does not resume partial transfers.
 
 ## Filesystem behavior
 
@@ -64,7 +64,7 @@ Existing settings are read from both the new Drop location and legacy applicatio
 
 Received files are content transfers, not filesystem clones. Drop writes ordinary files with the destination filesystem’s default permissions. It does not preserve executable bits, timestamps, extended attributes, quarantine metadata, or Windows ACLs.
 
-Incoming names are normalized to Unicode NFC and converted to a safe representation before any filesystem write. Control characters, separators, Windows-forbidden characters, trailing spaces/dots, and reserved names such as `CON` and `LPT1` are handled safely; for example, `CON.txt` becomes `_CON.txt`. UTF-8 names are bounded without splitting a character, collisions receive a suffix, and an existing file is never overwritten. Wire names cannot escape the configured destination through path traversal. Directories are rejected intentionally in v1; choose regular files.
+Incoming names are normalized to Unicode NFC and converted to a safe representation before any filesystem write. Control characters, separators, Windows-forbidden characters, trailing spaces/dots, and reserved names such as `CON` and `LPT1` are handled safely; for example, `CON.txt` becomes `_CON.txt`. UTF-8 names are bounded without splitting a character, collisions receive a suffix, and an existing file is never overwritten. Wire names cannot escape the configured destination through path traversal. Directories are rejected intentionally; choose regular files.
 
 Files are staged as hidden `.part` files and are only moved to their final names after the complete batch has passed size and SHA-256 checks. Finalization uses each platform’s native no-replace move primitive where available, with a hard-link fallback for filesystems that do not support it. If neither operation is supported, the transfer fails safely rather than risking an overwrite. Received files remain streamed in bounded chunks.
 
@@ -130,10 +130,11 @@ The repository’s workflow at `.github/workflows/platform.yml` prepares Linux, 
 
 ## Transfer contract
 
-The formal v1 discovery, framing, message, integrity, and compatibility
-contract is documented in [docs/PROTOCOL_V1.md](docs/PROTOCOL_V1.md).
+The historical plaintext application contract is frozen in
+[docs/PROTOCOL_V1.md](docs/PROTOCOL_V1.md). Current Drop transfers use the
+versioned secure v2 contract described in [docs/SECURITY_DESIGN.md](docs/SECURITY_DESIGN.md):
 
-- Each connection begins with a versioned `Hello` exchange.
+- Each connection begins with the fixed `DROP-SECURE-V2` preface and a bounded Noise XX handshake, followed by an encrypted `Hello` exchange.
 - A `TransferRequest` includes every filename, byte size, and SHA-256 digest.
 - The recipient must explicitly accept or decline each request.
 - Files stream in 96 KiB framed chunks; they are never loaded into memory in full.
@@ -141,8 +142,9 @@ contract is documented in [docs/PROTOCOL_V1.md](docs/PROTOCOL_V1.md).
 - Cancellation, rejection, timeouts, invalid metadata, checksum mismatch, and protocol-version mismatches fail safely.
 - Transfers are limited to 256 regular files and 4 TiB per request.
 - Only one transfer is admitted at a time. Additional requests are declined with a clear busy response instead of competing for shared UI or destination state.
+- A first-contact or changed-identity peer must be explicitly trusted; trust is tied to the public-key fingerprint, not an IP address, name, or UUID.
 
-There is no transport encryption, trusted-device authentication, replay protection, public-internet/port-forwarding support, NAT traversal, relay, resume, clipboard sharing, folder sync, or automatic updating in v1. Tailscale protects the network path according to its own overlay configuration, but it does not add Drop-level identity or encryption to the v1 protocol. Those protections must be designed before arbitrary remote-internet support is considered.
+Current v2 has Drop-level authenticated encryption, per-session forward secrecy from fresh ephemeral keys, and replay resistance within each Noise session. It has no public-internet/port-forwarding support, NAT traversal, relay, resume, clipboard sharing, folder sync, or automatic updating. A v1 peer is rejected; there is no silent downgrade to plaintext. Tailscale encryption remains useful, but it does not replace Drop-level identity and session protection.
 
 ## Plain identity and compatibility
 
@@ -152,7 +154,7 @@ Inter is bundled from `@fontsource/inter` under the SIL Open Font License 1.1; s
 
 ## Automated local integration tests
 
-The `integration-tests` feature exposes a test-only peer harness. Each test peer has its own device identity, loopback TCP listener, receive directory, transfer state, and temporary filesystem tree. Discovery is injected; the handshake, request decision, framed transfer, checksum verification, staging, finalization, cancellation, and shutdown paths use the production implementation.
+The `integration-tests` feature exposes a test-only peer harness. Each test peer has its own deterministic test-only cryptographic identity, loopback TCP listener, receive directory, transfer state, and temporary filesystem tree. Discovery is injected; the secure handshake, trust decision, request decision, encrypted framed transfer, checksum verification, staging, finalization, cancellation, and shutdown paths use the production implementation.
 
 Run the normal local scenarios serially to keep progress-barrier and allocation measurements deterministic:
 

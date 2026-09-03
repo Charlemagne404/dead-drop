@@ -1,19 +1,17 @@
 use crate::{
     connectivity::{
-        connect_and_identify, ConnectivityError, IdentifiedConnection, IDENTIFICATION_TIMEOUT,
+        accept_and_identify, connect_and_identify, ConnectivityError, IdentifiedConnection,
         MAX_ROUTE_ATTEMPTS, ROUTE_CONNECT_TIMEOUT, ROUTE_STAGGER,
     },
     diagnostics::{LogCategory, LogLevel, SupportLogger},
     models::{
         AppState, Cancellation, DeviceIdentity, Endpoint, IncomingTransfer, Peer,
         RuntimeDiagnostics, TransferFile, TransferLifecycle, TransferPhase, TransferSnapshot,
-        MAX_FILENAME_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES,
+        TrustRequest, TrustStatus, MAX_FILENAME_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES,
     },
     platform,
-    protocol::{
-        portable_file_name, read_frame, read_identification, validate_transfer_request,
-        write_control, write_data, write_identification, ControlMessage, Frame, ProtocolError,
-    },
+    protocol::{portable_file_name, validate_transfer_request, ControlMessage, Frame},
+    secure::{SecureError, SecureReader, SecureWriter},
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -42,6 +40,7 @@ use crate::models::FaultPoint;
 
 const CHUNK_SIZE: usize = 96 * 1024;
 const DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const TRUST_DECISION_TIMEOUT: Duration = Duration::from_secs(60);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(45);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(45);
 const CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -70,6 +69,12 @@ enum TransferError {
     InvalidPeerResponse(String),
     #[error("the other device could not complete the transfer: {0}")]
     RemoteFailure(String),
+    #[error("the other device was not trusted")]
+    TrustRejected,
+    #[error("the trust request expired")]
+    TrustTimeout,
+    #[error("the other device's security identity changed")]
+    IdentityChanged,
     #[error("could not read {name}: {detail}")]
     FileRead { name: String, detail: String },
     #[error("could not prepare files: {detail}")]
@@ -106,6 +111,11 @@ impl TransferError {
             Self::RemoteFailure(_) => {
                 "The other device could not complete the transfer.".to_string()
             }
+            Self::TrustRejected => "Device trust was cancelled.".to_string(),
+            Self::TrustTimeout => "The trust request expired.".to_string(),
+            Self::IdentityChanged => {
+                "This device's security identity changed. Review trusted devices.".to_string()
+            }
             Self::FileRead { .. } | Self::Prepare { .. } => "File could not be read.".to_string(),
             Self::UnsupportedSelection => "Only files can be sent.".to_string(),
             Self::Destination { .. } => "Destination is unavailable.".to_string(),
@@ -126,6 +136,9 @@ impl TransferError {
             Self::IncompatibleVersion => "incompatible Drop protocol version".to_string(),
             Self::InvalidPeerResponse(_) => "peer response was invalid".to_string(),
             Self::RemoteFailure(_) => "peer reported a transfer failure".to_string(),
+            Self::TrustRejected => "peer trust was not approved".to_string(),
+            Self::TrustTimeout => "peer trust request expired".to_string(),
+            Self::IdentityChanged => "peer security identity changed".to_string(),
             Self::FileRead { .. } => "source file could not be read".to_string(),
             Self::Prepare { .. } => "files could not be prepared".to_string(),
             Self::UnsupportedSelection => "selection was not a regular file".to_string(),
@@ -164,6 +177,10 @@ struct StagedFile {
 pub(crate) trait EventSink: Send + Sync {
     fn emit_transfer_update(&self, snapshot: &TransferSnapshot) -> Result<(), String>;
     fn emit_incoming_transfer(&self, transfer: &IncomingTransfer) -> Result<(), String>;
+
+    fn emit_trust_request(&self, _request: &TrustRequest) -> Result<(), String> {
+        Ok(())
+    }
 
     fn record_log(
         &self,
@@ -214,6 +231,22 @@ impl EventSink for TauriEventSink {
                 LogLevel::Warn,
                 LogCategory::Errors,
                 "incoming_update_emit_failed",
+                Some(error),
+            );
+        }
+        result
+    }
+
+    fn emit_trust_request(&self, request: &TrustRequest) -> Result<(), String> {
+        let result = self
+            .app
+            .emit("trust-request", request)
+            .map_err(|error| error.to_string());
+        if let Err(error) = &result {
+            self.record_log(
+                LogLevel::Warn,
+                LogCategory::Errors,
+                "trust_request_emit_failed",
                 Some(error),
             );
         }
@@ -573,13 +606,21 @@ async fn send_files(
         shutdown.clone(),
     )
     .await?;
+    ensure_peer_trusted(
+        tracker.events.clone(),
+        state,
+        &connected.identity,
+        transfer_id,
+        cancellation.as_ref(),
+        shutdown.as_ref(),
+    )
+    .await?;
+    state.record_authenticated_identity(connected.identity.clone());
     state.remember_peer(&connected.identity, connected.endpoint);
     let _ = tracker
         .events
         .emit_connectivity_diagnostics(&state.runtime_diagnostics());
-    let stream = connected.stream;
-    let _ = stream.set_nodelay(true);
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = connected.channel.split();
     let cancellation = cancellation.as_ref();
     let shutdown = shutdown.as_ref();
     write_control_with_timeout(
@@ -816,6 +857,72 @@ async fn send_files(
     result
 }
 
+async fn ensure_peer_trusted(
+    events: Arc<dyn EventSink>,
+    state: &Arc<AppState>,
+    identity: &DeviceIdentity,
+    request_id: &str,
+    cancellation: &Cancellation,
+    shutdown: &Cancellation,
+) -> Result<(), TransferError> {
+    let status = state.trust_status(identity);
+    if status == TrustStatus::Trusted {
+        return Ok(());
+    }
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    state
+        .add_pending_trust_request(request_id.to_string(), sender)
+        .map_err(|_| TransferError::AppUnavailable)?;
+    let request = TrustRequest {
+        id: request_id.to_string(),
+        device: identity.clone(),
+        short_fingerprint: crate::identity::short_fingerprint(&identity.fingerprint),
+        reason: if status == TrustStatus::Changed {
+            "identity_changed".to_string()
+        } else {
+            "new_device".to_string()
+        },
+    };
+    if let Err(error) = events.emit_trust_request(&request) {
+        state.clear_pending_trust_request(request_id);
+        events.record_log(
+            LogLevel::Warn,
+            LogCategory::Errors,
+            "trust_request_emit_failed",
+            Some(&error),
+        );
+        return Err(TransferError::AppUnavailable);
+    }
+
+    let decision = tokio::select! {
+        decision = receiver => decision.map_err(|_| TransferError::AppUnavailable)?,
+        _ = sleep(TRUST_DECISION_TIMEOUT) => {
+            state.clear_pending_trust_request(request_id);
+            return Err(TransferError::TrustTimeout);
+        }
+        _ = cancellation.cancelled() => {
+            state.clear_pending_trust_request(request_id);
+            return Err(TransferError::Canceled);
+        }
+        _ = shutdown.cancelled() => {
+            state.clear_pending_trust_request(request_id);
+            return Err(TransferError::ShuttingDown);
+        }
+    };
+    state.clear_pending_trust_request(request_id);
+    if !decision {
+        return Err(if status == TrustStatus::Changed {
+            TransferError::IdentityChanged
+        } else {
+            TransferError::TrustRejected
+        });
+    }
+    state
+        .trust_peer(identity)
+        .map_err(|_| TransferError::AppUnavailable)
+}
+
 async fn handle_incoming(
     stream: TcpStream,
     state: Arc<AppState>,
@@ -825,58 +932,20 @@ async fn handle_incoming(
     let connection_cancellation = Cancellation::new();
     let remote_address = stream.peer_addr().ok();
     let local_address = stream.local_addr().ok();
-    let _ = stream.set_nodelay(true);
-    let (mut reader, mut writer) = stream.into_split();
-    let sender_message = match read_identification_with_timeout(
-        &mut reader,
-        IDENTIFICATION_TIMEOUT,
+    let local = state.device();
+    let local_identity = state.local_identity();
+    let connection = accept_and_identify(
+        stream,
+        &local,
+        &local_identity,
         &connection_cancellation,
         shutdown.as_ref(),
     )
     .await
-    {
-        Ok(message) => message,
-        Err(error) => {
-            if matches!(
-                &error,
-                TransferError::Protocol(message)
-                    if message.contains("expected a Drop Hello message")
-            ) {
-                send_protocol_error(&mut writer, "Expected a Drop hello message.").await;
-            }
-            return Err(error);
-        }
-    };
-    let sender = match sender_message {
-        ControlMessage::Hello {
-            protocol_version,
-            device,
-        } if protocol_version == crate::models::PROTOCOL_VERSION => device,
-        ControlMessage::Hello { .. } => {
-            send_protocol_error(&mut writer, "Incompatible Drop version.").await;
-            return Err(TransferError::IncompatibleVersion);
-        }
-        _ => {
-            send_protocol_error(&mut writer, "Expected a Drop hello message.").await;
-            return Err(TransferError::InvalidPeerResponse(
-                "expected a hello message".to_string(),
-            ));
-        }
-    };
-    if same_device_id(&sender.id, &state.device().id) {
-        send_protocol_error(&mut writer, "A device cannot transfer to itself.").await;
-        return Err(TransferError::InvalidPeerResponse(
-            "peer identity matches local identity".to_string(),
-        ));
-    }
-    write_identification_with_timeout(
-        &mut writer,
-        &state.device(),
-        IDENTIFICATION_TIMEOUT,
-        &connection_cancellation,
-        shutdown.as_ref(),
-    )
-    .await?;
+    .map_err(connectivity_failure)?;
+    let sender = connection.identity;
+    state.record_authenticated_identity(sender.clone());
+    let (mut reader, mut writer) = connection.channel.split();
     state.log(
         LogLevel::Info,
         LogCategory::Connection,
@@ -889,7 +958,7 @@ async fn handle_incoming(
     );
     let request = match read_control_with_timeout(
         &mut reader,
-        FRAME_TIMEOUT,
+        TRUST_DECISION_TIMEOUT,
         "read",
         &connection_cancellation,
         shutdown.as_ref(),
@@ -927,12 +996,22 @@ async fn handle_incoming(
             ));
         }
     };
+    ensure_peer_trusted(
+        events.clone(),
+        &state,
+        &sender,
+        &Uuid::new_v4().to_string(),
+        &connection_cancellation,
+        shutdown.as_ref(),
+    )
+    .await?;
     if let (Some(remote_address), Some(local_address)) = (remote_address, local_address) {
         state.remember_peer(
             &sender,
             SocketAddr::new(remote_address.ip(), local_address.port()),
         );
     }
+    let _ = events.emit_connectivity_diagnostics(&state.runtime_diagnostics());
     if let Err(_reason) = state.try_begin_transfer(&transfer_id) {
         state.log(
             LogLevel::Info,
@@ -981,8 +1060,8 @@ async fn handle_incoming(
 async fn receive_incoming(
     events: &Arc<dyn EventSink>,
     state: &Arc<AppState>,
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    reader: &mut SecureReader,
+    writer: &mut SecureWriter,
     sender: &DeviceIdentity,
     transfer_id: String,
     files: Vec<TransferFile>,
@@ -1261,7 +1340,7 @@ async fn receive_incoming(
 
 #[allow(clippy::too_many_arguments)]
 async fn receive_files(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    reader: &mut SecureReader,
     tracker: &mut TransferTracker,
     transfer_id: &str,
     files: &[TransferFile],
@@ -1734,7 +1813,7 @@ async fn rollback_finalized(finalized: &[PathBuf], state: &AppState) {
 
 async fn finish_incoming_error(
     state: &AppState,
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut SecureWriter,
     tracker: &mut TransferTracker,
     transfer_id: &str,
     error: &TransferError,
@@ -1765,7 +1844,7 @@ enum IncomingDecision {
 }
 
 async fn wait_for_decision(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    reader: &mut SecureReader,
     transfer_id: &str,
     approval_receiver: tokio::sync::oneshot::Receiver<bool>,
     cancellation: &Cancellation,
@@ -1787,8 +1866,8 @@ async fn wait_for_decision(
                 Err(_) => Err(TransferError::AppUnavailable),
             }
         }
-        message = read_frame(reader) => {
-            match message.map_err(protocol_failure)? {
+        message = reader.read_frame() => {
+            match message.map_err(secure_failure)? {
                 Frame::Control(ControlMessage::Cancel { transfer_id: received_id }) if received_id == transfer_id => Err(TransferError::RemoteCanceled),
                 Frame::Control(_) => Err(TransferError::InvalidPeerResponse("unexpected message while waiting for acceptance".to_string())),
                 Frame::Data(_) => Err(TransferError::InvalidPeerResponse("unexpected data while waiting for acceptance".to_string())),
@@ -1801,7 +1880,7 @@ async fn wait_for_decision(
 }
 
 async fn write_decision(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut SecureWriter,
     transfer_id: &str,
     accepted: bool,
     reason: Option<String>,
@@ -1819,7 +1898,7 @@ async fn write_decision(
 }
 
 struct ConnectedPeer {
-    stream: TcpStream,
+    channel: crate::secure::SecureChannel,
     identity: DeviceIdentity,
     endpoint: SocketAddr,
 }
@@ -1862,7 +1941,7 @@ async fn connect_to_peer(
                             let _ = events.emit_connectivity_diagnostics(&state.runtime_diagnostics());
                         }
                         return Ok(ConnectedPeer {
-                            stream: connection.stream,
+                            channel: connection.channel,
                             identity: connection.identity,
                             endpoint: endpoint.address,
                         });
@@ -1903,6 +1982,7 @@ async fn connect_to_peer(
                 let endpoint = candidates[next_index].clone();
                 next_index += 1;
                 let local = state.device();
+                let local_identity = state.local_identity();
                 let expected_peer_id = peer.id.clone();
                 let attempt_cancellation = cancellation.clone();
                 let attempt_shutdown = shutdown.clone();
@@ -1916,6 +1996,7 @@ async fn connect_to_peer(
                     let result = connect_and_identify(
                         endpoint.address,
                         &local,
+                        &local_identity,
                         Some(&expected_peer_id),
                         attempt_cancellation.as_ref(),
                         attempt_shutdown.as_ref(),
@@ -1991,17 +2072,17 @@ async fn connect_to_addresses(
 }
 
 async fn read_frame_with_timeout(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    reader: &mut SecureReader,
     duration: Duration,
     phase: &'static str,
     cancellation: &Cancellation,
     shutdown: &Cancellation,
 ) -> Result<Frame, TransferError> {
     tokio::select! {
-        result = timeout(duration, read_frame(reader)) => {
+        result = timeout(duration, reader.read_frame()) => {
             match result {
                 Ok(Ok(frame)) => Ok(frame),
-                Ok(Err(error)) => Err(protocol_failure(error)),
+                Ok(Err(error)) => Err(secure_failure(error)),
                 Err(_) => Err(TransferError::Timeout(phase)),
             }
         }
@@ -2010,27 +2091,8 @@ async fn read_frame_with_timeout(
     }
 }
 
-async fn read_identification_with_timeout(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
-    duration: Duration,
-    cancellation: &Cancellation,
-    shutdown: &Cancellation,
-) -> Result<ControlMessage, TransferError> {
-    tokio::select! {
-        result = timeout(duration, read_identification(reader)) => {
-            match result {
-                Ok(Ok(message)) => Ok(message),
-                Ok(Err(error)) => Err(protocol_failure(error)),
-                Err(_) => Err(TransferError::Timeout("identification")),
-            }
-        }
-        _ = cancellation.cancelled() => Err(TransferError::Canceled),
-        _ = shutdown.cancelled() => Err(TransferError::ShuttingDown),
-    }
-}
-
 async fn read_control_with_timeout(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    reader: &mut SecureReader,
     duration: Duration,
     phase: &'static str,
     cancellation: &Cancellation,
@@ -2045,38 +2107,18 @@ async fn read_control_with_timeout(
 }
 
 async fn write_control_with_timeout(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut SecureWriter,
     message: &ControlMessage,
     duration: Duration,
     cancellation: &Cancellation,
     shutdown: &Cancellation,
 ) -> Result<(), TransferError> {
     tokio::select! {
-        result = timeout(duration, write_control(writer, message)) => {
+        result = timeout(duration, writer.write_control(message)) => {
             match result {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(protocol_failure(error)),
+                Ok(Err(error)) => Err(secure_failure(error)),
                 Err(_) => Err(TransferError::Timeout("write")),
-            }
-        }
-        _ = cancellation.cancelled() => Err(TransferError::Canceled),
-        _ = shutdown.cancelled() => Err(TransferError::ShuttingDown),
-    }
-}
-
-async fn write_identification_with_timeout(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    device: &DeviceIdentity,
-    duration: Duration,
-    cancellation: &Cancellation,
-    shutdown: &Cancellation,
-) -> Result<(), TransferError> {
-    tokio::select! {
-        result = timeout(duration, write_identification(writer, device)) => {
-            match result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(protocol_failure(error)),
-                Err(_) => Err(TransferError::Timeout("identification write")),
             }
         }
         _ = cancellation.cancelled() => Err(TransferError::Canceled),
@@ -2131,14 +2173,14 @@ enum RemoteSignal {
 }
 
 async fn monitor_remote(
-    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut reader: SecureReader,
     transfer_id: String,
     shutdown: Arc<Cancellation>,
     sender: mpsc::Sender<RemoteSignal>,
 ) {
     tokio::select! {
         result = async {
-                match read_frame(&mut reader).await {
+                match reader.read_frame().await {
                     Ok(Frame::Control(ControlMessage::Cancel { transfer_id: received_id })) if received_id == transfer_id => {
                         let _ = sender.send(RemoteSignal::Cancelled).await;
                     }
@@ -2152,7 +2194,7 @@ async fn monitor_remote(
                         let _ = sender.send(RemoteSignal::Failed(TransferError::InvalidPeerResponse("unexpected data from receiver".to_string()))).await;
                     }
                     Err(error) => {
-                        let _ = sender.send(RemoteSignal::Failed(protocol_failure(error))).await;
+                        let _ = sender.send(RemoteSignal::Failed(secure_failure(error))).await;
                     }
             }
         } => result,
@@ -2179,7 +2221,7 @@ async fn next_remote_signal(
 }
 
 async fn write_data_watched(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut SecureWriter,
     data: &[u8],
     cancellation: &Cancellation,
     shutdown: &Cancellation,
@@ -2187,15 +2229,15 @@ async fn write_data_watched(
 ) -> Result<(), TransferError> {
     check_cancelled(cancellation, shutdown)?;
     check_remote_signal(remote)?;
-    match timeout(WRITE_TIMEOUT, write_data(writer, data)).await {
+    match timeout(WRITE_TIMEOUT, writer.write_data(data)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(protocol_failure(error)),
+        Ok(Err(error)) => Err(secure_failure(error)),
         Err(_) => Err(TransferError::Timeout("write")),
     }
 }
 
 async fn write_control_watched(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut SecureWriter,
     message: &ControlMessage,
     cancellation: &Cancellation,
     shutdown: &Cancellation,
@@ -2203,9 +2245,9 @@ async fn write_control_watched(
 ) -> Result<(), TransferError> {
     check_cancelled(cancellation, shutdown)?;
     check_remote_signal(remote)?;
-    match timeout(WRITE_TIMEOUT, write_control(writer, message)).await {
+    match timeout(WRITE_TIMEOUT, writer.write_control(message)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(protocol_failure(error)),
+        Ok(Err(error)) => Err(secure_failure(error)),
         Err(_) => Err(TransferError::Timeout("write")),
     }
 }
@@ -2229,20 +2271,17 @@ fn remote_signal_error(signal: Option<RemoteSignal>) -> TransferError {
     }
 }
 
-async fn send_cancel(writer: &mut tokio::net::tcp::OwnedWriteHalf, transfer_id: &str) {
+async fn send_cancel(writer: &mut SecureWriter, transfer_id: &str) {
     let _ = timeout(
         CANCEL_WRITE_TIMEOUT,
-        write_control(
-            writer,
-            &ControlMessage::Cancel {
-                transfer_id: transfer_id.to_string(),
-            },
-        ),
+        writer.write_control(&ControlMessage::Cancel {
+            transfer_id: transfer_id.to_string(),
+        }),
     )
     .await;
 }
 
-async fn send_protocol_error(writer: &mut tokio::net::tcp::OwnedWriteHalf, message: &str) {
+async fn send_protocol_error(writer: &mut SecureWriter, message: &str) {
     let _ = send_control_bounded(
         writer,
         &ControlMessage::ProtocolError {
@@ -2252,20 +2291,14 @@ async fn send_protocol_error(writer: &mut tokio::net::tcp::OwnedWriteHalf, messa
     .await;
 }
 
-async fn send_control_bounded(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    message: &ControlMessage,
-) -> bool {
+async fn send_control_bounded(writer: &mut SecureWriter, message: &ControlMessage) -> bool {
     matches!(
-        timeout(CANCEL_WRITE_TIMEOUT, write_control(writer, message)).await,
+        timeout(CANCEL_WRITE_TIMEOUT, writer.write_control(message)).await,
         Ok(Ok(()))
     )
 }
 
-async fn write_control_bounded(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    message: &ControlMessage,
-) -> Option<()> {
+async fn write_control_bounded(writer: &mut SecureWriter, message: &ControlMessage) -> Option<()> {
     if send_control_bounded(writer, message).await {
         Some(())
     } else {
@@ -2291,13 +2324,32 @@ fn check_cancelled(
     }
 }
 
-fn protocol_failure(error: ProtocolError) -> TransferError {
+fn secure_failure(error: SecureError) -> TransferError {
     match error {
-        ProtocolError::Io(error) if error.kind() == ErrorKind::UnexpectedEof => {
+        SecureError::Io(error) if error.kind() == ErrorKind::UnexpectedEof => {
             TransferError::ConnectionClosed
         }
-        ProtocolError::Io(error) => TransferError::Connection(error.to_string()),
-        other => TransferError::Protocol(other.to_string()),
+        SecureError::Io(error) => TransferError::Connection(error.to_string()),
+        SecureError::Version => TransferError::IncompatibleVersion,
+        SecureError::IdentityBinding => TransferError::IdentityChanged,
+        SecureError::Crypto | SecureError::Invalid(_) => {
+            TransferError::Protocol("secure channel rejected a message".to_string())
+        }
+    }
+}
+
+fn connectivity_failure(error: ConnectivityError) -> TransferError {
+    match error {
+        ConnectivityError::Canceled => TransferError::Canceled,
+        ConnectivityError::ShuttingDown => TransferError::ShuttingDown,
+        ConnectivityError::Timeout(stage) => TransferError::Timeout(stage),
+        ConnectivityError::Connection(detail) => TransferError::Connection(detail),
+        ConnectivityError::Protocol(detail) => TransferError::Protocol(detail),
+        ConnectivityError::IncompatibleVersion => TransferError::IncompatibleVersion,
+        ConnectivityError::IdentityMismatch => TransferError::IdentityChanged,
+        ConnectivityError::UnexpectedPeer | ConnectivityError::SelfConnection => {
+            TransferError::InvalidPeerResponse("peer identity did not match the route".to_string())
+        }
     }
 }
 
@@ -2320,10 +2372,6 @@ fn rejection_message(reason: Option<&str>) -> String {
         }
         _ => "Declined by the recipient.".to_string(),
     }
-}
-
-fn same_device_id(left: &str, right: &str) -> bool {
-    Uuid::parse_str(left).ok() == Uuid::parse_str(right).ok()
 }
 
 fn destination_error(error: std::io::Error) -> TransferError {
@@ -2626,21 +2674,27 @@ mod tests {
             name: "Fallback peer".to_string(),
             os: "Test OS".to_string(),
             protocol_version: PROTOCOL_VERSION,
+            fingerprint: crate::identity::test_identity("22222222-2222-4222-8222-222222222222")
+                .fingerprint()
+                .to_string(),
         };
         let server = tokio::spawn({
             let identity = identity.clone();
+            let remote_key = crate::identity::test_identity(&identity.id);
             async move {
-                let (mut stream, _) = fallback_listener
+                let (stream, _) = fallback_listener
                     .accept()
                     .await
                     .expect("fallback listener should accept");
-                let hello = read_identification(&mut stream)
-                    .await
-                    .expect("client should identify itself");
-                assert!(matches!(hello, ControlMessage::Hello { .. }));
-                write_identification(&mut stream, &identity)
-                    .await
-                    .expect("fallback peer should identify itself");
+                accept_and_identify(
+                    stream,
+                    &identity,
+                    &remote_key,
+                    &Cancellation::new(),
+                    &Cancellation::new(),
+                )
+                .await
+                .expect("fallback peer should complete the secure hello");
             }
         });
         let state = state_for_tests(Path::new("/tmp"));

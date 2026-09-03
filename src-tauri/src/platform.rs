@@ -48,6 +48,13 @@ pub fn settings_path() -> Option<PathBuf> {
     project_dirs(APPLICATION).map(|dirs| dirs.config_local_dir().join("settings.json"))
 }
 
+/// The device private key is kept separate from user-editable preferences so
+/// its restrictive file permissions are easy to audit and a settings export
+/// cannot accidentally include it.
+pub fn identity_path() -> Option<PathBuf> {
+    project_dirs(APPLICATION).map(|dirs| dirs.config_local_dir().join("identity.json"))
+}
+
 pub fn log_path() -> Option<PathBuf> {
     project_dirs(APPLICATION).map(|dirs| dirs.data_local_dir().join("drop.log"))
 }

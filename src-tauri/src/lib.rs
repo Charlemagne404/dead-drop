@@ -1,11 +1,13 @@
 mod connectivity;
 mod diagnostics;
 mod discovery;
+mod identity;
 mod models;
 mod peer;
 mod platform;
 mod protocol;
 mod routing;
+mod secure;
 #[cfg(any(test, feature = "integration-tests"))]
 pub mod test_support;
 mod transfer;
@@ -40,6 +42,28 @@ fn respond_to_incoming(
     accepted: bool,
 ) -> Result<(), String> {
     state.resolve_pending_request(&transfer_id, accepted)
+}
+
+#[tauri::command]
+fn respond_to_trust(
+    state: State<'_, Arc<AppState>>,
+    request_id: String,
+    accepted: bool,
+) -> Result<(), String> {
+    state.resolve_pending_trust_request(&request_id, accepted)
+}
+
+#[tauri::command]
+fn forget_trusted_device(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    fingerprint: String,
+) -> Result<(), String> {
+    let result = state.forget_trusted_device(&fingerprint);
+    if result.is_ok() {
+        let _ = app.emit("connectivity-diagnostics", state.runtime_diagnostics());
+    }
+    result
 }
 
 #[tauri::command]
@@ -100,6 +124,7 @@ async fn connect_by_address(
         }
     };
     let local = state.device();
+    let local_identity = state.local_identity();
     let shutdown = state.shutdown_token();
     let cancellation = models::Cancellation::new();
     let mut last_error = None;
@@ -107,6 +132,7 @@ async fn connect_by_address(
         match connectivity::connect_and_identify(
             endpoint,
             &local,
+            &local_identity,
             None,
             &cancellation,
             shutdown.as_ref(),
@@ -128,6 +154,7 @@ async fn connect_by_address(
                     endpoints: vec![discovered],
                 });
                 state.record_route_success(&peer_id, endpoint);
+                state.record_authenticated_identity(connection.identity.clone());
                 state.remember_peer(&connection.identity, endpoint);
                 let peer = state
                     .peers()
@@ -180,7 +207,7 @@ fn run_inner() -> Result<(), Box<dyn Error>> {
     let std_listener = StdTcpListener::bind(("0.0.0.0", connectivity::DROP_SERVICE_PORT))?;
     std_listener.set_nonblocking(true)?;
     let listener_port = std_listener.local_addr()?.port();
-    let state = Arc::new(AppState::load(listener_port));
+    let state = Arc::new(AppState::load(listener_port)?);
     let setup_state = state.clone();
     let shutdown_state = state.clone();
 
@@ -198,6 +225,8 @@ fn run_inner() -> Result<(), Box<dyn Error>> {
             initial_state,
             update_preferences,
             respond_to_incoming,
+            respond_to_trust,
+            forget_trusted_device,
             send_files,
             connect_by_address,
             cancel_transfer,

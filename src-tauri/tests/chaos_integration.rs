@@ -13,17 +13,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    time::timeout,
-};
+use tokio::{net::TcpListener, time::timeout};
 use uuid::Uuid;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
-const CONTROL_FRAME: u8 = 1;
-const DATA_FRAME: u8 = 2;
-
 async fn wait_incoming(
     events: &TestEventSink,
     transfer_id: &str,
@@ -122,6 +115,7 @@ fn identity(name: &str) -> DeviceIdentity {
         name: name.to_string(),
         os: "Test OS".to_string(),
         protocol_version: PROTOCOL_VERSION,
+        fingerprint: String::new(),
     }
 }
 
@@ -164,182 +158,6 @@ fn peer_with_endpoints(
             })
             .collect(),
     )
-}
-
-async fn raw_frame(stream: &mut TcpStream, kind: u8, payload: &[u8]) {
-    stream
-        .write_u8(kind)
-        .await
-        .expect("raw frame kind should write");
-    stream
-        .write_u32(payload.len() as u32)
-        .await
-        .expect("raw frame length should write");
-    stream
-        .write_all(payload)
-        .await
-        .expect("raw frame payload should write");
-}
-
-async fn read_raw_frame(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
-    let kind = stream.read_u8().await.ok()?;
-    let length = stream.read_u32().await.ok()? as usize;
-    if length > 512 * 1024 {
-        return None;
-    }
-    let mut payload = vec![0_u8; length];
-    stream.read_exact(&mut payload).await.ok()?;
-    Some((kind, payload))
-}
-
-async fn fake_peer_with_malformed_terminal(listener: TcpListener, peer: DeviceIdentity) {
-    let Some((mut stream, _)) = listener.accept().await.ok() else {
-        return;
-    };
-    let Some((kind, _)) = read_raw_frame(&mut stream).await else {
-        return;
-    };
-    assert_eq!(kind, CONTROL_FRAME);
-    raw_frame(
-        &mut stream,
-        CONTROL_FRAME,
-        &serde_json::to_vec(&serde_json::json!({
-            "type": "hello",
-            "protocol_version": PROTOCOL_VERSION,
-            "device": peer,
-        }))
-        .expect("fake hello should encode"),
-    )
-    .await;
-    let Some((kind, request_payload)) = read_raw_frame(&mut stream).await else {
-        return;
-    };
-    assert_eq!(kind, CONTROL_FRAME);
-    let request: serde_json::Value =
-        serde_json::from_slice(&request_payload).expect("request should be JSON");
-    let transfer_id = request["transfer_id"]
-        .as_str()
-        .expect("request should contain a transfer id");
-    raw_frame(
-        &mut stream,
-        CONTROL_FRAME,
-        &serde_json::to_vec(&serde_json::json!({
-            "type": "transfer_decision",
-            "transfer_id": transfer_id,
-            "accepted": true,
-            "reason": null,
-        }))
-        .expect("fake decision should encode"),
-    )
-    .await;
-    while let Some((kind, _)) = read_raw_frame(&mut stream).await {
-        if kind == CONTROL_FRAME {
-            raw_frame(
-                &mut stream,
-                CONTROL_FRAME,
-                &serde_json::to_vec(&serde_json::json!({
-                    "type": "transfer_result",
-                    "transfer_id": Uuid::new_v4().to_string(),
-                    "success": true,
-                    "reason": null,
-                }))
-                .expect("malformed terminal result should encode"),
-            )
-            .await;
-            break;
-        }
-    }
-    let _ = stream.shutdown().await;
-}
-
-async fn send_raw_request_and_payload(
-    receiver: &TestPeer,
-    sender: DeviceIdentity,
-    file: TransferFile,
-    payload: &[u8],
-    send_complete: bool,
-) -> String {
-    let mut stream = TcpStream::connect(receiver.address())
-        .await
-        .expect("raw sender should connect");
-    raw_frame(
-        &mut stream,
-        CONTROL_FRAME,
-        &serde_json::to_vec(&serde_json::json!({
-            "type": "hello",
-            "protocol_version": PROTOCOL_VERSION,
-            "device": sender,
-        }))
-        .expect("raw sender hello should encode"),
-    )
-    .await;
-    let (kind, _) = read_raw_frame(&mut stream)
-        .await
-        .expect("receiver hello should arrive");
-    assert_eq!(kind, CONTROL_FRAME);
-    let transfer_id = Uuid::new_v4().to_string();
-    raw_frame(
-        &mut stream,
-        CONTROL_FRAME,
-        &serde_json::to_vec(&serde_json::json!({
-            "type": "transfer_request",
-            "transfer_id": transfer_id,
-            "files": [file],
-            "total_bytes": file.size,
-        }))
-        .expect("raw transfer request should encode"),
-    )
-    .await;
-    let id = transfer_id.clone();
-    wait_incoming(&receiver.events, &id).await;
-    receiver
-        .accept(&id)
-        .expect("receiver should accept raw request");
-    let (kind, decision) = read_raw_frame(&mut stream)
-        .await
-        .expect("receiver decision should arrive");
-    assert_eq!(kind, CONTROL_FRAME);
-    let decision: serde_json::Value =
-        serde_json::from_slice(&decision).expect("receiver decision should be JSON");
-    assert_eq!(decision["accepted"], true);
-    raw_frame(
-        &mut stream,
-        CONTROL_FRAME,
-        &serde_json::to_vec(&serde_json::json!({
-            "type": "file_start",
-            "transfer_id": transfer_id,
-            "file_index": 0,
-        }))
-        .expect("raw file start should encode"),
-    )
-    .await;
-    raw_frame(&mut stream, DATA_FRAME, payload).await;
-    raw_frame(
-        &mut stream,
-        CONTROL_FRAME,
-        &serde_json::to_vec(&serde_json::json!({
-            "type": "file_end",
-            "transfer_id": transfer_id,
-            "file_index": 0,
-        }))
-        .expect("raw file end should encode"),
-    )
-    .await;
-    if send_complete {
-        raw_frame(
-            &mut stream,
-            CONTROL_FRAME,
-            &serde_json::to_vec(&serde_json::json!({
-                "type": "complete",
-                "transfer_id": transfer_id,
-            }))
-            .expect("raw complete should encode"),
-        )
-        .await;
-    }
-    let _ = timeout(TEST_TIMEOUT, read_raw_frame(&mut stream)).await;
-    let _ = stream.shutdown().await;
-    transfer_id
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -466,7 +284,9 @@ async fn network_fault_proxy_exercises_partial_slow_and_disconnect_paths() {
         FaultProxyConfig {
             disconnect: Some(ProxyDisconnect {
                 direction: ProxyDirection::PeerToClient,
-                trigger: ProxyDisconnectTrigger::AfterFrames(2),
+                // One Noise handshake record and the encrypted Hello response
+                // precede the encrypted transfer decision on this direction.
+                trigger: ProxyDisconnectTrigger::AfterFrames(3),
                 mode: ProxyDisconnectMode::Graceful,
             }),
             ..FaultProxyConfig::default()
@@ -508,7 +328,10 @@ async fn network_fault_proxy_exercises_partial_slow_and_disconnect_paths() {
         FaultProxyConfig {
             disconnect: Some(ProxyDisconnect {
                 direction: ProxyDirection::ClientToPeer,
-                trigger: ProxyDisconnectTrigger::AfterFrames(4),
+                // The transfer request is the fourth client-to-peer record;
+                // cut after FileStart so the receiver can display and accept
+                // the request before the data path is interrupted.
+                trigger: ProxyDisconnectTrigger::AfterFrames(5),
                 mode: ProxyDisconnectMode::Abrupt,
             }),
             ..FaultProxyConfig::default()
@@ -1076,48 +899,25 @@ async fn malformed_terminal_messages_and_repeated_declines_do_not_resurrect_tran
     );
     assert_no_part_files(&receiver.destination_dir());
     wait_idle(&[&sender, &receiver]).await;
-
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("malformed peer listener should bind");
-    let address = listener.local_addr().unwrap();
-    let peer = identity("Malformed Terminal Peer");
-    let fake_task = tokio::spawn(fake_peer_with_malformed_terminal(listener, peer.clone()));
-    let sender = TestPeer::new("Malformed Terminal Sender");
-    let source = sender.source_dir().join("malformed-terminal.bin");
-    write_pattern_file(&source, 2 * 96 * 1024, 0x3001);
-    let run = sender
-        .start_send_to_peer(
-            peer_at(&peer, address, RouteClass::DirectLocal),
-            vec![source],
-        )
-        .expect("malformed terminal transfer should start");
-    let id = run.id().to_string();
-    wait_run(run).await;
-    fake_task.await.expect("malformed peer should not panic");
-    assert_eq!(
-        assert_one_terminal(&sender.events, &id).phase,
-        TransferPhase::Failed
-    );
-    assert!(sender.is_idle());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn checksum_mismatch_and_truncated_payloads_never_finalize_files() {
     let receiver = TestPeer::new("Integrity Receiver");
-    let sender = identity("Integrity Sender");
-    let mismatch_id = send_raw_request_and_payload(
-        &receiver,
-        sender.clone(),
-        TransferFile {
-            name: "checksum-mismatch.bin".to_string(),
-            size: 3,
-            sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        },
-        b"bad",
-        true,
-    )
-    .await;
+    let sender = TestPeer::new("Integrity Sender");
+    let mismatch_id = sender
+        .send_custom_transfer(
+            &receiver,
+            TransferFile {
+                name: "checksum-mismatch.bin".to_string(),
+                size: 3,
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            },
+            b"bad",
+            true,
+        )
+        .await;
     assert_eq!(
         wait_one_terminal(&receiver.events, &mismatch_id)
             .await
@@ -1132,18 +932,18 @@ async fn checksum_mismatch_and_truncated_payloads_never_finalize_files() {
     wait_idle(&[&receiver]).await;
 
     let expected = format!("{:x}", Sha256::digest(b"0123456789"));
-    let truncated_id = send_raw_request_and_payload(
-        &receiver,
-        sender,
-        TransferFile {
-            name: "truncated.bin".to_string(),
-            size: 10,
-            sha256: expected,
-        },
-        b"123",
-        true,
-    )
-    .await;
+    let truncated_id = sender
+        .send_custom_transfer(
+            &receiver,
+            TransferFile {
+                name: "truncated.bin".to_string(),
+                size: 10,
+                sha256: expected,
+            },
+            b"123",
+            true,
+        )
+        .await;
     assert_eq!(
         wait_one_terminal(&receiver.events, &truncated_id)
             .await
@@ -1167,6 +967,7 @@ fn peer_registry_converges_under_source_failure_metadata_conflicts_and_churn() {
         name: "Stable peer".to_string(),
         os: "Linux".to_string(),
         protocol_version: PROTOCOL_VERSION,
+        fingerprint: String::new(),
     };
     let mut registry = PeerRegistry::new();
     let mdns_address: SocketAddr = "192.168.50.10:39821".parse().unwrap();
@@ -1249,6 +1050,7 @@ fn peer_registry_converges_under_source_failure_metadata_conflicts_and_churn() {
                 name: format!("Synthetic {index}"),
                 os: "Test OS".to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                fingerprint: String::new(),
             },
             source: source.clone(),
             endpoints: vec![Endpoint::new(
@@ -1274,6 +1076,7 @@ fn peer_registry_converges_under_source_failure_metadata_conflicts_and_churn() {
                 name: "Churning peer".to_string(),
                 os: "Test OS".to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                fingerprint: String::new(),
             },
             source: churn_source.clone(),
             endpoints: vec![Endpoint::new(

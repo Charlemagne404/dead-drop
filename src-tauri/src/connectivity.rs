@@ -1,8 +1,8 @@
 use crate::{
+    identity::{self, LocalIdentity},
     models::{Cancellation, DeviceIdentity, PROTOCOL_VERSION},
-    protocol::{
-        read_identification, validate_device, write_identification, ControlMessage, ProtocolError,
-    },
+    protocol::{validate_secure_device, ControlMessage},
+    secure::{self, SecureChannel, SecureError},
 };
 use std::{
     collections::HashSet,
@@ -12,7 +12,6 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
     net::{lookup_host, TcpStream},
     time::timeout,
 };
@@ -46,6 +45,8 @@ pub enum ConnectivityError {
     IncompatibleVersion,
     #[error("the endpoint identified a different Drop device")]
     UnexpectedPeer,
+    #[error("the endpoint presented a different security identity")]
+    IdentityMismatch,
     #[error("the endpoint identified this device")]
     SelfConnection,
 }
@@ -57,6 +58,9 @@ impl ConnectivityError {
             Self::ShuttingDown => "Drop is closing.",
             Self::IncompatibleVersion => "That device uses a different Drop protocol version.",
             Self::UnexpectedPeer => "That address belongs to a different Drop device.",
+            Self::IdentityMismatch => {
+                "This device's security identity changed. Review trusted devices."
+            }
             Self::SelfConnection => "That address belongs to this device.",
             Self::Timeout(_) | Self::Connection(_) | Self::Protocol(_) => {
                 "Couldn't connect to that device."
@@ -75,6 +79,9 @@ impl ConnectivityError {
             Self::Protocol(detail) => format!("protocol {}", classify_protocol_detail(detail)),
             Self::IncompatibleVersion => "incompatible Drop protocol version".to_string(),
             Self::UnexpectedPeer => "endpoint identified a different Drop device".to_string(),
+            Self::IdentityMismatch => {
+                "peer security identity did not match the secure session".to_string()
+            }
             Self::SelfConnection => "endpoint identified this device".to_string(),
         }
     }
@@ -110,9 +117,8 @@ fn classify_protocol_detail(detail: &str) -> &'static str {
     }
 }
 
-#[derive(Debug)]
 pub struct IdentifiedConnection {
-    pub stream: TcpStream,
+    pub channel: SecureChannel,
     pub identity: DeviceIdentity,
 }
 
@@ -123,10 +129,12 @@ pub struct IdentifiedConnection {
 pub async fn connect_and_identify(
     endpoint: SocketAddr,
     local: &DeviceIdentity,
+    local_identity: &LocalIdentity,
     expected_peer_id: Option<&str>,
     cancellation: &Cancellation,
     shutdown: &Cancellation,
 ) -> Result<IdentifiedConnection, ConnectivityError> {
+    validate_local_identity(local, local_identity)?;
     if shutdown.is_cancelled() {
         return Err(ConnectivityError::ShuttingDown);
     }
@@ -134,7 +142,7 @@ pub async fn connect_and_identify(
         return Err(ConnectivityError::Canceled);
     }
 
-    let mut stream = tokio::select! {
+    let stream = tokio::select! {
         result = timeout(IDENTIFICATION_TIMEOUT, TcpStream::connect(endpoint)) => {
             match result {
                 Ok(Ok(stream)) => stream,
@@ -147,8 +155,39 @@ pub async fn connect_and_identify(
     };
     let _ = stream.set_nodelay(true);
 
-    write_identification_with_timeout(&mut stream, local, cancellation, shutdown).await?;
-    let response = read_identification_with_timeout(&mut stream, cancellation, shutdown).await?;
+    let session = tokio::select! {
+        result = timeout(
+            IDENTIFICATION_TIMEOUT,
+            secure::establish_initiator(stream, local_identity),
+        ) => match result {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => return Err(secure_error(error)),
+            Err(_) => return Err(ConnectivityError::Timeout("secure handshake")),
+        },
+        _ = cancellation.cancelled() => return Err(ConnectivityError::Canceled),
+        _ = shutdown.cancelled() => return Err(ConnectivityError::ShuttingDown),
+    };
+    let mut channel = session.channel;
+    let response = tokio::select! {
+        result = timeout(
+            IDENTIFICATION_TIMEOUT,
+            async {
+                channel
+                    .write_control(&ControlMessage::Hello {
+                        protocol_version: PROTOCOL_VERSION,
+                        device: local.clone(),
+                    })
+                    .await?;
+                channel.read_control().await
+            },
+        ) => match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Err(secure_error(error)),
+            Err(_) => return Err(ConnectivityError::Timeout("secure hello")),
+        },
+        _ = cancellation.cancelled() => return Err(ConnectivityError::Canceled),
+        _ = shutdown.cancelled() => return Err(ConnectivityError::ShuttingDown),
+    };
     let ControlMessage::Hello {
         protocol_version,
         device,
@@ -161,7 +200,11 @@ pub async fn connect_and_identify(
     if protocol_version != PROTOCOL_VERSION || device.protocol_version != PROTOCOL_VERSION {
         return Err(ConnectivityError::IncompatibleVersion);
     }
-    validate_device(&device).map_err(|error| ConnectivityError::Protocol(error.to_string()))?;
+    validate_secure_device(&device)
+        .map_err(|error| ConnectivityError::Protocol(error.to_string()))?;
+    if device.fingerprint != session.remote_fingerprint {
+        return Err(ConnectivityError::IdentityMismatch);
+    }
     if same_device_id(&device.id, &local.id) {
         return Err(ConnectivityError::SelfConnection);
     }
@@ -169,53 +212,107 @@ pub async fn connect_and_identify(
         return Err(ConnectivityError::UnexpectedPeer);
     }
     Ok(IdentifiedConnection {
-        stream,
+        channel,
         identity: device,
     })
 }
 
-async fn write_identification_with_timeout<W: AsyncWrite + Unpin>(
-    writer: &mut W,
+/// Accept a v2 secure session and complete the encrypted Hello exchange. No
+/// unauthenticated error or transfer message is sent if the preface,
+/// handshake, or identity binding fails.
+pub async fn accept_and_identify(
+    stream: TcpStream,
     local: &DeviceIdentity,
+    local_identity: &LocalIdentity,
     cancellation: &Cancellation,
     shutdown: &Cancellation,
-) -> Result<(), ConnectivityError> {
-    tokio::select! {
-        result = timeout(IDENTIFICATION_TIMEOUT, write_identification(writer, local)) => {
-            match result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(protocol_error(error)),
-                Err(_) => Err(ConnectivityError::Timeout("identification write")),
-            }
-        }
-        _ = cancellation.cancelled() => Err(ConnectivityError::Canceled),
-        _ = shutdown.cancelled() => Err(ConnectivityError::ShuttingDown),
+) -> Result<IdentifiedConnection, ConnectivityError> {
+    validate_local_identity(local, local_identity)?;
+    if shutdown.is_cancelled() {
+        return Err(ConnectivityError::ShuttingDown);
     }
+    let session = tokio::select! {
+        result = timeout(
+            IDENTIFICATION_TIMEOUT,
+            secure::establish_responder(stream, local_identity),
+        ) => match result {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => return Err(secure_error(error)),
+            Err(_) => return Err(ConnectivityError::Timeout("secure handshake")),
+        },
+        _ = cancellation.cancelled() => return Err(ConnectivityError::Canceled),
+        _ = shutdown.cancelled() => return Err(ConnectivityError::ShuttingDown),
+    };
+    let mut channel = session.channel;
+    let response = tokio::select! {
+        result = timeout(
+            IDENTIFICATION_TIMEOUT,
+            async {
+                let incoming = channel.read_control().await?;
+                channel
+                    .write_control(&ControlMessage::Hello {
+                        protocol_version: PROTOCOL_VERSION,
+                        device: local.clone(),
+                    })
+                    .await?;
+                Ok::<ControlMessage, secure::SecureError>(incoming)
+            },
+        ) => match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Err(secure_error(error)),
+            Err(_) => return Err(ConnectivityError::Timeout("secure hello")),
+        },
+        _ = cancellation.cancelled() => return Err(ConnectivityError::Canceled),
+        _ = shutdown.cancelled() => return Err(ConnectivityError::ShuttingDown),
+    };
+    let ControlMessage::Hello {
+        protocol_version,
+        device,
+    } = response
+    else {
+        return Err(ConnectivityError::Protocol(
+            "expected a Drop Hello message".to_string(),
+        ));
+    };
+    if protocol_version != PROTOCOL_VERSION || device.protocol_version != PROTOCOL_VERSION {
+        return Err(ConnectivityError::IncompatibleVersion);
+    }
+    validate_secure_device(&device)
+        .map_err(|error| ConnectivityError::Protocol(error.to_string()))?;
+    if device.fingerprint != session.remote_fingerprint {
+        return Err(ConnectivityError::IdentityMismatch);
+    }
+    if same_device_id(&device.id, &local.id) {
+        return Err(ConnectivityError::SelfConnection);
+    }
+    Ok(IdentifiedConnection {
+        channel,
+        identity: device,
+    })
 }
 
-async fn read_identification_with_timeout<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    cancellation: &Cancellation,
-    shutdown: &Cancellation,
-) -> Result<ControlMessage, ConnectivityError> {
-    tokio::select! {
-        result = timeout(IDENTIFICATION_TIMEOUT, read_identification(reader)) => {
-            match result {
-                Ok(Ok(message)) => Ok(message),
-                Ok(Err(error)) => Err(protocol_error(error)),
-                Err(_) => Err(ConnectivityError::Timeout("identification read")),
-            }
-        }
-        _ = cancellation.cancelled() => Err(ConnectivityError::Canceled),
-        _ = shutdown.cancelled() => Err(ConnectivityError::ShuttingDown),
-    }
-}
-
-fn protocol_error(error: ProtocolError) -> ConnectivityError {
+fn secure_error(error: SecureError) -> ConnectivityError {
     match error {
-        ProtocolError::Io(error) => ConnectivityError::Connection(error.to_string()),
-        other => ConnectivityError::Protocol(other.to_string()),
+        SecureError::Version => ConnectivityError::IncompatibleVersion,
+        SecureError::IdentityBinding => ConnectivityError::IdentityMismatch,
+        SecureError::Io(error) => ConnectivityError::Connection(error.to_string()),
+        SecureError::Crypto | SecureError::Invalid(_) => {
+            ConnectivityError::Protocol("secure session failed".to_string())
+        }
     }
+}
+
+fn validate_local_identity(
+    local: &DeviceIdentity,
+    local_identity: &LocalIdentity,
+) -> Result<(), ConnectivityError> {
+    if local.protocol_version != PROTOCOL_VERSION
+        || !identity::valid_fingerprint(&local.fingerprint)
+        || local.fingerprint != local_identity.fingerprint()
+    {
+        return Err(ConnectivityError::IdentityMismatch);
+    }
+    Ok(())
 }
 
 fn same_device_id(left: &str, right: &str) -> bool {
@@ -332,7 +429,7 @@ fn is_shared_overlay_ipv4(address: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{read_identification, write_identification};
+    use crate::{identity, protocol::ControlMessage, secure};
     use tokio::net::TcpListener;
 
     fn identity(id: &str, protocol_version: u16) -> DeviceIdentity {
@@ -341,6 +438,7 @@ mod tests {
             name: "Test peer".to_string(),
             os: "Test OS".to_string(),
             protocol_version,
+            fingerprint: identity::test_identity(id).fingerprint().to_string(),
         }
     }
 
@@ -394,22 +492,28 @@ mod tests {
             .expect("test listener should have an address");
         let local = identity("11111111-1111-4111-8111-111111111111", PROTOCOL_VERSION);
         let remote = identity("22222222-2222-4222-8222-222222222222", PROTOCOL_VERSION);
+        let local_key = identity::test_identity(&local.id);
+        let remote_key = identity::test_identity(&remote.id);
         let server = tokio::spawn({
             let remote = remote.clone();
+            let remote_key = remote_key.clone();
             async move {
-                let (mut stream, _) = listener.accept().await.expect("client should connect");
-                let hello = read_identification(&mut stream)
-                    .await
-                    .expect("client hello should be bounded and valid");
-                assert!(matches!(hello, ControlMessage::Hello { .. }));
-                write_identification(&mut stream, &remote)
-                    .await
-                    .expect("server hello should be written");
+                let (stream, _) = listener.accept().await.expect("client should connect");
+                accept_and_identify(
+                    stream,
+                    &remote,
+                    &remote_key,
+                    &Cancellation::new(),
+                    &Cancellation::new(),
+                )
+                .await
+                .expect("server should complete the secure hello");
             }
         });
         let connection = connect_and_identify(
             address,
             &local,
+            &local_key,
             Some(&remote.id),
             &Cancellation::new(),
             &Cancellation::new(),
@@ -431,25 +535,88 @@ mod tests {
             .expect("test listener should have an address");
         let local = identity("11111111-1111-4111-8111-111111111111", PROTOCOL_VERSION);
         let remote = identity("22222222-2222-4222-8222-222222222222", PROTOCOL_VERSION + 1);
+        let local_key = identity::test_identity(&local.id);
+        let remote_key = identity::test_identity(&remote.id);
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("client should connect");
-            let _ = read_identification(&mut stream).await;
-            write_identification(&mut stream, &remote)
+            let (stream, _) = listener.accept().await.expect("client should connect");
+            let mut session = secure::establish_responder(stream, &remote_key)
                 .await
-                .expect("incompatible hello should still be bounded");
+                .expect("server secure session should establish");
+            session
+                .channel
+                .read_control()
+                .await
+                .expect("client hello should be encrypted");
+            session
+                .channel
+                .write_control(&ControlMessage::Hello {
+                    protocol_version: remote.protocol_version,
+                    device: remote,
+                })
+                .await
+                .expect("incompatible hello should remain well-formed");
         });
         let result = connect_and_identify(
             address,
             &local,
+            &local_key,
             None,
             &Cancellation::new(),
             &Cancellation::new(),
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(ConnectivityError::IncompatibleVersion)
-        ));
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected an incompatible protocol error"),
+        };
+        assert!(matches!(error, ConnectivityError::IncompatibleVersion));
+        server.await.expect("test server should not panic");
+    }
+
+    #[tokio::test]
+    async fn hello_fingerprint_must_match_the_noise_static_key() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have an address");
+        let local = identity("11111111-1111-4111-8111-111111111111", PROTOCOL_VERSION);
+        let mut remote = identity("22222222-2222-4222-8222-222222222222", PROTOCOL_VERSION);
+        let local_key = identity::test_identity(&local.id);
+        let remote_key = identity::test_identity("different-static-key");
+        remote.fingerprint = identity::test_identity("claimed-fingerprint")
+            .fingerprint()
+            .to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("client should connect");
+            let mut session = secure::establish_responder(stream, &remote_key)
+                .await
+                .expect("server secure session should establish");
+            session
+                .channel
+                .read_control()
+                .await
+                .expect("client hello should be encrypted");
+            session
+                .channel
+                .write_control(&ControlMessage::Hello {
+                    protocol_version: remote.protocol_version,
+                    device: remote,
+                })
+                .await
+                .expect("mismatched hello should remain well-formed");
+        });
+        let result = connect_and_identify(
+            address,
+            &local,
+            &local_key,
+            None,
+            &Cancellation::new(),
+            &Cancellation::new(),
+        )
+        .await;
+        assert!(matches!(result, Err(ConnectivityError::IdentityMismatch)));
         server.await.expect("test server should not panic");
     }
 
@@ -462,17 +629,19 @@ mod tests {
             .local_addr()
             .expect("test listener should have an address");
         let local = identity("11111111-1111-4111-8111-111111111111", PROTOCOL_VERSION);
+        let local_key = identity::test_identity(&local.id);
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("client should connect");
             use tokio::io::AsyncWriteExt;
             stream
-                .write_all(&[2, 0, 0, 0, 0])
+                .write_all(b"not-a-drop")
                 .await
                 .expect("test service response should write");
         });
         let result = connect_and_identify(
             address,
             &local,
+            &local_key,
             None,
             &Cancellation::new(),
             &Cancellation::new(),

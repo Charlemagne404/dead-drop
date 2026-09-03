@@ -13,6 +13,7 @@ by the current protocol. An endpoint is separate data:
 Peer
   stable Drop UUID
   name / operating system / protocol
+  cryptographic fingerprint (trust authority)
   endpoints[]
 
 Endpoint
@@ -46,13 +47,13 @@ UDP 39821  bounded local broadcast discovery fallback
 UDP 5353   mDNS/DNS-SD, provided by mdns-sd
 ```
 
-The TCP listener is shared by discovery probes and transfers. The first frame
-must be a control frame containing a `Hello`; identification frames are capped
-at 16 KiB and client/server reads and writes have short timeouts. A malformed,
-oversized, incompatible, self, or unexpected-UUID response is rejected before
-it can enter transfer state. The handshake only identifies the v1 Drop
-implementation; it is not authenticated device identity and does not encrypt
-the connection.
+The TCP listener is shared by discovery probes and transfers. A connection
+must begin with the fixed `DROP-SECURE-V2` preface and a bounded Noise XX
+handshake. The encrypted application `Hello` binds the stable UUID, display
+metadata, protocol version, and public-key fingerprint to the Noise static key.
+A malformed, oversized, incompatible, self, unexpected-UUID, or
+identity-mismatched response is rejected before it can enter transfer state.
+There is no plaintext v1 fallback.
 
 The listener binds IPv4 `0.0.0.0` on the fixed port. Drop does not change host
 firewall rules. A host firewall should permit TCP/UDP 39821 only on the
@@ -65,12 +66,16 @@ unavailable optional source does not stop the other workers.
 ### mDNS / DNS-SD
 
 mDNS remains the preferred local zero-configuration source. Drop advertises
-`_dead-drop._tcp.local.` with the stable UUID, name, OS, protocol, and IPv4
-transport marker. Resolved usable IPv4 addresses and the SRV port become one
-source-scoped observation. IPv6 discovery remains disabled in protocol v1.
+`_dead-drop._tcp.local.` with the stable UUID, name, OS, protocol, public-key
+fingerprint, and IPv4 transport marker. Resolved usable IPv4 addresses and the
+SRV port become one source-scoped observation. TXT metadata remains an
+untrusted hint; the secure probe is authoritative. IPv6 discovery remains
+disabled.
 Fresh resolution refreshes timestamps; removed services and observations older
 than 75 seconds expire. Interface and DHCP changes are handled by the mDNS
-daemon's re-resolution and re-announcement behavior.
+daemon's re-resolution and re-announcement behavior. After a peer key has been
+authenticated, discovery can refresh routes but cannot replace the bound name,
+OS, protocol, or fingerprint without another secure Hello.
 
 ### Local broadcast fallback
 
@@ -78,7 +83,7 @@ The fallback sends the fixed 23-byte `DROP-LOCAL-DISCOVERY-V1` request to the
 IPv4 limited broadcast address every 20 seconds. A Drop instance replies with
 the fixed response marker and the fixed TCP service port. The response carries
 no identity; every response is filtered to a directly reachable/private IPv4
-candidate and must complete the normal TCP Hello exchange before entering the
+candidate and must complete the normal encrypted TCP v2 probe before entering the
 registry. Packets are capped at 64 bytes, response collection lasts less than
 one second, and at most 64 addresses are probed per cycle with at most eight
 live Drop probes. TTL 1 keeps the exchange local and there is no subnet scan.
@@ -104,11 +109,12 @@ call tailscale.com and does not require a Tailscale account.
 
 ### Remembered endpoints
 
-After a successful identification/transfer, Drop stores at most 64 peer
+After a successful secure identification/transfer, Drop stores at most 64 peer
 identities and eight endpoints per identity in the existing per-user settings
 file. Entries expire from revalidation consideration after 30 days. Startup
-and periodic workers revalidate candidates with the expected UUID; a remembered
-peer is not added to the current peer list merely because it exists on disk.
+and periodic workers revalidate candidates with the expected UUID and secure
+identity handshake; a remembered peer is not added to the current peer list
+merely because it exists on disk.
 Successful revalidation refreshes the remembered timestamp. The store is a
 reconnection aid, not a contact list.
 
@@ -121,7 +127,7 @@ The route selector ranks current endpoints using two signals:
 
 Address ordering and source ordering make equal candidates deterministic. A
 send attempts up to eight candidates with a 150 ms stagger, and every attempt
-must complete the same bounded Hello exchange and match the target UUID. The
+must complete the same bounded secure handshake and match the target UUID. The
 first verified connection wins and remaining attempts are cancelled. A stale
 LAN endpoint therefore does not prevent a working overlay or remembered route
 from being used. A failed active transfer is not migrated mid-stream; later
@@ -135,24 +141,25 @@ transfer feature.
 
 ## Security and operational boundary
 
-Discovery packets, mDNS TXT values, Tailscale status, and Hello responses are
-untrusted input. Parsers cap text, frames, command output, packets, endpoint
+Discovery packets, mDNS TXT values, Tailscale status, and pre-handshake input
+are untrusted. Parsers cap text, frames, command output, packets, endpoint
 lists, process time, simultaneous probes, and incoming connection slots.
-UUID and protocol validation happens before registry insertion or transfer
-negotiation. The current protocol still self-asserts device identity and has
-no authenticated encryption or replay protection on ordinary LAN paths.
-Tailscale reachability does not change that Drop-level limitation. Public
-exposure, NAT traversal, rendezvous, relay infrastructure, and cryptographic
-device identity require a separate protocol design.
+Discovery never grants trust. The v2 Noise handshake authenticates the static
+public key for the session; the encrypted Hello binds that key to the stable
+Drop metadata; the remembered trust record decides whether the session may
+transfer. Tailscale reachability does not change that Drop-level trust model.
+Public exposure, NAT traversal, rendezvous, relay infrastructure, and account
+recovery remain outside the protocol.
 
 ## Diagnostics and logs
 
 The normal UI receives only `id`, `name`, `os`, protocol version, and online
 state. Settings → Connection diagnostics is a secondary support surface; it
 exposes application and local-service state, source status, remembered count,
-stable UUIDs, endpoint address/family, sources, route class, reachability,
-last-seen age, selected route, and recent route failures. The same view can
-copy the plain-text report to the clipboard or download it as a text file.
+stable UUIDs, safe public-key fingerprints, endpoint address/family, sources,
+route class, reachability, last-seen age, selected route, and recent route
+failures. The same view can copy the plain-text report to the clipboard or
+download it as a text file.
 
 Support logging uses bounded structured JSON records with stable categories:
 `startup`, `shutdown`, `discovery`, `peer_registry`, `route_selection`,
