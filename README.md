@@ -54,7 +54,7 @@ If Tailscale is absent or stopped, Drop continues normally with every other sour
 
 The default receive folder is the operating system’s Downloads directory followed by `Drop` (for example, `Downloads/Drop`). If that directory is unavailable, Drop falls back to a persistent application-data location rather than silently choosing a volatile temporary directory. A previously saved device ID and name are retained even when a saved destination has been deleted or becomes unavailable. Settings use the platform’s normal per-user configuration directory, and Settings includes the native folder picker. If a receive folder disappears while the app is running—especially a removable or network volume—the transfer fails with a destination error instead of recreating a local directory at the old mount path; choose a new folder in Settings.
 
-Existing settings are read from both the new Drop location and the previous Dead Drop locations. They are written to the new location on startup. An existing destination is kept exactly as saved; Drop does not move or rename folders that may contain received files.
+Existing settings are read from both the new Drop location and legacy application locations. They are written to the new location on startup. An existing destination is kept exactly as saved; Drop does not move or rename folders that may contain received files.
 
 Received files are content transfers, not filesystem clones. Drop writes ordinary files with the destination filesystem’s default permissions. It does not preserve executable bits, timestamps, extended attributes, quarantine metadata, or Windows ACLs.
 

@@ -243,7 +243,7 @@ fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
 fn local_service_info(state: &AppState) -> Result<ServiceInfo, String> {
     let device = state.device();
     let stable_id = device.id.replace('-', "");
-    let instance_name = format!("Dead Drop {stable_id}");
+    let instance_name = format!("Drop {stable_id}");
     let host_name = format!("dead-drop-{stable_id}.local.");
     let protocol = device.protocol_version.to_string();
     let properties = [
@@ -1133,7 +1133,7 @@ mod tests {
         ];
         let service = ServiceInfo::new(
             SERVICE_TYPE,
-            "Dead Drop peer",
+            "Drop peer",
             "dead-drop-peer.local.",
             "192.168.1.20,10.0.0.20",
             4040,
@@ -1172,7 +1172,7 @@ mod tests {
         ];
         let service = ServiceInfo::new(
             SERVICE_TYPE,
-            "Dead Drop peer",
+            "Drop peer",
             "dead-drop-peer.local.",
             "2001:db8::20",
             4040,
@@ -1196,7 +1196,7 @@ mod tests {
         ];
         let service = ServiceInfo::new(
             SERVICE_TYPE,
-            "Dead Drop peer",
+            "Drop peer",
             "dead-drop-peer.local.",
             "192.168.1.20",
             4040,
@@ -1216,7 +1216,7 @@ mod tests {
             ];
             let service = ServiceInfo::new(
                 SERVICE_TYPE,
-                "Dead Drop peer",
+                "Drop peer",
                 "dead-drop-peer.local.",
                 "192.168.1.20",
                 4040,
@@ -1240,7 +1240,7 @@ mod tests {
         ];
         let service = ServiceInfo::new(
             SERVICE_TYPE,
-            "Dead Drop peer",
+            "Drop peer",
             "dead-drop-peer.local.",
             "192.168.1.20",
             4040,
