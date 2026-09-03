@@ -1,13 +1,17 @@
 use crate::{
+    connectivity::{
+        connect_and_identify, ConnectivityError, IdentifiedConnection, IDENTIFICATION_TIMEOUT,
+        MAX_ROUTE_ATTEMPTS, ROUTE_CONNECT_TIMEOUT, ROUTE_STAGGER,
+    },
     models::{
-        AppState, Cancellation, DeviceIdentity, IncomingTransfer, Peer, TransferFile,
-        TransferLifecycle, TransferPhase, TransferSnapshot, MAX_FILENAME_BYTES, MAX_TRANSFER_BYTES,
-        MAX_TRANSFER_FILES,
+        AppState, Cancellation, DeviceIdentity, Endpoint, EndpointReachability, IncomingTransfer,
+        Peer, RuntimeDiagnostics, TransferFile, TransferLifecycle, TransferPhase, TransferSnapshot,
+        MAX_FILENAME_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES,
     },
     platform,
     protocol::{
-        portable_file_name, read_frame, validate_transfer_request, write_control, write_data,
-        ControlMessage, Frame, ProtocolError,
+        portable_file_name, read_frame, read_identification, validate_transfer_request,
+        write_control, write_data, write_identification, ControlMessage, Frame, ProtocolError,
     },
 };
 use sha2::{Digest, Sha256};
@@ -27,12 +31,12 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc,
     task::JoinHandle,
-    time::{sleep, timeout},
+    task::JoinSet,
+    time::{sleep, sleep_until, timeout},
 };
 use uuid::Uuid;
 
 const CHUNK_SIZE: usize = 96 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(45);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -52,6 +56,8 @@ enum TransferError {
     Timeout(&'static str),
     #[error("connection failed: {0}")]
     Connection(String),
+    #[error("connection closed")]
+    ConnectionClosed,
     #[error("protocol failure: {0}")]
     Protocol(String),
     #[error("incompatible Drop protocol version")]
@@ -87,6 +93,7 @@ impl TransferError {
             Self::Timeout("write") => "Connection timed out.".to_string(),
             Self::Timeout(_) => "The other device stopped responding.".to_string(),
             Self::Connection(_) => "Device went offline.".to_string(),
+            Self::ConnectionClosed => "Device went offline.".to_string(),
             Self::Protocol(_) => "Transfer protocol error.".to_string(),
             Self::IncompatibleVersion => "Incompatible Drop version.".to_string(),
             Self::InvalidPeerResponse(_) => {
@@ -126,6 +133,13 @@ struct StagedFile {
 pub(crate) trait EventSink: Send + Sync {
     fn emit_transfer_update(&self, snapshot: &TransferSnapshot) -> Result<(), String>;
     fn emit_incoming_transfer(&self, transfer: &IncomingTransfer) -> Result<(), String>;
+
+    fn emit_connectivity_diagnostics(
+        &self,
+        _diagnostics: &RuntimeDiagnostics,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 struct TauriEventSink {
@@ -142,6 +156,15 @@ impl EventSink for TauriEventSink {
     fn emit_incoming_transfer(&self, transfer: &IncomingTransfer) -> Result<(), String> {
         self.app
             .emit("incoming-transfer", transfer)
+            .map_err(|error| error.to_string())
+    }
+
+    fn emit_connectivity_diagnostics(
+        &self,
+        diagnostics: &RuntimeDiagnostics,
+    ) -> Result<(), String> {
+        self.app
+            .emit("connectivity-diagnostics", diagnostics)
             .map_err(|error| error.to_string())
     }
 }
@@ -393,8 +416,6 @@ async fn send_files(
         peer.id
     );
     let prepared = prepare_files(paths, cancellation.clone(), shutdown.clone()).await?;
-    let cancellation = cancellation.as_ref();
-    let shutdown = shutdown.as_ref();
     if prepared.is_empty() {
         return Err(TransferError::Prepare {
             detail: "no files selected".to_string(),
@@ -410,54 +431,25 @@ async fn send_files(
         .map_err(|error| TransferError::Protocol(error.to_string()))?;
     tracker.set_files(files.clone(), total_bytes);
     tracker.transition(TransferPhase::Requesting, None);
-    check_cancelled(cancellation, shutdown)?;
+    check_cancelled(cancellation.as_ref(), shutdown.as_ref())?;
 
-    let route_candidates = peer.route_candidates();
-    let stream = connect_to_peer(&route_candidates, cancellation, shutdown).await?;
-    let _ = stream.set_nodelay(true);
-    let (mut reader, mut writer) = stream.into_split();
-    write_control_with_timeout(
-        &mut writer,
-        &ControlMessage::Hello {
-            protocol_version: crate::models::PROTOCOL_VERSION,
-            device: state.device(),
-        },
-        FRAME_TIMEOUT,
-        cancellation,
-        shutdown,
+    let connected = connect_to_peer(
+        tracker.events.clone(),
+        state,
+        peer,
+        cancellation.clone(),
+        shutdown.clone(),
     )
     .await?;
-    match read_control_with_timeout(&mut reader, FRAME_TIMEOUT, "read", cancellation, shutdown)
-        .await?
-    {
-        ControlMessage::Hello {
-            protocol_version,
-            device,
-        } if protocol_version == crate::models::PROTOCOL_VERSION
-            && same_device_id(&device.id, &peer.id) =>
-        {
-            eprintln!(
-                "[dead-drop][protocol] negotiated version {} with {}",
-                protocol_version, peer.id
-            );
-        }
-        ControlMessage::Hello {
-            protocol_version, ..
-        } if protocol_version != crate::models::PROTOCOL_VERSION => {
-            return Err(TransferError::IncompatibleVersion);
-        }
-        ControlMessage::ProtocolError { message } => return Err(remote_protocol_error(&message)),
-        ControlMessage::Hello { .. } => {
-            return Err(TransferError::InvalidPeerResponse(
-                "hello identity did not match the selected peer".to_string(),
-            ))
-        }
-        _ => {
-            return Err(TransferError::InvalidPeerResponse(
-                "expected a hello response".to_string(),
-            ))
-        }
-    }
+    state.remember_peer(&connected.identity, connected.endpoint);
+    let _ = tracker
+        .events
+        .emit_connectivity_diagnostics(&state.runtime_diagnostics());
+    let stream = connected.stream;
+    let _ = stream.set_nodelay(true);
+    let (mut reader, mut writer) = stream.into_split();
+    let cancellation = cancellation.as_ref();
+    let shutdown = shutdown.as_ref();
     write_control_with_timeout(
         &mut writer,
         &ControlMessage::TransferRequest {
@@ -670,17 +662,31 @@ async fn handle_incoming(
 ) -> Result<(), TransferError> {
     let shutdown = state.shutdown_token();
     let connection_cancellation = Cancellation::new();
+    let remote_address = stream.peer_addr().ok();
+    let local_address = stream.local_addr().ok();
     let _ = stream.set_nodelay(true);
     let (mut reader, mut writer) = stream.into_split();
-    let sender = match read_control_with_timeout(
+    let sender_message = match read_identification_with_timeout(
         &mut reader,
-        FRAME_TIMEOUT,
-        "read",
+        IDENTIFICATION_TIMEOUT,
         &connection_cancellation,
         shutdown.as_ref(),
     )
-    .await?
+    .await
     {
+        Ok(message) => message,
+        Err(error) => {
+            if matches!(
+                &error,
+                TransferError::Protocol(message)
+                    if message.contains("expected a Drop Hello message")
+            ) {
+                send_protocol_error(&mut writer, "Expected a Drop hello message.").await;
+            }
+            return Err(error);
+        }
+    };
+    let sender = match sender_message {
         ControlMessage::Hello {
             protocol_version,
             device,
@@ -702,13 +708,10 @@ async fn handle_incoming(
             "peer identity matches local identity".to_string(),
         ));
     }
-    write_control_with_timeout(
+    write_identification_with_timeout(
         &mut writer,
-        &ControlMessage::Hello {
-            protocol_version: crate::models::PROTOCOL_VERSION,
-            device: state.device(),
-        },
-        FRAME_TIMEOUT,
+        &state.device(),
+        IDENTIFICATION_TIMEOUT,
         &connection_cancellation,
         shutdown.as_ref(),
     )
@@ -718,15 +721,27 @@ async fn handle_incoming(
         crate::models::PROTOCOL_VERSION,
         sender.id
     );
-    let (transfer_id, files, total_bytes) = match read_control_with_timeout(
+    let request = match read_control_with_timeout(
         &mut reader,
         FRAME_TIMEOUT,
         "read",
         &connection_cancellation,
         shutdown.as_ref(),
     )
-    .await?
+    .await
     {
+        Ok(request) => request,
+        Err(TransferError::ConnectionClosed) => {
+            if let Some(remote_address) = remote_address {
+                eprintln!(
+                    "[dead-drop][discovery] identification probe completed from {remote_address}"
+                );
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let (transfer_id, files, total_bytes) = match request {
         ControlMessage::TransferRequest {
             transfer_id,
             files,
@@ -743,6 +758,12 @@ async fn handle_incoming(
             ));
         }
     };
+    if let (Some(remote_address), Some(local_address)) = (remote_address, local_address) {
+        state.remember_peer(
+            &sender,
+            SocketAddr::new(remote_address.ip(), local_address.port()),
+        );
+    }
     if let Err(_reason) = state.try_begin_transfer(&transfer_id) {
         eprintln!("[dead-drop][transfer] rejected incoming {transfer_id}: application is busy");
         send_control_bounded(
@@ -1427,19 +1448,152 @@ async fn write_decision(
     .ok_or_else(|| TransferError::Connection("could not send transfer decision".to_string()))
 }
 
+struct ConnectedPeer {
+    stream: TcpStream,
+    identity: DeviceIdentity,
+    endpoint: SocketAddr,
+}
+
 async fn connect_to_peer(
+    events: Arc<dyn EventSink>,
+    state: &Arc<AppState>,
+    peer: &Peer,
+    cancellation: Arc<Cancellation>,
+    shutdown: Arc<Cancellation>,
+) -> Result<ConnectedPeer, TransferError> {
+    let candidates = peer.route_candidates();
+    if candidates.is_empty() {
+        return Err(TransferError::Connection(
+            "peer did not advertise a usable IPv4 endpoint".to_string(),
+        ));
+    }
+
+    let attempt_limit = candidates.len().min(MAX_ROUTE_ATTEMPTS);
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at + ROUTE_CONNECT_TIMEOUT;
+    let mut next_index = 0;
+    let mut next_launch = started_at;
+    let mut last_error = None;
+    let mut attempts: JoinSet<
+        Result<(Endpoint, IdentifiedConnection), (Endpoint, ConnectivityError)>,
+    > = JoinSet::new();
+
+    loop {
+        if attempts.is_empty() && next_index >= attempt_limit {
+            break;
+        }
+        tokio::select! {
+            result = attempts.join_next(), if !attempts.is_empty() => {
+                match result {
+                    Some(Ok(Ok((endpoint, connection)))) => {
+                        attempts.abort_all();
+                        let changed = state.mark_endpoint_reachability(
+                            &peer.id,
+                            endpoint.address,
+                            EndpointReachability::Reachable,
+                        );
+                        if changed {
+                            let _ = events.emit_connectivity_diagnostics(&state.runtime_diagnostics());
+                        }
+                        eprintln!(
+                            "[dead-drop][route] Connected to {} via {}",
+                            peer.name, endpoint.address
+                        );
+                        return Ok(ConnectedPeer {
+                            stream: connection.stream,
+                            identity: connection.identity,
+                            endpoint: endpoint.address,
+                        });
+                    }
+                    Some(Ok(Err((endpoint, error)))) => {
+                        if !matches!(error, ConnectivityError::Canceled | ConnectivityError::ShuttingDown) {
+                            let changed = state.mark_endpoint_reachability(
+                                &peer.id,
+                                endpoint.address,
+                                EndpointReachability::Unreachable,
+                            );
+                            if changed {
+                                let _ = events.emit_connectivity_diagnostics(&state.runtime_diagnostics());
+                            }
+                            eprintln!(
+                                "[dead-drop][route] Endpoint {} unavailable: {}",
+                                endpoint.address, error
+                            );
+                            last_error = Some(error.to_string());
+                        }
+                        if matches!(error, ConnectivityError::Canceled) {
+                            return Err(TransferError::Canceled);
+                        }
+                        if matches!(error, ConnectivityError::ShuttingDown) {
+                            return Err(TransferError::ShuttingDown);
+                        }
+                    }
+                    Some(Err(error)) => {
+                        last_error = Some(format!("route attempt failed: {error}"));
+                    }
+                    None => {}
+                }
+            }
+            _ = sleep_until(next_launch), if next_index < attempt_limit => {
+                let endpoint = candidates[next_index].clone();
+                next_index += 1;
+                let local = state.device();
+                let expected_peer_id = peer.id.clone();
+                let attempt_cancellation = cancellation.clone();
+                let attempt_shutdown = shutdown.clone();
+                eprintln!(
+                    "[dead-drop][route] Trying {} endpoint {}",
+                    peer.name, endpoint.address
+                );
+                attempts.spawn(async move {
+                    let result = connect_and_identify(
+                        endpoint.address,
+                        &local,
+                        Some(&expected_peer_id),
+                        attempt_cancellation.as_ref(),
+                        attempt_shutdown.as_ref(),
+                    )
+                    .await;
+                    result
+                        .map(|connection| (endpoint.clone(), connection))
+                        .map_err(|error| (endpoint, error))
+                });
+                next_launch = tokio::time::Instant::now() + ROUTE_STAGGER;
+            }
+            _ = sleep_until(deadline) => {
+                last_error = Some("connection timed out".to_string());
+                attempts.abort_all();
+                break;
+            }
+            _ = cancellation.cancelled() => {
+                attempts.abort_all();
+                return Err(TransferError::Canceled);
+            }
+            _ = shutdown.cancelled() => {
+                attempts.abort_all();
+                return Err(TransferError::ShuttingDown);
+            }
+        }
+    }
+    Err(TransferError::Connection(
+        last_error.unwrap_or_else(|| "could not connect to peer".to_string()),
+    ))
+}
+
+#[cfg(test)]
+async fn connect_to_addresses(
     endpoints: &[SocketAddr],
     cancellation: &Cancellation,
     shutdown: &Cancellation,
 ) -> Result<TcpStream, TransferError> {
     if endpoints.is_empty() {
         return Err(TransferError::Connection(
-            "peer did not advertise a usable IPv4 endpoint".to_string(),
+            "peer did not advertise a usable endpoint".to_string(),
         ));
     }
 
     let mut last_error = None;
-    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + ROUTE_CONNECT_TIMEOUT;
     for endpoint in endpoints {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -1483,6 +1637,25 @@ async fn read_frame_with_timeout(
     }
 }
 
+async fn read_identification_with_timeout(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    duration: Duration,
+    cancellation: &Cancellation,
+    shutdown: &Cancellation,
+) -> Result<ControlMessage, TransferError> {
+    tokio::select! {
+        result = timeout(duration, read_identification(reader)) => {
+            match result {
+                Ok(Ok(message)) => Ok(message),
+                Ok(Err(error)) => Err(protocol_failure(error)),
+                Err(_) => Err(TransferError::Timeout("identification")),
+            }
+        }
+        _ = cancellation.cancelled() => Err(TransferError::Canceled),
+        _ = shutdown.cancelled() => Err(TransferError::ShuttingDown),
+    }
+}
+
 async fn read_control_with_timeout(
     reader: &mut tokio::net::tcp::OwnedReadHalf,
     duration: Duration,
@@ -1511,6 +1684,26 @@ async fn write_control_with_timeout(
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => Err(protocol_failure(error)),
                 Err(_) => Err(TransferError::Timeout("write")),
+            }
+        }
+        _ = cancellation.cancelled() => Err(TransferError::Canceled),
+        _ = shutdown.cancelled() => Err(TransferError::ShuttingDown),
+    }
+}
+
+async fn write_identification_with_timeout(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    device: &DeviceIdentity,
+    duration: Duration,
+    cancellation: &Cancellation,
+    shutdown: &Cancellation,
+) -> Result<(), TransferError> {
+    tokio::select! {
+        result = timeout(duration, write_identification(writer, device)) => {
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(protocol_failure(error)),
+                Err(_) => Err(TransferError::Timeout("identification write")),
             }
         }
         _ = cancellation.cancelled() => Err(TransferError::Canceled),
@@ -1727,6 +1920,9 @@ fn check_cancelled(
 
 fn protocol_failure(error: ProtocolError) -> TransferError {
     match error {
+        ProtocolError::Io(error) if error.kind() == ErrorKind::UnexpectedEof => {
+            TransferError::ConnectionClosed
+        }
         ProtocolError::Io(error) => TransferError::Connection(error.to_string()),
         other => TransferError::Protocol(other.to_string()),
     }
@@ -1776,7 +1972,11 @@ fn speed_for(transferred: u64, started_at: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::{Endpoint, EndpointSource, RouteClass};
+    use crate::{
+        models::PROTOCOL_VERSION,
+        peer::{Endpoint, EndpointSource, RouteClass},
+        test_support::{state_for_tests, RecordingEventSink},
+    };
     use proptest::prelude::*;
     use std::{io::Write, net::Ipv4Addr};
     use uuid::Uuid;
@@ -2004,7 +2204,7 @@ mod tests {
         ];
 
         let candidates = crate::routing::ordered_addresses(&endpoints);
-        let stream = connect_to_peer(&candidates, &Cancellation::new(), &Cancellation::new())
+        let stream = connect_to_addresses(&candidates, &Cancellation::new(), &Cancellation::new())
             .await
             .expect("connection should fall back to the second endpoint");
         let (_accepted, accepted_address) = fallback_listener
@@ -2013,5 +2213,75 @@ mod tests {
             .expect("fallback listener should accept the connection");
         assert!(accepted_address.ip().is_loopback());
         drop(stream);
+    }
+
+    #[tokio::test]
+    async fn route_selection_falls_back_after_a_failed_identification() {
+        let preferred_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("temporary listener should bind");
+        let preferred_address = preferred_listener
+            .local_addr()
+            .expect("temporary listener address should be available");
+        drop(preferred_listener);
+
+        let fallback_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("fallback listener should bind");
+        let fallback_address = fallback_listener
+            .local_addr()
+            .expect("fallback listener address should be available");
+        let identity = DeviceIdentity {
+            id: "22222222-2222-4222-8222-222222222222".to_string(),
+            name: "Fallback peer".to_string(),
+            os: "Test OS".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let server = tokio::spawn({
+            let identity = identity.clone();
+            async move {
+                let (mut stream, _) = fallback_listener
+                    .accept()
+                    .await
+                    .expect("fallback listener should accept");
+                let hello = read_identification(&mut stream)
+                    .await
+                    .expect("client should identify itself");
+                assert!(matches!(hello, ControlMessage::Hello { .. }));
+                write_identification(&mut stream, &identity)
+                    .await
+                    .expect("fallback peer should identify itself");
+            }
+        });
+        let state = state_for_tests(Path::new("/tmp"));
+        let peer = Peer::new(
+            identity,
+            vec![
+                Endpoint::new(
+                    preferred_address,
+                    EndpointSource::new("test", "local", "preferred"),
+                    RouteClass::DirectLocal,
+                    Instant::now(),
+                ),
+                Endpoint::new(
+                    fallback_address,
+                    EndpointSource::new("test", "overlay", "fallback"),
+                    RouteClass::Overlay,
+                    Instant::now(),
+                ),
+            ],
+        );
+        let connected = connect_to_peer(
+            Arc::new(RecordingEventSink::default()),
+            &state,
+            &peer,
+            Arc::new(Cancellation::new()),
+            Arc::new(Cancellation::new()),
+        )
+        .await
+        .expect("route selection should use the working fallback");
+        assert_eq!(connected.endpoint, fallback_address);
+        drop(connected);
+        server.await.expect("fallback server should not panic");
     }
 }

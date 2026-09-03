@@ -1,3 +1,4 @@
+mod connectivity;
 mod discovery;
 mod models;
 mod peer;
@@ -8,9 +9,9 @@ mod routing;
 pub mod test_support;
 mod transfer;
 
-use models::{AppState, Preferences, PreferencesDraft, StartupSnapshot};
+use models::{AppState, PeerSnapshot, Preferences, PreferencesDraft, StartupSnapshot};
 use std::{error::Error, net::TcpListener as StdTcpListener, sync::Arc};
-use tauri::State;
+use tauri::{Emitter, State};
 
 #[tauri::command]
 fn initial_state(state: State<'_, Arc<AppState>>) -> StartupSnapshot {
@@ -74,6 +75,62 @@ async fn send_files(
 }
 
 #[tauri::command]
+async fn connect_by_address(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    address: String,
+) -> Result<PeerSnapshot, String> {
+    let endpoints = connectivity::resolve_manual_target(&address).await?;
+    let local = state.device();
+    let shutdown = state.shutdown_token();
+    let cancellation = models::Cancellation::new();
+    let mut last_error = None;
+    for endpoint in endpoints {
+        match connectivity::connect_and_identify(
+            endpoint,
+            &local,
+            None,
+            &cancellation,
+            shutdown.as_ref(),
+        )
+        .await
+        {
+            Ok(connection) => {
+                let mut discovered = peer::Endpoint::new(
+                    endpoint,
+                    peer::EndpointSource::new("manual", "tcp", endpoint.to_string()),
+                    peer::RouteClass::Other,
+                    std::time::Instant::now(),
+                );
+                discovered.reachability = peer::EndpointReachability::Reachable;
+                let peer_id = connection.identity.id.clone();
+                state.apply_discovery_observation(peer::DiscoveryObservation {
+                    identity: connection.identity.clone(),
+                    source: discovered.source.clone(),
+                    endpoints: vec![discovered],
+                });
+                state.remember_peer(&connection.identity, endpoint);
+                let peer = state
+                    .peers()
+                    .into_iter()
+                    .find(|peer| peer.id == peer_id)
+                    .ok_or_else(|| "The device could not be added.".to_string())?;
+                let _ = app.emit("peers-updated", state.peers());
+                let _ = app.emit("connectivity-diagnostics", state.runtime_diagnostics());
+                return Ok(peer);
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    Err(format!(
+        "No compatible Drop device responded at that address{}.",
+        last_error
+            .map(|error| format!(" ({error})"))
+            .unwrap_or_default()
+    ))
+}
+
+#[tauri::command]
 fn cancel_transfer(state: State<'_, Arc<AppState>>, transfer_id: String) -> Result<(), String> {
     state.cancel_transfer(&transfer_id)
 }
@@ -85,7 +142,7 @@ pub fn run() {
 }
 
 fn run_inner() -> Result<(), Box<dyn Error>> {
-    let std_listener = StdTcpListener::bind(("0.0.0.0", 0))?;
+    let std_listener = StdTcpListener::bind(("0.0.0.0", connectivity::DROP_SERVICE_PORT))?;
     std_listener.set_nonblocking(true)?;
     let listener_port = std_listener.local_addr()?.port();
     let state = Arc::new(AppState::load(listener_port));
@@ -107,6 +164,7 @@ fn run_inner() -> Result<(), Box<dyn Error>> {
             update_preferences,
             respond_to_incoming,
             send_files,
+            connect_by_address,
             cancel_transfer
         ])
         .build(tauri::generate_context!())?;

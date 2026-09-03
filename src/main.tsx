@@ -11,6 +11,7 @@ import {
   chooseFiles,
   chooseDirectory,
   command,
+  type DiscoverySourceDiagnostics,
   isNativeRuntime,
   type IncomingTransfer,
   type Peer,
@@ -25,7 +26,6 @@ const previewPeers: Peer[] = [
     id: "preview-thinkpad",
     name: "Charlie's ThinkPad",
     os: "Windows 11",
-    endpoint: "192.168.1.24:0",
     online: true,
     protocolVersion: 1,
   },
@@ -33,7 +33,6 @@ const previewPeers: Peer[] = [
     id: "preview-desktop",
     name: "Desktop",
     os: "Linux",
-    endpoint: "192.168.1.44:0",
     online: true,
     protocolVersion: 1,
   },
@@ -48,6 +47,13 @@ const previewDiagnostics: RuntimeDiagnostics = {
   transport: "IPv4",
   listenerPort: 0,
   receiveDirectoryAvailable: true,
+  discovery: {
+    mdns: { status: "preview", detail: null },
+    localFallback: { status: "preview", detail: null },
+    tailscale: { status: "not-detected", detail: null },
+    rememberedPeers: 0,
+  },
+  peers: [],
 };
 
 const phaseOrder: Record<Transfer["phase"], number> = {
@@ -139,6 +145,9 @@ function App() {
           setIsSettingsOpen(false);
         }),
         attach<string>("discovery-status", (status) => setNotice(status)),
+        attach<RuntimeDiagnostics>("connectivity-diagnostics", (nextDiagnostics) => {
+          setDiagnostics(nextDiagnostics);
+        }),
       ]);
       if (!mounted) return;
       try {
@@ -195,7 +204,7 @@ function App() {
     }
     const peer = selectedPeerRef.current;
     if (!peer) {
-      setNotice("Choose a nearby device first.");
+      setNotice("Choose a device first.");
       return;
     }
     if (!peer.online) {
@@ -245,7 +254,7 @@ function App() {
       return;
     }
     if (!selectedPeerRef.current) {
-      setNotice("Choose a nearby device first.");
+      setNotice("Choose a device first.");
       return;
     }
     if (!native) {
@@ -298,7 +307,7 @@ function App() {
         <div className="brand" data-tauri-drag-region aria-label="Drop">
           <span>Drop</span>
         </div>
-        <section className="device-section" aria-label="Nearby devices">
+        <section className="device-section" aria-label="Devices">
           <p className="eyebrow">Devices</p>
           <div className="device-list">
             {peers.map((peer) => {
@@ -331,7 +340,7 @@ function App() {
                 </button>
               );
             })}
-            {!peers.length && <p className="device-empty">Looking for nearby devices</p>}
+            {!peers.length && <p className="device-empty">Looking for reachable devices</p>}
           </div>
         </section>
         <button
@@ -388,6 +397,15 @@ function App() {
               preferences={preferences}
               diagnostics={diagnostics}
               onClose={() => setIsSettingsOpen(false)}
+              onPeerConnected={(peer) => {
+                setPeers((current) => {
+                  const withoutPeer = current.filter((candidate) => candidate.id !== peer.id);
+                  return [...withoutPeer, peer];
+                });
+                setSelectedId(peer.id);
+                setIsSettingsOpen(false);
+                setNotice(`${peer.name} is ready.`);
+              }}
               onSave={async (draft) => {
                 if (!native) {
                   setPreferences({ deviceName: draft.deviceName.trim(), destination: draft.destination.trim() });
@@ -447,7 +465,7 @@ function App() {
             <p>{viewLocked ? "Transfer in progress" : selectedPeer ? "Drop to send" : "Choose a device first"}</p>
             <span>
               <ArrowIcon />
-              {viewLocked ? "Finish the current transfer" : selectedPeer ? selectedPeer.name : "Select a nearby device"}
+              {viewLocked ? "Finish the current transfer" : selectedPeer ? selectedPeer.name : "Select a device"}
             </span>
           </div>
         )}
@@ -479,7 +497,7 @@ function SendPanel({ peer, onChoose }: { peer: Peer; onChoose: () => void }) {
       <div className="drop-prompt">
         <FileIcon />
         <h2>Drop files anywhere</h2>
-        <p>{compatible ? "or choose files" : "Choose another nearby device"}</p>
+        <p>{compatible ? "or choose files" : "Choose another device"}</p>
         <button className="outline-button" type="button" onClick={onChoose} disabled={!compatible}>
           Choose files
         </button>
@@ -494,7 +512,7 @@ function NoDevicePanel() {
       <div className="no-device-copy">
         <RadarIcon />
         <h1>Waiting for a device</h1>
-        <p>Nearby devices appear here automatically.</p>
+        <p>Reachable Drop devices appear here automatically.</p>
       </div>
     </div>
   );
@@ -615,17 +633,22 @@ function SettingsPanel({
   preferences,
   diagnostics,
   onClose,
+  onPeerConnected,
   onSave,
 }: {
   native: boolean;
   preferences: Preferences;
   diagnostics: RuntimeDiagnostics | null;
   onClose: () => void;
+  onPeerConnected: (peer: Peer) => void;
   onSave: (draft: Preferences) => Promise<void>;
 }) {
   const [draft, setDraft] = useState(preferences);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [address, setAddress] = useState("");
+  const [connecting, setConnecting] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   useEffect(() => setDraft(preferences), [preferences]);
   const save = async () => {
     if (saving) return;
@@ -639,23 +662,41 @@ function SettingsPanel({
       setSaving(false);
     }
   };
+  const connectByAddress = async () => {
+    if (connecting || !address.trim()) return;
+    if (!native) {
+      setConnectionError("Address fallback is available in the installed app.");
+      return;
+    }
+    setConnecting(true);
+    setConnectionError(null);
+    try {
+      const peer = await command.connectByAddress(address.trim());
+      onPeerConnected(peer);
+      setAddress("");
+    } catch (reason) {
+      setConnectionError(userFacingError(reason, "No compatible Drop device responded."));
+    } finally {
+      setConnecting(false);
+    }
+  };
   return (
-    <form
-      className="settings-panel state-panel"
-      noValidate
-      onSubmit={(event) => {
-        event.preventDefault();
-        void save();
-      }}
-    >
-      <h1>Settings</h1>
+    <div className="settings-panel state-panel">
+      <form
+        noValidate
+        onSubmit={(event) => {
+          event.preventDefault();
+          void save();
+        }}
+      >
+        <h1>Settings</h1>
       <p className="settings-intro">Drop stays local. It stores only this device name and receiving folder.</p>
       <div className={`settings-health ${diagnostics?.receiveDirectoryAvailable === false ? "is-warning" : ""}`} role="status">
         <span className="health-mark" aria-hidden="true" />
         <span>
           <strong>{diagnostics?.receiveDirectoryAvailable === false ? "Receive folder unavailable" : "Ready"}</strong>
           <small>
-            {diagnostics?.transport ?? "IPv4"} mDNS · UDP 5353 · {diagnostics?.listenerPort ? `TCP ${diagnostics.listenerPort}` : "automatic transfer port"}
+            {diagnostics?.transport ?? "IPv4"} · {diagnostics?.listenerPort ? `TCP ${diagnostics.listenerPort}` : "automatic service port"} · automatic discovery
           </small>
         </span>
       </div>
@@ -676,10 +717,65 @@ function SettingsPanel({
         </span>
       </label>
       {error && <p id="settings-error" className="settings-error" role="alert">{error}</p>}
-      <div className="settings-actions">
-        <button type="submit" className="primary-button" disabled={saving}>{saving ? "Saving…" : "Save"}</button>
-        <button type="button" className="text-button" onClick={onClose} disabled={saving}>Close</button>
-      </div>
+        <div className="settings-actions">
+          <button type="submit" className="primary-button" disabled={saving}>{saving ? "Saving…" : "Save"}</button>
+          <button type="button" className="text-button" onClick={onClose} disabled={saving}>Close</button>
+        </div>
+      </form>
+      <details className="diagnostics-disclosure">
+        <summary>Connection diagnostics</summary>
+        <div className="diagnostics-body">
+          <div className="diagnostic-status-list" aria-label="Discovery status">
+            <DiagnosticStatus label="mDNS" source={diagnostics?.discovery.mdns} />
+            <DiagnosticStatus label="Local fallback" source={diagnostics?.discovery.localFallback} />
+            <DiagnosticStatus label="Tailscale" source={diagnostics?.discovery.tailscale} />
+          </div>
+          <p className="diagnostic-count">
+            {diagnostics?.discovery.rememberedPeers ?? 0} remembered peer{diagnostics?.discovery.rememberedPeers === 1 ? "" : "s"} available for revalidation.
+          </p>
+          <form
+            className="address-fallback"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void connectByAddress();
+            }}
+          >
+            <label htmlFor="drop-address">Connect by address
+              <span className="path-field">
+                <input
+                  id="drop-address"
+                  value={address}
+                  placeholder="192.168.1.40 or 100.75.12.8"
+                  inputMode="url"
+                  autoComplete="off"
+                  spellCheck={false}
+                  onChange={(event) => setAddress(event.target.value)}
+                />
+                <button className="outline-button path-button" type="submit" disabled={connecting || !address.trim()}>
+                  {connecting ? "Checking…" : "Connect"}
+                </button>
+              </span>
+            </label>
+            <p>For unusual private or overlay networks. Drop v1 does not encrypt ordinary LAN traffic.</p>
+            {connectionError && <p className="settings-error" role="alert">{connectionError}</p>}
+          </form>
+          <div className="diagnostic-peer-list">
+            {(diagnostics?.peers ?? []).map((peer) => (
+              <div className="diagnostic-peer" key={peer.id}>
+                <strong>{peer.name}</strong>
+                <small>{peer.os} · protocol {peer.protocolVersion} · {peer.id}</small>
+                <small>{peer.selectedRoute ? `Selected ${peer.selectedRoute}` : "No route selected"}</small>
+                {peer.endpoints.map((endpoint) => (
+                  <span className="diagnostic-endpoint" key={`${peer.id}-${endpoint.address}`}>
+                    {endpoint.address} · {endpoint.reachability} · {endpoint.sources.join(", ") || "unknown source"} · {formatLastSeen(endpoint.lastSeenSecondsAgo)}
+                  </span>
+                ))}
+              </div>
+            ))}
+            {diagnostics && !diagnostics.peers.length && <p className="diagnostic-empty">No Drop peers are currently available.</p>}
+          </div>
+        </div>
+      </details>
       <section className="about-section" aria-labelledby="about-heading">
         <p className="eyebrow" id="about-heading">About</p>
         <p className="plain-wordmark">PLAIN/</p>
@@ -687,8 +783,38 @@ function SettingsPanel({
         <p className="about-credit">Made by Continental</p>
       </section>
       {!native && <p className="preview-caption">Changes are shown only in this preview.</p>}
-    </form>
+    </div>
   );
+}
+
+function DiagnosticStatus({
+  label,
+  source,
+}: {
+  label: string;
+  source?: DiscoverySourceDiagnostics;
+}) {
+  const status = source?.status ?? "starting";
+  return (
+    <div className="diagnostic-status">
+      <span>{label}</span>
+      <strong>{diagnosticStatusLabel(status)}</strong>
+      {source?.detail && <small title={source.detail}>{source.detail}</small>}
+    </div>
+  );
+}
+
+function diagnosticStatusLabel(status: string) {
+  return status
+    .replaceAll("-", " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function formatLastSeen(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "last seen unknown";
+  if (seconds < 5) return "seen just now";
+  if (seconds < 60) return `seen ${Math.round(seconds)}s ago`;
+  return `seen ${Math.round(seconds / 60)}m ago`;
 }
 
 function DeviceIcon({ os }: { os: string }) { return os.toLowerCase().includes("linux") || os.toLowerCase().includes("desktop") ? <DesktopIcon /> : <LaptopIcon />; }

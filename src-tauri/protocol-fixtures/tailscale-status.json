@@ -1,0 +1,13 @@
+{
+  "BackendState": "Running",
+  "Peer": {
+    "key:fixture-online": {
+      "Online": true,
+      "TailscaleIPs": ["100.75.12.8", "fd7a:115c:a1e0::8"]
+    },
+    "key:fixture-offline": {
+      "Online": false,
+      "TailscaleIPs": ["100.75.12.9"]
+    }
+  }
+}

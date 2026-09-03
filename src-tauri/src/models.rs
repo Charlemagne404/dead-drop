@@ -1,5 +1,6 @@
 pub use crate::peer::{
-    DeviceIdentity, DiscoveryObservation, EndpointSource, Peer, PeerRegistry, PeerSnapshot,
+    DeviceIdentity, DiscoveryObservation, Endpoint, EndpointReachability, EndpointSource, Peer,
+    PeerDiagnosticsSnapshot, PeerRegistry, PeerSnapshot,
 };
 use crate::platform;
 use parking_lot::{Mutex, RwLock};
@@ -8,11 +9,13 @@ use std::{
     collections::HashMap,
     fs,
     io::{self, Read},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -22,6 +25,51 @@ pub const MAX_TRANSFER_FILES: usize = 256;
 pub const MAX_FILENAME_BYTES: usize = 255;
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 const MAX_PERSISTED_SETTINGS_BYTES: u64 = 64 * 1024;
+const MAX_REMEMBERED_PEERS: usize = 64;
+const MAX_REMEMBERED_ENDPOINTS: usize = 8;
+const MAX_REMEMBERED_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverySourceDiagnostics {
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryDiagnostics {
+    pub mdns: DiscoverySourceDiagnostics,
+    pub local_fallback: DiscoverySourceDiagnostics,
+    pub tailscale: DiscoverySourceDiagnostics,
+    pub remembered_peers: usize,
+}
+
+#[derive(Clone, Debug)]
+struct DiscoveryStatusState {
+    mdns: DiscoverySourceDiagnostics,
+    local_fallback: DiscoverySourceDiagnostics,
+    tailscale: DiscoverySourceDiagnostics,
+}
+
+impl Default for DiscoveryStatusState {
+    fn default() -> Self {
+        Self {
+            mdns: DiscoverySourceDiagnostics {
+                status: "starting".to_string(),
+                detail: None,
+            },
+            local_fallback: DiscoverySourceDiagnostics {
+                status: "starting".to_string(),
+                detail: None,
+            },
+            tailscale: DiscoverySourceDiagnostics {
+                status: "not-detected".to_string(),
+                detail: None,
+            },
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,6 +203,8 @@ pub struct RuntimeDiagnostics {
     pub transport: String,
     pub listener_port: u16,
     pub receive_directory_available: bool,
+    pub discovery: DiscoveryDiagnostics,
+    pub peers: Vec<PeerDiagnosticsSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -163,12 +213,40 @@ struct PersistedSettings {
     device_id: String,
     device_name: String,
     destination: String,
+    #[serde(default)]
+    remembered_peers: Vec<PersistedRememberedPeer>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedRememberedPeer {
+    device_id: String,
+    device_name: String,
+    os: String,
+    protocol_version: u16,
+    endpoints: Vec<String>,
+    last_successful_at: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RememberedPeer {
+    identity: DeviceIdentity,
+    endpoints: Vec<SocketAddr>,
+    last_successful_at: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RememberedEndpointCandidate {
+    pub identity: DeviceIdentity,
+    pub address: SocketAddr,
 }
 
 pub struct AppState {
     device: RwLock<DeviceIdentity>,
     preferences: RwLock<Preferences>,
     peers: RwLock<PeerRegistry>,
+    remembered_peers: RwLock<Vec<RememberedPeer>>,
+    discovery_status: RwLock<DiscoveryStatusState>,
     pending_requests: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     cancellations: Mutex<HashMap<String, Arc<Cancellation>>>,
     active_transfer: Mutex<Option<String>>,
@@ -228,15 +306,22 @@ impl AppState {
                 destination: resolve_destination(&settings.destination, &fallback_destination)
                     .to_string_lossy()
                     .to_string(),
+                remembered_peers: sanitize_remembered_peers(settings.remembered_peers),
             })
             .unwrap_or_else(|| PersistedSettings {
                 device_id: Uuid::new_v4().to_string(),
                 device_name: fallback_name,
                 destination: fallback_destination.to_string_lossy().to_string(),
+                remembered_peers: Vec::new(),
             });
         let stored_device_name = stored.device_name.trim().to_string();
+        let remembered_peers = stored
+            .remembered_peers
+            .iter()
+            .filter_map(remembered_peer_from_persisted)
+            .collect();
 
-        let state = Self::new(
+        let state = Self::new_with_remembered(
             DeviceIdentity {
                 id: stored.device_id,
                 name: stored_device_name.clone(),
@@ -248,6 +333,7 @@ impl AppState {
                 destination: stored.destination,
             },
             listener_port,
+            remembered_peers,
         );
         if let Err(error) = state.persist() {
             eprintln!("[dead-drop][settings] could not persist startup settings: {error}");
@@ -255,15 +341,27 @@ impl AppState {
         state
     }
 
+    #[allow(dead_code)]
     pub(crate) fn new(
         device: DeviceIdentity,
         preferences: Preferences,
         listener_port: u16,
     ) -> Self {
+        Self::new_with_remembered(device, preferences, listener_port, Vec::new())
+    }
+
+    fn new_with_remembered(
+        device: DeviceIdentity,
+        preferences: Preferences,
+        listener_port: u16,
+        remembered_peers: Vec<RememberedPeer>,
+    ) -> Self {
         Self {
             device: RwLock::new(device),
             preferences: RwLock::new(preferences),
             peers: RwLock::new(PeerRegistry::new()),
+            remembered_peers: RwLock::new(remembered_peers),
+            discovery_status: RwLock::new(DiscoveryStatusState::default()),
             pending_requests: Mutex::new(HashMap::new()),
             cancellations: Mutex::new(HashMap::new()),
             active_transfer: Mutex::new(None),
@@ -288,6 +386,7 @@ impl AppState {
             device_id: device.id.clone(),
             device_name: preferences.device_name.clone(),
             destination: preferences.destination.clone(),
+            remembered_peers: self.persisted_remembered_peers(),
         };
         persist_settings(&path, &value)
     }
@@ -384,6 +483,7 @@ impl AppState {
             device_id,
             device_name: name.to_string(),
             destination: destination.to_string_lossy().to_string(),
+            remembered_peers: self.persisted_remembered_peers(),
         };
         let path = Self::settings_path()
             .ok_or_else(|| "Could not determine an application settings directory.".to_string())?;
@@ -416,12 +516,27 @@ impl AppState {
         self.peers.read().snapshots()
     }
 
+    pub fn peer_diagnostics(&self) -> Vec<PeerDiagnosticsSnapshot> {
+        self.peers.read().diagnostics()
+    }
+
     pub fn peer(&self, id: &str) -> Option<Peer> {
         self.peers.read().peer(id)
     }
 
     pub fn apply_discovery_observation(&self, observation: DiscoveryObservation) -> bool {
         self.peers.write().apply_observation(observation)
+    }
+
+    pub fn mark_endpoint_reachability(
+        &self,
+        peer_id: &str,
+        address: SocketAddr,
+        reachability: EndpointReachability,
+    ) -> bool {
+        self.peers
+            .write()
+            .mark_endpoint_reachability(peer_id, address, reachability)
     }
 
     pub fn remove_endpoint_source(&self, source: &EndpointSource) -> bool {
@@ -432,12 +547,109 @@ impl AppState {
         self.peers.write().remove_discovery_source(discovery)
     }
 
-    pub fn remove_stale_peers(
+    pub fn remove_stale_peers_from_discovery(
         &self,
+        discovery: &str,
         now: std::time::Instant,
         stale_after: std::time::Duration,
     ) -> bool {
-        self.peers.write().remove_stale(now, stale_after)
+        self.peers
+            .write()
+            .remove_stale_for_discovery(discovery, now, stale_after)
+    }
+
+    pub(crate) fn remembered_endpoint_candidates(&self) -> Vec<RememberedEndpointCandidate> {
+        let now = unix_now();
+        self.remembered_peers
+            .read()
+            .iter()
+            .filter(|peer| {
+                peer.last_successful_at <= now
+                    && now.saturating_sub(peer.last_successful_at) <= MAX_REMEMBERED_AGE_SECONDS
+            })
+            .flat_map(|peer| {
+                peer.endpoints
+                    .iter()
+                    .copied()
+                    .map(|address| RememberedEndpointCandidate {
+                        identity: peer.identity.clone(),
+                        address,
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn remember_peer(&self, identity: &DeviceIdentity, address: SocketAddr) {
+        if !valid_device_id(&identity.id)
+            || !valid_device_name(&identity.name)
+            || !valid_device_os(&identity.os)
+            || identity.protocol_version == 0
+            || !rememberable_endpoint(address)
+        {
+            return;
+        }
+        let now = unix_now();
+        {
+            let mut remembered = self.remembered_peers.write();
+            let id = Uuid::parse_str(&identity.id)
+                .expect("validated remembered peer id should parse")
+                .to_string();
+            let peer = remembered.iter_mut().find(|peer| peer.identity.id == id);
+            if let Some(peer) = peer {
+                peer.identity = identity.clone();
+                peer.last_successful_at = now;
+                if !peer.endpoints.contains(&address) {
+                    peer.endpoints.push(address);
+                }
+                peer.endpoints.sort();
+                while peer.endpoints.len() > MAX_REMEMBERED_ENDPOINTS {
+                    let remove_index = peer
+                        .endpoints
+                        .iter()
+                        .position(|candidate| *candidate != address)
+                        .unwrap_or(0);
+                    peer.endpoints.remove(remove_index);
+                }
+            } else {
+                remembered.push(RememberedPeer {
+                    identity: identity.clone(),
+                    endpoints: vec![address],
+                    last_successful_at: now,
+                });
+                remembered.sort_by(|left, right| {
+                    right
+                        .last_successful_at
+                        .cmp(&left.last_successful_at)
+                        .then_with(|| left.identity.id.cmp(&right.identity.id))
+                });
+                remembered.truncate(MAX_REMEMBERED_PEERS);
+            }
+        }
+        if let Err(error) = self.persist() {
+            eprintln!("[dead-drop][settings] could not remember peer: {error}");
+        }
+    }
+
+    pub(crate) fn set_discovery_status(
+        &self,
+        source: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> bool {
+        let mut diagnostics = self.discovery_status.write();
+        let target = match source {
+            "mdns" => &mut diagnostics.mdns,
+            "local-fallback" => &mut diagnostics.local_fallback,
+            "tailscale" => &mut diagnostics.tailscale,
+            _ => return false,
+        };
+        let detail = detail.map(str::to_string);
+        if target.status == status && target.detail == detail {
+            return false;
+        }
+        target.status = status.to_string();
+        target.detail = detail;
+        true
     }
 
     pub fn add_pending_request(&self, id: String, sender: oneshot::Sender<bool>) {
@@ -490,11 +702,34 @@ impl AppState {
 
     pub fn runtime_diagnostics(&self) -> RuntimeDiagnostics {
         let preferences = self.preferences();
+        let discovery_status = self.discovery_status.read().clone();
         RuntimeDiagnostics {
             transport: platform::TRANSPORT_NAME.to_string(),
             listener_port: self.listener_port,
             receive_directory_available: usable_destination(Path::new(&preferences.destination)),
+            discovery: DiscoveryDiagnostics {
+                mdns: discovery_status.mdns,
+                local_fallback: discovery_status.local_fallback,
+                tailscale: discovery_status.tailscale,
+                remembered_peers: self.remembered_peers.read().len(),
+            },
+            peers: self.peer_diagnostics(),
         }
+    }
+
+    fn persisted_remembered_peers(&self) -> Vec<PersistedRememberedPeer> {
+        self.remembered_peers
+            .read()
+            .iter()
+            .map(|peer| PersistedRememberedPeer {
+                device_id: peer.identity.id.clone(),
+                device_name: peer.identity.name.clone(),
+                os: peer.identity.os.clone(),
+                protocol_version: peer.identity.protocol_version,
+                endpoints: peer.endpoints.iter().map(ToString::to_string).collect(),
+                last_successful_at: peer.last_successful_at,
+            })
+            .collect()
     }
 }
 
@@ -530,6 +765,87 @@ fn valid_device_name(value: &str) -> bool {
         && trimmed.len() <= 64
         && trimmed.chars().count() <= 64
         && !trimmed.chars().any(|character| character.is_control())
+}
+
+fn valid_device_os(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 32
+        && trimmed.chars().count() <= 32
+        && !trimmed.chars().any(|character| character.is_control())
+}
+
+fn usable_endpoint(address: SocketAddr) -> bool {
+    address.port() != 0
+        && !address.ip().is_loopback()
+        && !address.ip().is_unspecified()
+        && !address.ip().is_multicast()
+        && match address.ip() {
+            IpAddr::V4(address) => !address.is_broadcast(),
+            IpAddr::V6(_) => true,
+        }
+}
+
+fn rememberable_endpoint(address: SocketAddr) -> bool {
+    usable_endpoint(address)
+        && matches!(
+            address.ip(),
+            IpAddr::V4(ip)
+                if ip.is_private()
+                    || ip.is_link_local()
+                    || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+        )
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn sanitize_remembered_peers(peers: Vec<PersistedRememberedPeer>) -> Vec<PersistedRememberedPeer> {
+    peers
+        .into_iter()
+        .filter(|peer| {
+            valid_device_id(&peer.device_id)
+                && valid_device_name(&peer.device_name)
+                && valid_device_os(&peer.os)
+                && peer.protocol_version != 0
+                && peer.endpoints.len() <= MAX_REMEMBERED_ENDPOINTS
+                && peer.endpoints.iter().all(|endpoint| {
+                    endpoint
+                        .parse::<SocketAddr>()
+                        .is_ok_and(rememberable_endpoint)
+                })
+        })
+        .take(MAX_REMEMBERED_PEERS)
+        .collect()
+}
+
+fn remembered_peer_from_persisted(peer: &PersistedRememberedPeer) -> Option<RememberedPeer> {
+    let identity = DeviceIdentity {
+        id: Uuid::parse_str(&peer.device_id).ok()?.to_string(),
+        name: peer.device_name.trim().to_string(),
+        os: peer.os.trim().to_string(),
+        protocol_version: peer.protocol_version,
+    };
+    let mut endpoints = peer
+        .endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint.parse::<SocketAddr>().ok())
+        .filter(|endpoint| rememberable_endpoint(*endpoint))
+        .collect::<Vec<_>>();
+    endpoints.sort();
+    endpoints.dedup();
+    if endpoints.is_empty() {
+        return None;
+    }
+    Some(RememberedPeer {
+        identity,
+        endpoints,
+        last_successful_at: peer.last_successful_at,
+    })
 }
 
 fn usable_destination(path: &Path) -> bool {
@@ -788,6 +1104,7 @@ mod tests {
             device_id: "11111111-1111-4111-8111-111111111111".to_string(),
             device_name: "Test device".to_string(),
             destination: directory.to_string_lossy().to_string(),
+            remembered_peers: Vec::new(),
         };
         let serialized = serde_json::to_string(&value).expect("settings should serialize");
         let parsed =
@@ -821,9 +1138,80 @@ mod tests {
         );
         let value = serde_json::to_value(PeerSnapshot::from(&peer))
             .expect("peer snapshot should serialize");
-        assert_eq!(value["endpoint"], "192.168.1.20:4040");
+        assert!(value.get("endpoint").is_none());
         assert!(value.get("endpointCandidates").is_none());
         assert!(value.get("serviceFullname").is_none());
+    }
+
+    #[test]
+    fn remembered_candidates_are_recent_and_do_not_expose_stale_entries() {
+        let identity = DeviceIdentity {
+            id: "22222222-2222-4222-8222-222222222222".to_string(),
+            name: "Remembered peer".to_string(),
+            os: "Linux".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let state = AppState::new_with_remembered(
+            DeviceIdentity {
+                id: "11111111-1111-4111-8111-111111111111".to_string(),
+                name: "Test device".to_string(),
+                os: "Test OS".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            Preferences {
+                device_name: "Test device".to_string(),
+                destination: "/tmp".to_string(),
+            },
+            4040,
+            vec![
+                RememberedPeer {
+                    identity: identity.clone(),
+                    endpoints: vec!["192.168.1.40:39821".parse().unwrap()],
+                    last_successful_at: unix_now().saturating_sub(60),
+                },
+                RememberedPeer {
+                    identity: DeviceIdentity {
+                        id: "33333333-3333-4333-8333-333333333333".to_string(),
+                        name: "Stale peer".to_string(),
+                        os: "Linux".to_string(),
+                        protocol_version: PROTOCOL_VERSION,
+                    },
+                    endpoints: vec!["192.168.1.41:39821".parse().unwrap()],
+                    last_successful_at: unix_now().saturating_sub(MAX_REMEMBERED_AGE_SECONDS + 1),
+                },
+            ],
+        );
+        let candidates = state.remembered_endpoint_candidates();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].identity.id, identity.id);
+        assert_eq!(candidates[0].address, "192.168.1.40:39821".parse().unwrap());
+    }
+
+    #[test]
+    fn remembered_peers_do_not_retain_public_endpoints() {
+        let state = AppState::new(
+            DeviceIdentity {
+                id: "11111111-1111-4111-8111-111111111111".to_string(),
+                name: "Test device".to_string(),
+                os: "Test OS".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            Preferences {
+                device_name: "Test device".to_string(),
+                destination: "/tmp".to_string(),
+            },
+            4040,
+        );
+        let identity = DeviceIdentity {
+            id: "22222222-2222-4222-8222-222222222222".to_string(),
+            name: "Public peer".to_string(),
+            os: "Linux".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+
+        state.remember_peer(&identity, "203.0.113.10:39821".parse().unwrap());
+
+        assert!(state.remembered_endpoint_candidates().is_empty());
     }
 
     #[test]

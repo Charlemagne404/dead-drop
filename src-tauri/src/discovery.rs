@@ -1,24 +1,55 @@
-use crate::protocol::validate_device;
 use crate::{
-    models::{AppState, DeviceIdentity, PROTOCOL_VERSION},
-    peer::{DiscoveryObservation, DiscoverySource, Endpoint, RouteClass},
+    connectivity::{
+        connect_and_identify, is_allowed_ipv4, ConnectivityError, DROP_SERVICE_PORT,
+        MAX_DISCOVERY_PROBES,
+    },
+    models::{
+        AppState, Cancellation, DeviceIdentity, RememberedEndpointCandidate, PROTOCOL_VERSION,
+    },
+    peer::{
+        DiscoveryObservation, DiscoverySource, Endpoint, EndpointReachability, EndpointSource,
+        RouteClass,
+    },
+    protocol::validate_device,
 };
 use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
+use serde::Deserialize;
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    collections::{HashMap, HashSet},
+    io::{self, Read},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    path::PathBuf,
+    process::{Command, Stdio},
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter};
+use tokio::{runtime::Runtime, sync::Semaphore, task::JoinSet};
 use uuid::Uuid;
 
 const SERVICE_TYPE: &str = "_dead-drop._tcp.local.";
 const SERVICE_TRANSPORT: &str = "ipv4";
 const MDNS_SOURCE_ID: &str = "mdns";
+const LOCAL_FALLBACK_SOURCE_ID: &str = "local-fallback";
+const TAILSCALE_SOURCE_ID: &str = "tailscale";
+const REMEMBERED_SOURCE_ID: &str = "remembered";
 const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_STALE_AFTER: Duration = Duration::from_secs(75);
 const DISCOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
+const LOCAL_FALLBACK_INTERVAL: Duration = Duration::from_secs(20);
+const LOCAL_FALLBACK_RESPONSE_WINDOW: Duration = Duration::from_millis(750);
+const LOCAL_FALLBACK_READ_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_LOCAL_FALLBACK_RESPONSES: usize = 64;
+const MAX_MDNS_ENDPOINTS: usize = 16;
+const TAILSCALE_POLL_INTERVAL: Duration = Duration::from_secs(20);
+const MAX_TAILSCALE_STATUS_BYTES: usize = 1024 * 1024;
+const MAX_TAILSCALE_CANDIDATES: usize = 256;
+const MAX_COMMAND_WAIT: Duration = Duration::from_secs(2);
+const REMEMBERED_REVALIDATION_INTERVAL: Duration = Duration::from_secs(45);
+const MAX_ENDPOINT_KEY_BYTES: usize = 256;
+const FALLBACK_REQUEST: &[u8] = b"DROP-LOCAL-DISCOVERY-V1";
+const FALLBACK_RESPONSE: &[u8] = b"DROP-LOCAL-RESPONSE-V1";
 
 struct MdnsDiscoverySource;
 
@@ -39,24 +70,68 @@ impl MdnsDiscoverySource {
 }
 
 pub fn start(state: Arc<AppState>, app: AppHandle) {
+    start_worker(
+        "dead-drop-mdns",
+        MDNS_SOURCE_ID,
+        state.clone(),
+        app.clone(),
+        run_mdns,
+    );
+    start_worker(
+        "dead-drop-local-fallback",
+        LOCAL_FALLBACK_SOURCE_ID,
+        state.clone(),
+        app.clone(),
+        run_local_fallback,
+    );
+    start_worker(
+        "dead-drop-tailscale",
+        TAILSCALE_SOURCE_ID,
+        state.clone(),
+        app.clone(),
+        run_tailscale,
+    );
+    start_worker(
+        "dead-drop-remembered",
+        REMEMBERED_SOURCE_ID,
+        state,
+        app,
+        run_remembered,
+    );
+}
+
+fn start_worker<F>(
+    name: &str,
+    source: &'static str,
+    state: Arc<AppState>,
+    app: AppHandle,
+    worker: F,
+) where
+    F: FnOnce(Arc<AppState>, AppHandle) + Send + 'static,
+{
+    let failure_state = state.clone();
     let failure_app = app.clone();
-    let thread_result = thread::Builder::new()
-        .name("dead-drop-discovery".to_string())
-        .spawn(move || run(state, app));
-    if let Err(error) = thread_result {
-        eprintln!("[dead-drop][discovery] could not start discovery thread: {error}");
-        report_failure(&failure_app, "Discovery thread could not start");
+    if let Err(error) = thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || worker(state, app))
+    {
+        eprintln!("[dead-drop][discovery] could not start {source} worker: {error}");
+        failure_state.set_discovery_status(source, "unavailable", Some("worker could not start"));
+        emit_state(&failure_app, &failure_state);
     }
 }
 
-fn run(state: Arc<AppState>, app: AppHandle) {
+fn run_mdns(state: Arc<AppState>, app: AppHandle) {
     loop {
         match run_session(&state, &app) {
             Ok(()) => return,
             Err(_error) if state.is_shutting_down() => return,
             Err(error) => {
-                if state.remove_discovery_source(MDNS_SOURCE_ID) {
-                    emit_peers(&app, &state);
+                let peers_changed = state.remove_discovery_source(MDNS_SOURCE_ID);
+                let status_changed =
+                    state.set_discovery_status(MDNS_SOURCE_ID, "unavailable", Some(&error));
+                if peers_changed || status_changed {
+                    emit_state(&app, &state);
                 }
                 report_failure(&app, &error);
                 if !wait_for_retry(&state) {
@@ -96,6 +171,8 @@ fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
             return Err(format!("Discovery could not browse for peers: {error}"));
         }
     };
+    state.set_discovery_status(MDNS_SOURCE_ID, "running", None);
+    emit_state(app, state);
     eprintln!("[dead-drop][discovery] advertising and browsing for IPv4 peers");
     let source = MdnsDiscoverySource;
     let local_id = state.device().id;
@@ -124,7 +201,7 @@ fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
                 ServiceEvent::ServiceResolved(service) => {
                     if let Some(observation) = source.observe(&service, &local_id) {
                         if state.apply_discovery_observation(observation) {
-                            emit_peers(app, state);
+                            emit_state(app, state);
                         }
                     }
                 }
@@ -133,7 +210,7 @@ fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
                         &source.endpoint_source(SERVICE_TRANSPORT, &service_fullname),
                     ) =>
                 {
-                    emit_peers(app, state);
+                    emit_state(app, state);
                 }
                 _ => {}
             },
@@ -143,9 +220,13 @@ fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
             }
         }
         if last_purge.elapsed() >= EVENT_POLL_INTERVAL {
-            if state.remove_stale_peers(Instant::now(), PEER_STALE_AFTER) {
+            if state.remove_stale_peers_from_discovery(
+                MDNS_SOURCE_ID,
+                Instant::now(),
+                PEER_STALE_AFTER,
+            ) {
                 eprintln!("[dead-drop][discovery] removed stale peer(s)");
-                emit_peers(app, state);
+                emit_state(app, state);
             }
             last_purge = Instant::now();
         }
@@ -231,8 +312,11 @@ fn observation_from_service(
         return None;
     }
     let discovery_source = MdnsDiscoverySource;
-    let endpoint_source =
-        discovery_source.endpoint_source(SERVICE_TRANSPORT, service.get_fullname());
+    let fullname = service.get_fullname();
+    if fullname.len() > MAX_ENDPOINT_KEY_BYTES {
+        return None;
+    }
+    let endpoint_source = discovery_source.endpoint_source(SERVICE_TRANSPORT, fullname);
     let last_seen = Instant::now();
     let endpoints = ipv4_endpoints(service.get_addresses_v4(), service.get_port())
         .into_iter()
@@ -259,7 +343,8 @@ where
     let mut endpoints: Vec<_> = addresses
         .into_iter()
         .filter(|address| {
-            !address.is_loopback()
+            is_allowed_ipv4(*address)
+                && !address.is_loopback()
                 && !address.is_unspecified()
                 && !address.is_multicast()
                 && !address.is_broadcast()
@@ -276,6 +361,7 @@ where
         (priority, *endpoint)
     });
     endpoints.dedup();
+    endpoints.truncate(MAX_MDNS_ENDPOINTS);
     endpoints
 }
 
@@ -291,9 +377,12 @@ fn bounded_property(value: Option<&str>, fallback: &str, maximum: usize) -> Stri
         .to_string()
 }
 
-fn emit_peers(app: &AppHandle, state: &AppState) {
+pub(crate) fn emit_state(app: &AppHandle, state: &AppState) {
     if let Err(error) = app.emit("peers-updated", state.peers()) {
         eprintln!("[dead-drop][discovery] could not emit peer update: {error}");
+    }
+    if let Err(error) = app.emit("connectivity-diagnostics", state.runtime_diagnostics()) {
+        eprintln!("[dead-drop][discovery] could not emit diagnostics update: {error}");
     }
 }
 
@@ -303,6 +392,704 @@ fn report_failure(app: &AppHandle, detail: &str) {
         "discovery-status",
         "Nearby device discovery is unavailable. Check local network access and UDP port 5353.",
     );
+}
+
+#[derive(Clone, Debug)]
+struct ProbeCandidate {
+    address: SocketAddr,
+    source: EndpointSource,
+    route_class: RouteClass,
+    expected_peer_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct ProbeSuccess {
+    candidate: ProbeCandidate,
+    identity: DeviceIdentity,
+}
+
+/// Run bounded protocol probes for one discovery cycle. The semaphore limits
+/// live sockets and the callers cap the size of each source's work queue.
+async fn probe_candidates(
+    state: &Arc<AppState>,
+    candidates: Vec<ProbeCandidate>,
+) -> Vec<ProbeSuccess> {
+    let local = state.device();
+    let shutdown = state.shutdown_token();
+    let slots = Arc::new(Semaphore::new(MAX_DISCOVERY_PROBES));
+    let mut tasks: JoinSet<Result<ProbeSuccess, (ProbeCandidate, ConnectivityError)>> =
+        JoinSet::new();
+
+    for candidate in candidates {
+        let Ok(slot) = slots.clone().acquire_owned().await else {
+            break;
+        };
+        let local = local.clone();
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            let _slot = slot;
+            let probe_cancellation = Cancellation::new();
+            let result = connect_and_identify(
+                candidate.address,
+                &local,
+                candidate.expected_peer_id.as_deref(),
+                &probe_cancellation,
+                shutdown.as_ref(),
+            )
+            .await;
+            match result {
+                Ok(connection) => Ok(ProbeSuccess {
+                    candidate,
+                    identity: connection.identity,
+                }),
+                Err(error) => Err((candidate, error)),
+            }
+        });
+    }
+
+    let mut successes = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(success)) => successes.push(success),
+            Ok(Err((_candidate, error)))
+                if !matches!(
+                    error,
+                    ConnectivityError::Canceled | ConnectivityError::ShuttingDown
+                ) =>
+            {
+                // A discovery source is expected to encounter ordinary
+                // non-Drop services and closed endpoints. Keep those quiet;
+                // source status and route diagnostics carry the useful signal.
+            }
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+    successes
+}
+
+fn apply_probe_successes(
+    state: &Arc<AppState>,
+    successes: Vec<ProbeSuccess>,
+) -> HashSet<EndpointSource> {
+    let mut sources = HashSet::new();
+    for success in successes {
+        let ProbeSuccess {
+            candidate,
+            identity,
+        } = success;
+        let source = candidate.source.clone();
+        let mut endpoint = Endpoint::new(
+            candidate.address,
+            source.clone(),
+            candidate.route_class,
+            Instant::now(),
+        );
+        endpoint.reachability = EndpointReachability::Reachable;
+        sources.insert(source.clone());
+        if state.apply_discovery_observation(DiscoveryObservation {
+            identity: identity.clone(),
+            source,
+            endpoints: vec![endpoint],
+        }) {
+            eprintln!(
+                "[dead-drop][discovery] peer endpoint added via {} UUID {} Endpoint {}",
+                candidate.route_class.label(),
+                identity.id,
+                candidate.address
+            );
+        }
+    }
+    sources
+}
+
+fn remove_old_sources(
+    state: &Arc<AppState>,
+    previous: &HashSet<EndpointSource>,
+    current: &HashSet<EndpointSource>,
+) -> bool {
+    let mut changed = false;
+    for source in previous.difference(current) {
+        changed |= state.remove_endpoint_source(source);
+    }
+    changed
+}
+
+fn run_local_fallback(state: Arc<AppState>, app: AppHandle) {
+    let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DROP_SERVICE_PORT)) {
+        Ok(socket) => socket,
+        Err(error) => {
+            state.set_discovery_status(
+                LOCAL_FALLBACK_SOURCE_ID,
+                "unavailable",
+                Some("UDP service port could not be bound"),
+            );
+            eprintln!("[dead-drop][discovery] local fallback could not bind UDP service: {error}");
+            emit_state(&app, &state);
+            return;
+        }
+    };
+    if let Err(error) = socket.set_broadcast(true) {
+        eprintln!("[dead-drop][discovery] local fallback broadcast is unavailable: {error}");
+    }
+    if let Err(error) = socket.set_ttl(1) {
+        eprintln!("[dead-drop][discovery] local fallback TTL could not be set: {error}");
+    }
+    if let Err(error) = socket.set_read_timeout(Some(LOCAL_FALLBACK_READ_TIMEOUT)) {
+        state.set_discovery_status(
+            LOCAL_FALLBACK_SOURCE_ID,
+            "unavailable",
+            Some("UDP read timeout could not be configured"),
+        );
+        eprintln!("[dead-drop][discovery] local fallback could not configure UDP reads: {error}");
+        emit_state(&app, &state);
+        return;
+    }
+    state.set_discovery_status(LOCAL_FALLBACK_SOURCE_ID, "running", None);
+    emit_state(&app, &state);
+    eprintln!(
+        "[dead-drop][discovery] local broadcast fallback listening on UDP {DROP_SERVICE_PORT}"
+    );
+
+    let runtime = match Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            state.set_discovery_status(
+                LOCAL_FALLBACK_SOURCE_ID,
+                "unavailable",
+                Some("probe runtime could not start"),
+            );
+            eprintln!("[dead-drop][discovery] local fallback probe runtime failed: {error}");
+            emit_state(&app, &state);
+            return;
+        }
+    };
+    let mut next_broadcast = Instant::now();
+    let mut cycle_deadline = Instant::now();
+    let mut pending = HashSet::new();
+    let mut previous_sources = HashSet::new();
+    let mut packet = [0_u8; 64];
+    loop {
+        if state.is_shutting_down() {
+            return;
+        }
+        let now = Instant::now();
+        if now >= next_broadcast {
+            if let Err(error) = socket.send_to(
+                FALLBACK_REQUEST,
+                SocketAddr::from((Ipv4Addr::BROADCAST, DROP_SERVICE_PORT)),
+            ) {
+                eprintln!("[dead-drop][discovery] local broadcast request failed: {error}");
+            }
+            pending.clear();
+            cycle_deadline = now + LOCAL_FALLBACK_RESPONSE_WINDOW;
+            next_broadcast = now + LOCAL_FALLBACK_INTERVAL;
+        }
+
+        match socket.recv_from(&mut packet) {
+            Ok((length, from)) => {
+                if let Some(port) = parse_fallback_response(&packet[..length]) {
+                    if let IpAddr::V4(address) = from.ip() {
+                        if is_allowed_ipv4(address) && pending.len() < MAX_LOCAL_FALLBACK_RESPONSES
+                        {
+                            pending.insert(SocketAddr::from((address, port)));
+                        }
+                    }
+                } else if &packet[..length] == FALLBACK_REQUEST
+                    && matches!(from.ip(), IpAddr::V4(address) if is_allowed_ipv4(address))
+                {
+                    let _ = socket.send_to(&fallback_response_packet(), from);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => {
+                eprintln!("[dead-drop][discovery] local fallback UDP read failed: {error}");
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+
+        if Instant::now() >= cycle_deadline {
+            let candidates = pending
+                .drain()
+                .map(|address| ProbeCandidate {
+                    source: EndpointSource::new(
+                        LOCAL_FALLBACK_SOURCE_ID,
+                        SERVICE_TRANSPORT,
+                        address.ip().to_string(),
+                    ),
+                    address,
+                    route_class: RouteClass::DirectLocal,
+                    expected_peer_id: None,
+                })
+                .collect::<Vec<_>>();
+            let successes = runtime.block_on(probe_candidates(&state, candidates));
+            let current_sources = apply_probe_successes(&state, successes);
+            let removed = remove_old_sources(&state, &previous_sources, &current_sources);
+            if removed || !current_sources.is_empty() {
+                emit_state(&app, &state);
+            }
+            previous_sources = current_sources;
+            cycle_deadline = next_broadcast;
+        }
+    }
+}
+
+fn fallback_response_packet() -> Vec<u8> {
+    let mut packet = Vec::with_capacity(FALLBACK_RESPONSE.len() + 2);
+    packet.extend_from_slice(FALLBACK_RESPONSE);
+    packet.extend_from_slice(&DROP_SERVICE_PORT.to_be_bytes());
+    packet
+}
+
+fn parse_fallback_response(packet: &[u8]) -> Option<u16> {
+    if packet.len() != FALLBACK_RESPONSE.len() + 2
+        || &packet[..FALLBACK_RESPONSE.len()] != FALLBACK_RESPONSE
+    {
+        return None;
+    }
+    let port = u16::from_be_bytes([
+        packet[FALLBACK_RESPONSE.len()],
+        packet[FALLBACK_RESPONSE.len() + 1],
+    ]);
+    (port == DROP_SERVICE_PORT).then_some(port)
+}
+
+#[derive(Clone, Debug)]
+struct TailscaleCandidateSnapshot {
+    candidates: Vec<ProbeCandidate>,
+    running: bool,
+    limited: bool,
+}
+
+#[derive(Debug)]
+enum TailscaleStatusError {
+    NotInstalled,
+    Unavailable(String),
+    OutputTooLarge,
+    Invalid(String),
+}
+
+impl std::fmt::Display for TailscaleStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotInstalled => formatter.write_str("not installed"),
+            Self::Unavailable(detail) => formatter.write_str(detail),
+            Self::OutputTooLarge => formatter.write_str("local status output exceeded the limit"),
+            Self::Invalid(detail) => write!(formatter, "invalid local status: {detail}"),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TailscaleStatusDocument {
+    #[serde(rename = "BackendState")]
+    backend_state: Option<String>,
+    #[serde(rename = "Peer", default)]
+    peers: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Deserialize, Default)]
+struct TailscalePeerDocument {
+    #[serde(rename = "Online")]
+    online: Option<bool>,
+    #[serde(rename = "TailscaleIPs", default)]
+    addresses: Vec<String>,
+}
+
+fn run_tailscale(state: Arc<AppState>, app: AppHandle) {
+    let runtime = match Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            state.set_discovery_status(
+                TAILSCALE_SOURCE_ID,
+                "unavailable",
+                Some("probe runtime could not start"),
+            );
+            eprintln!("[dead-drop][discovery] Tailscale probe runtime failed: {error}");
+            emit_state(&app, &state);
+            return;
+        }
+    };
+    let mut previous_sources = HashSet::new();
+    let mut last_status = String::new();
+    loop {
+        if state.is_shutting_down() {
+            return;
+        }
+        match read_tailscale_snapshot() {
+            Ok(snapshot) => {
+                let status = if !snapshot.running {
+                    "not-running"
+                } else if snapshot.limited {
+                    "probe-limited"
+                } else {
+                    "running"
+                };
+                if last_status != status {
+                    eprintln!("[dead-drop][discovery] local Tailscale status: {status}");
+                    last_status = status.to_string();
+                }
+                let candidates = if snapshot.running {
+                    snapshot.candidates
+                } else {
+                    Vec::new()
+                };
+                let successes = runtime.block_on(probe_candidates(&state, candidates));
+                let current_sources = apply_probe_successes(&state, successes);
+                let removed = remove_old_sources(&state, &previous_sources, &current_sources);
+                if removed
+                    || !current_sources.is_empty()
+                    || state.set_discovery_status(
+                        TAILSCALE_SOURCE_ID,
+                        status,
+                        Some("local structured peer status"),
+                    )
+                {
+                    emit_state(&app, &state);
+                }
+                previous_sources = current_sources;
+            }
+            Err(TailscaleStatusError::NotInstalled) => {
+                if last_status != "not-installed" {
+                    eprintln!("[dead-drop][discovery] local Tailscale client not installed; continuing without it");
+                    last_status = "not-installed".to_string();
+                }
+                if state.set_discovery_status(TAILSCALE_SOURCE_ID, "not-installed", None) {
+                    emit_state(&app, &state);
+                }
+                let removed = remove_old_sources(&state, &previous_sources, &HashSet::new());
+                if removed {
+                    emit_state(&app, &state);
+                }
+                previous_sources.clear();
+            }
+            Err(error) => {
+                let status = if matches!(error, TailscaleStatusError::OutputTooLarge) {
+                    "unavailable"
+                } else {
+                    "not-running"
+                };
+                if last_status != status {
+                    eprintln!("[dead-drop][discovery] local Tailscale status unavailable: {error}");
+                    last_status = status.to_string();
+                }
+                if state.set_discovery_status(
+                    TAILSCALE_SOURCE_ID,
+                    status,
+                    Some("local client unavailable"),
+                ) {
+                    emit_state(&app, &state);
+                }
+                let removed = remove_old_sources(&state, &previous_sources, &HashSet::new());
+                if removed {
+                    emit_state(&app, &state);
+                }
+                previous_sources.clear();
+            }
+        }
+        if !wait_for_interval(&state, TAILSCALE_POLL_INTERVAL) {
+            return;
+        }
+    }
+}
+
+fn read_tailscale_snapshot() -> Result<TailscaleCandidateSnapshot, TailscaleStatusError> {
+    let mut not_installed = true;
+    let mut last_error = None;
+    for binary in tailscale_binary_candidates() {
+        match run_tailscale_command(&binary) {
+            Ok(raw) => return parse_tailscale_snapshot(&raw),
+            Err(TailscaleStatusError::NotInstalled) => {}
+            Err(error) => {
+                not_installed = false;
+                last_error = Some(error);
+                break;
+            }
+        }
+    }
+    if not_installed {
+        Err(TailscaleStatusError::NotInstalled)
+    } else {
+        Err(last_error
+            .unwrap_or_else(|| TailscaleStatusError::Unavailable("status failed".to_string())))
+    }
+}
+
+fn tailscale_binary_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("tailscale")];
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(PathBuf::from(
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        ));
+        candidates.push(PathBuf::from("/opt/homebrew/bin/tailscale"));
+        candidates.push(PathBuf::from("/usr/local/bin/tailscale"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        candidates.push(PathBuf::from("/usr/bin/tailscale"));
+        candidates.push(PathBuf::from("/usr/sbin/tailscale"));
+        candidates.push(PathBuf::from("/usr/local/bin/tailscale"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        candidates.push(PathBuf::from("tailscale.exe"));
+        candidates.push(PathBuf::from(r"C:\Program Files\Tailscale\tailscale.exe"));
+    }
+    candidates
+}
+
+fn run_tailscale_command(binary: &PathBuf) -> Result<Vec<u8>, TailscaleStatusError> {
+    let mut child = match Command::new(binary)
+        .args(["status", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(TailscaleStatusError::NotInstalled)
+        }
+        Err(error) => return Err(TailscaleStatusError::Unavailable(error.to_string())),
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TailscaleStatusError::Unavailable(
+                "Tailscale stdout was unavailable".to_string(),
+            ));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TailscaleStatusError::Unavailable(
+                "Tailscale stderr was unavailable".to_string(),
+            ));
+        }
+    };
+    let stdout_reader = thread::spawn(move || read_bounded(stdout, MAX_TAILSCALE_STATUS_BYTES));
+    let stderr_reader = thread::spawn(move || read_bounded(stderr, 16 * 1024));
+    let deadline = Instant::now() + MAX_COMMAND_WAIT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(TailscaleStatusError::Unavailable(
+                    "local status request timed out".to_string(),
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(TailscaleStatusError::Unavailable(error.to_string()));
+            }
+        }
+    };
+    let stdout_result = stdout_reader.join();
+    let stderr_result = stderr_reader.join();
+    let stdout = stdout_result
+        .map_err(|_| {
+            TailscaleStatusError::Unavailable("Tailscale output reader failed".to_string())
+        })?
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::InvalidData {
+                TailscaleStatusError::OutputTooLarge
+            } else {
+                TailscaleStatusError::Unavailable(error.to_string())
+            }
+        })?;
+    let stderr = stderr_result
+        .map_err(|_| {
+            TailscaleStatusError::Unavailable("Tailscale error reader failed".to_string())
+        })?
+        .unwrap_or_default();
+    if !status.success() {
+        return Err(TailscaleStatusError::Unavailable(
+            String::from_utf8_lossy(&stderr)
+                .trim()
+                .chars()
+                .take(256)
+                .collect(),
+        ));
+    }
+    Ok(stdout)
+}
+
+fn read_bounded<R: Read>(mut reader: R, maximum: usize) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if output.len().saturating_add(count) > maximum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "command output exceeded the size limit",
+            ));
+        }
+        output.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn parse_tailscale_snapshot(
+    raw: &[u8],
+) -> Result<TailscaleCandidateSnapshot, TailscaleStatusError> {
+    if raw.len() > MAX_TAILSCALE_STATUS_BYTES {
+        return Err(TailscaleStatusError::OutputTooLarge);
+    }
+    let document = serde_json::from_slice::<TailscaleStatusDocument>(raw)
+        .map_err(|error| TailscaleStatusError::Invalid(error.to_string()))?;
+    let running = document
+        .backend_state
+        .as_deref()
+        .is_none_or(|state| state.eq_ignore_ascii_case("running"));
+    if !running {
+        return Ok(TailscaleCandidateSnapshot {
+            candidates: Vec::new(),
+            running: false,
+            limited: false,
+        });
+    }
+    let mut candidates = Vec::new();
+    for (public_key, value) in document.peers.unwrap_or_default() {
+        if public_key.len() > MAX_ENDPOINT_KEY_BYTES {
+            continue;
+        }
+        let Ok(peer) = serde_json::from_value::<TailscalePeerDocument>(value) else {
+            continue;
+        };
+        if peer.online != Some(true) {
+            continue;
+        }
+        for address in peer.addresses.into_iter().take(8) {
+            let Ok(IpAddr::V4(address)) = address.parse::<IpAddr>() else {
+                continue;
+            };
+            if !is_allowed_ipv4(address)
+                || address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_broadcast()
+            {
+                continue;
+            }
+            let source = EndpointSource::new(
+                TAILSCALE_SOURCE_ID,
+                SERVICE_TRANSPORT,
+                format!("{public_key}:{address}"),
+            );
+            candidates.push(ProbeCandidate {
+                address: SocketAddr::from((address, DROP_SERVICE_PORT)),
+                source,
+                route_class: RouteClass::Overlay,
+                expected_peer_id: None,
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.address
+            .cmp(&right.address)
+            .then_with(|| left.source.key.cmp(&right.source.key))
+    });
+    let limited = candidates.len() > MAX_TAILSCALE_CANDIDATES;
+    candidates.truncate(MAX_TAILSCALE_CANDIDATES);
+    Ok(TailscaleCandidateSnapshot {
+        candidates,
+        running: true,
+        limited,
+    })
+}
+
+fn run_remembered(state: Arc<AppState>, app: AppHandle) {
+    let runtime = match Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("[dead-drop][discovery] remembered-peer probe runtime failed: {error}");
+            return;
+        }
+    };
+    let mut previous_sources = HashSet::new();
+    loop {
+        if state.is_shutting_down() {
+            return;
+        }
+        let candidates = state
+            .remembered_endpoint_candidates()
+            .into_iter()
+            .map(remembered_probe_candidate)
+            .collect::<Vec<_>>();
+        let successes = runtime.block_on(probe_candidates(&state, candidates));
+        for success in &successes {
+            state.remember_peer(&success.identity, success.candidate.address);
+        }
+        let current_sources = apply_probe_successes(&state, successes);
+        let removed = remove_old_sources(&state, &previous_sources, &current_sources);
+        if removed || !current_sources.is_empty() {
+            emit_state(&app, &state);
+        }
+        previous_sources = current_sources;
+        if !wait_for_interval(&state, REMEMBERED_REVALIDATION_INTERVAL) {
+            return;
+        }
+    }
+}
+
+fn remembered_probe_candidate(candidate: RememberedEndpointCandidate) -> ProbeCandidate {
+    ProbeCandidate {
+        source: EndpointSource::new(
+            REMEMBERED_SOURCE_ID,
+            SERVICE_TRANSPORT,
+            format!("{}:{}", candidate.identity.id, candidate.address),
+        ),
+        address: candidate.address,
+        route_class: RouteClass::Remembered,
+        expected_peer_id: Some(candidate.identity.id),
+    }
+}
+
+fn wait_for_interval(state: &AppState, duration: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < duration {
+        if state.is_shutting_down() {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+trait RouteClassLabel {
+    fn label(self) -> &'static str;
+}
+
+impl RouteClassLabel for RouteClass {
+    fn label(self) -> &'static str {
+        match self {
+            RouteClass::DirectLocal => "mDNS/local discovery",
+            RouteClass::VerifiedLocal => "local discovery",
+            RouteClass::Overlay => "Tailscale",
+            RouteClass::Remembered => "remembered endpoint",
+            RouteClass::Other => "direct address",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -470,6 +1257,63 @@ mod tests {
         assert_eq!(bounded_property(Some(&huge), "fallback", 64), "fallback");
         assert_eq!(bounded_property(Some(" \n"), "fallback", 64), "fallback");
         assert_eq!(bounded_property(None, "fallback", 64), "fallback");
+    }
+
+    #[test]
+    fn local_fallback_packets_are_exact_and_bounded() {
+        let packet = fallback_response_packet();
+        assert_eq!(packet.len(), FALLBACK_RESPONSE.len() + 2);
+        assert_eq!(parse_fallback_response(&packet), Some(DROP_SERVICE_PORT));
+
+        let mut wrong_port = packet.clone();
+        let last = wrong_port.len() - 1;
+        wrong_port[last] = wrong_port[last].wrapping_add(1);
+        assert_eq!(parse_fallback_response(&wrong_port), None);
+        assert_eq!(parse_fallback_response(&packet[..packet.len() - 1]), None);
+        assert_eq!(parse_fallback_response(&[0_u8; 64]), None);
+    }
+
+    #[test]
+    fn tailscale_fixture_yields_only_online_ipv4_candidates() {
+        let raw = include_bytes!("../protocol-fixtures/tailscale-status.json");
+        let snapshot = parse_tailscale_snapshot(raw).expect("fixture should parse");
+        assert!(snapshot.running);
+        assert!(!snapshot.limited);
+        assert_eq!(snapshot.candidates.len(), 1);
+        assert_eq!(
+            snapshot.candidates[0].address,
+            "100.75.12.8:39821".parse().unwrap()
+        );
+        assert_eq!(snapshot.candidates[0].route_class, RouteClass::Overlay);
+        assert_eq!(snapshot.candidates[0].source.discovery, TAILSCALE_SOURCE_ID);
+    }
+
+    #[test]
+    fn tailscale_without_peers_is_normal_and_large_peer_lists_are_capped() {
+        let stopped = br#"{"BackendState":"Stopped","Peer":null}"#;
+        let stopped_snapshot = parse_tailscale_snapshot(stopped).expect("stopped status is valid");
+        assert!(!stopped_snapshot.running);
+        assert!(stopped_snapshot.candidates.is_empty());
+
+        let mut peers = serde_json::Map::new();
+        for index in 0..(MAX_TAILSCALE_CANDIDATES + 32) {
+            peers.insert(
+                format!("key:{index}"),
+                serde_json::json!({
+                    "Online": true,
+                    "TailscaleIPs": [format!("100.64.{}.{}", index / 250, index % 250 + 1)]
+                }),
+            );
+        }
+        let raw = serde_json::json!({ "BackendState": "Running", "Peer": peers });
+        let snapshot = parse_tailscale_snapshot(
+            serde_json::to_string(&raw)
+                .expect("status fixture should encode")
+                .as_bytes(),
+        )
+        .expect("large status should parse");
+        assert_eq!(snapshot.candidates.len(), MAX_TAILSCALE_CANDIDATES);
+        assert!(snapshot.limited);
     }
 
     proptest! {

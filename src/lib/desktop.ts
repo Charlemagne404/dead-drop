@@ -9,7 +9,6 @@ export type Device = {
 };
 
 export type Peer = Device & {
-  endpoint: string;
   online: boolean;
 };
 
@@ -57,10 +56,40 @@ export type Preferences = {
   destination: string;
 };
 
+export type DiscoverySourceDiagnostics = {
+  status: string;
+  detail: string | null;
+};
+
+export type EndpointDiagnostics = {
+  address: string;
+  addressFamily: string;
+  sources: string[];
+  routeClass: string;
+  reachability: string;
+  lastSeenSecondsAgo: number;
+};
+
+export type PeerDiagnostics = {
+  id: string;
+  name: string;
+  os: string;
+  protocolVersion: number;
+  selectedRoute: string | null;
+  endpoints: EndpointDiagnostics[];
+};
+
 export type RuntimeDiagnostics = {
   transport: string;
   listenerPort: number;
   receiveDirectoryAvailable: boolean;
+  discovery: {
+    mdns: DiscoverySourceDiagnostics;
+    localFallback: DiscoverySourceDiagnostics;
+    tailscale: DiscoverySourceDiagnostics;
+    rememberedPeers: number;
+  };
+  peers: PeerDiagnostics[];
 };
 
 export type InitialState = {
@@ -100,6 +129,8 @@ export const command = {
     invoke<void>("cancel_transfer", { transferId }),
   respondToIncoming: (transferId: string, accepted: boolean) =>
     invoke<void>("respond_to_incoming", { transferId, accepted }),
+  connectByAddress: (address: string) =>
+    invoke<Peer>("connect_by_address", { address }),
   updatePreferences: (draft: Preferences) =>
     invoke<Preferences>("update_preferences", { draft }),
 };

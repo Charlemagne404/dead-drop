@@ -13,6 +13,10 @@ const DATA_FRAME: u8 = 2;
 const FRAME_HEADER_SIZE: usize = 5;
 pub const MAX_CONTROL_FRAME_SIZE: usize = 512 * 1024;
 pub const MAX_DATA_FRAME_SIZE: usize = 128 * 1024;
+/// Identification is deliberately narrower than a normal control frame. A
+/// service probe only carries one small Hello message and must not be able to
+/// make the listener allocate the full control-frame budget.
+pub const MAX_IDENTIFICATION_FRAME_SIZE: usize = 16 * 1024;
 const MAX_REASON_BYTES: usize = 1024;
 const MAX_OS_BYTES: usize = 32;
 
@@ -83,6 +87,26 @@ pub async fn write_control<W: AsyncWrite + Unpin>(
     write_frame(writer, CONTROL_FRAME, &payload).await
 }
 
+/// Write the bounded v1 Hello used both to start a transfer and to identify a
+/// Drop service during discovery. Keeping this helper separate makes the
+/// small service-handshake limit explicit at every call site.
+pub async fn write_identification<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    device: &DeviceIdentity,
+) -> Result<(), ProtocolError> {
+    let message = ControlMessage::Hello {
+        protocol_version: device.protocol_version,
+        device: device.clone(),
+    };
+    let payload = encode_control_message(&message)?;
+    if payload.len() > MAX_IDENTIFICATION_FRAME_SIZE {
+        return Err(ProtocolError::InvalidMessage(
+            "identification message exceeds the size limit".to_string(),
+        ));
+    }
+    write_frame(writer, CONTROL_FRAME, &payload).await
+}
+
 /// Encode one validated v1 control message as compact UTF-8 JSON.
 ///
 /// The JSON object shape is the wire contract; object member ordering is only
@@ -125,6 +149,34 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, P
     let mut payload = vec![0; length];
     reader.read_exact(&mut payload).await?;
     decode_frame_payload(kind, &payload)
+}
+
+/// Read one bounded control message for the service-identification exchange.
+/// The normal transfer decoder remains available for the larger control-frame
+/// budget, while a probe never waits for or allocates more than 16 KiB.
+pub async fn read_identification<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<ControlMessage, ProtocolError> {
+    let kind = reader.read_u8().await?;
+    let length = reader.read_u32().await? as usize;
+    if kind != CONTROL_FRAME {
+        return Err(ProtocolError::InvalidFrame(
+            "identification requires a control frame".to_string(),
+        ));
+    }
+    if length > MAX_IDENTIFICATION_FRAME_SIZE {
+        return Err(ProtocolError::InvalidFrame(
+            "identification frame exceeds the size limit".to_string(),
+        ));
+    }
+    let mut payload = vec![0; length];
+    reader.read_exact(&mut payload).await?;
+    match decode_control_message(&payload)? {
+        message @ ControlMessage::Hello { .. } => Ok(message),
+        _ => Err(ProtocolError::InvalidMessage(
+            "expected a Drop Hello message".to_string(),
+        )),
+    }
 }
 
 /// Decode exactly one length-prefixed frame from a byte slice.
@@ -617,10 +669,7 @@ mod tests {
                     reason: Some("File verification failed.".to_string()),
                 },
             ),
-            (
-                "cancel",
-                ControlMessage::Cancel { transfer_id },
-            ),
+            ("cancel", ControlMessage::Cancel { transfer_id }),
         ]
     }
 

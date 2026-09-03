@@ -243,6 +243,25 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--plain-focus
 .path-button { min-width: 0; min-height: var(--plain-control-height); padding-inline: 13px; font-size: 13px; }
 .settings-error { margin: 14px 0 0; color: #f1b0ac; font-size: 13px; font-weight: var(--plain-weight-regular); line-height: 1.4; }
 .settings-actions { display: flex; align-items: center; gap: 22px; margin-top: 31px; }
+.diagnostics-disclosure { max-width: 470px; margin-top: 34px; border-top: var(--plain-border); color: #d7d7d4; }
+.diagnostics-disclosure summary { padding: 17px 0 13px; color: #d7d7d4; cursor: pointer; font-size: 13px; font-weight: var(--plain-weight-medium); list-style-position: outside; }
+.diagnostics-disclosure summary::marker { color: #898a8d; }
+.diagnostics-body { display: grid; gap: 17px; padding: 0 0 4px 15px; border-left: 1px solid #36373a; }
+.diagnostic-status-list { display: grid; gap: 10px; }
+.diagnostic-status { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 12px; font-size: 12px; }
+.diagnostic-status span { color: #bcbcb9; }
+.diagnostic-status strong { color: #e3e3df; font-size: 11px; font-weight: var(--plain-weight-medium); text-transform: capitalize; }
+.diagnostic-status small { grid-column: 1 / -1; min-width: 0; overflow: hidden; color: #77787b; font-size: 10px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.diagnostic-count, .address-fallback > p { margin: 0; color: #85868a; font-size: 11px; line-height: 1.45; }
+.address-fallback { display: grid; gap: 8px; padding-top: 2px; }
+.address-fallback label { margin-top: 0; }
+.address-fallback .settings-error { margin-top: 0; }
+.diagnostic-peer-list { display: grid; gap: 14px; }
+.diagnostic-peer { min-width: 0; display: grid; gap: 5px; padding-top: 12px; border-top: var(--plain-border); }
+.diagnostic-peer strong { color: #e3e3df; font-size: 12px; font-weight: var(--plain-weight-medium); }
+.diagnostic-peer small, .diagnostic-endpoint { min-width: 0; overflow-wrap: anywhere; color: #85868a; font-size: 10px; line-height: 1.4; }
+.diagnostic-endpoint { color: #aaa; }
+.diagnostic-empty { margin: 0; color: #77787b; font-size: 11px; }
 .about-section { max-width: 470px; margin-top: 43px; padding-top: 22px; border-top: var(--plain-border); }
 .plain-wordmark { margin: 15px 0 6px; color: var(--plain-ink-strong); font-size: 16px; font-weight: var(--plain-weight-bold); letter-spacing: .02em; }
 .about-product, .about-credit { margin: 0; color: #b5b5b4; font-size: 13px; font-weight: var(--plain-weight-regular); line-height: 1.5; }

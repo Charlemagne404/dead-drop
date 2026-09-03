@@ -2,7 +2,7 @@
 
 **PLAIN/**
 
-Plain / Drop is the formal product name. Inside the app, it is simply Drop: a small, LAN-only desktop utility for sending files directly between nearby computers. Plain/ is the utility collection; Continental is the parent organization. There are no accounts, cloud relays, web dashboard, or telemetry.
+Plain / Drop is the formal product name. Inside the app, it is simply Drop: a small desktop utility for sending files directly between reachable Drop devices. Plain/ is the utility collection; Continental is the parent organization. There are no accounts, cloud relays, web dashboard, or telemetry.
 
 ## Platform support status
 
@@ -16,7 +16,7 @@ The repository has native build paths for each first-class desktop target. “Bu
 | Linux x86_64, Ubuntu/Debian priority | Build-ready | `.deb`, AppImage | Native build and desktop/runtime testing still required |
 | Other Linux distributions and compositor combinations | Untested | Tauri targets may work | Validate WebKitGTK, GTK, file chooser, scaling, and desktop integration on the target distro |
 
-The normal workflow is intended to be identical on all three first-class targets: install Drop, open it, select an automatically discovered peer, choose or drop files, accept on the receiver, and wait for completion. No manual IP configuration is part of the normal flow.
+The normal workflow is intended to be identical on all three first-class targets: install Drop, open it, select an automatically discovered peer, choose or drop files, accept on the receiver, and wait for completion. Drop chooses the route; no manual IP configuration is part of the normal flow.
 
 ## Run it from source
 
@@ -25,23 +25,30 @@ npm ci
 npm run tauri dev
 ```
 
-The native app advertises `_dead-drop._tcp.local.` over mDNS/DNS-SD, discovers peers running the same protocol version, and listens on a random local TCP port. The service type is retained as a compatibility identifier from the earlier release.
+The native app advertises `_dead-drop._tcp.local.` over mDNS/DNS-SD, discovers peers running the same protocol version, and listens on the fixed Drop service port `39821` for both identification and transfers. The service type is retained as a compatibility identifier from the earlier release.
 
-## LAN and firewall behavior
+## Reachability and firewall behavior
 
-Drop uses the embedded `mdns-sd` implementation rather than requiring an Avahi or Bonjour daemon. The service follows the same DNS-SD shape on Windows, macOS, and Linux:
+Drop finds other Drop devices that are reachable from your computer and chooses how to connect automatically. The main device list contains one logical peer per stable Drop device UUID; it does not split devices into LAN, VPN, or remote sections.
+
+Discovery sources contribute endpoint observations to one backend registry:
 
 - service type: `_dead-drop._tcp.local.`
 - stable instance and host names derived from the device UUID
 - TXT records: `id`, `name`, `os`, `protocol`, and `transport=ipv4`
-- the service advertises every usable local IPv4 address and the receiver tries the candidates in order
-- a device ignores its own UUID and stale or removed services disappear from the peer list
+- mDNS/DNS-SD for ordinary zero-configuration local discovery
+- a small IPv4 broadcast fallback on directly connected local networks when multicast discovery is unavailable
+- local `tailscale status --json` data, when a Tailscale-compatible client is installed and running, followed by Drop identification probes
+- recently successful endpoints, revalidated before they are shown as available
+- an optional private/overlay address fallback under Settings → Connection diagnostics
 
-v1 is intentionally IPv4-only. IPv6 advertisements are disabled and IPv6-only networks are not supported until the listener, discovery, and endpoint handling are made dual-stack together. VPN, virtual-machine, bridge, and other local IPv4 addresses are retained as candidates; Drop does not implement Tailscale or remote peer discovery.
+Every candidate must complete a bounded Drop identification handshake before an endpoint learned from the fallback, Tailscale, remembered, or manual sources is added. Endpoints with the same Drop UUID are merged; route choice is automatic and prefers a recently verified path, then direct local paths, overlay paths, and revalidated remembered paths. If a preferred endpoint fails, Drop makes short staggered attempts to other candidates.
 
-The transfer listener binds an ephemeral TCP port on the local IPv4 interfaces so it can survive ordinary Wi-Fi/Ethernet address changes. mDNS uses UDP port 5353. If the operating-system firewall prompts, allow Drop inbound TCP on the trusted private/local network and UDP 5353 multicast. The transfer port is dynamic and is shown in Settings for diagnosis; Drop does not modify firewall rules automatically. Do not expose the listener beyond a trusted LAN: v1 has no transport encryption or trusted-device authentication.
+v1 is intentionally IPv4-first. IPv6-only networks are not supported until the listener, discovery, and endpoint handling are made dual-stack together. VPN, virtual-machine, bridge, and other local IPv4 addresses can participate through normal discovery or remembered endpoints; Drop does not implement a VPN or a Tailscale control plane. A Headscale-operated tailnet works through the same local Tailscale client status interface.
 
-After sleep, wake, Wi-Fi changes, DHCP changes, or a temporary mDNS failure, Drop retries discovery and removes stale peers. An active transfer that loses its connection fails cleanly; v1 does not resume partial transfers.
+The transfer/identification listener binds TCP `39821` on local IPv4 interfaces. The conservative fallback uses UDP `39821` for a small TTL-1 broadcast exchange, and mDNS uses UDP port 5353. If the operating-system firewall prompts, allow Drop inbound TCP/UDP `39821` on trusted private/local networks and UDP 5353 multicast where local mDNS is desired. Drop does not modify firewall rules automatically. Do not expose the listener to the public internet: v1 has no Drop-level authenticated device identity, transport encryption, or replay protection.
+
+If Tailscale is absent or stopped, Drop continues normally with every other source and does not show a normal-use error. After sleep, wake, Wi-Fi changes, DHCP changes, tailnet reconnects, or a temporary mDNS failure, source workers refresh, remove stale endpoints, and keep a peer visible when another current endpoint remains. An active transfer that loses its connection fails cleanly; v1 does not resume partial transfers.
 
 ## Filesystem behavior
 
@@ -127,7 +134,7 @@ contract is documented in [docs/PROTOCOL_V1.md](docs/PROTOCOL_V1.md).
 - Transfers are limited to 256 regular files and 4 TiB per request.
 - Only one transfer is admitted at a time. Additional requests are declined with a clear busy response instead of competing for shared UI or destination state.
 
-There is no transport encryption, trusted-device authentication, replay protection, internet/port-forwarding support, resume, clipboard sharing, folder sync, or automatic updating in v1. Those protections must be designed before remote support is considered.
+There is no transport encryption, trusted-device authentication, replay protection, public-internet/port-forwarding support, NAT traversal, relay, resume, clipboard sharing, folder sync, or automatic updating in v1. Tailscale protects the network path according to its own overlay configuration, but it does not add Drop-level identity or encryption to the v1 protocol. Those protections must be designed before arbitrary remote-internet support is considered.
 
 ## Plain identity and compatibility
 

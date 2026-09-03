@@ -14,9 +14,12 @@ requirements.
 
 ## Scope and security boundary
 
-Drop v1 is a direct file transfer protocol for trusted local IPv4 networks.
-Discovery uses mDNS/DNS-SD and transfer data uses a direct TCP connection. v1
-does not support relays, internet transfer, resume, or IPv6-only networks.
+Drop v1 is a direct file transfer protocol for trusted local or trusted
+overlay-reachable IPv4 networks. Discovery may use mDNS/DNS-SD, a bounded local
+broadcast fallback, a local Tailscale-compatible client status source, or a
+remembered endpoint; transfer data always uses a direct TCP connection. v1
+does not support relays, public-internet transfer, resume, or IPv6-only
+networks.
 
 The following are deliberately not provided by v1:
 
@@ -28,8 +31,8 @@ The device ID and the displayed name are self-asserted by the peer. A UUID in
 a message is an identifier and correlation value, not proof of who sent the
 message. SHA-256 detects accidental or ordinary in-transit content changes;
 it is not an authenticity mechanism. Do not expose the listener beyond a
-trusted LAN. Authentication, encryption, and replay resistance require a
-separately designed protocol version.
+trusted private network or trusted overlay. Authentication, encryption, and
+replay resistance require a separately designed protocol version.
 
 ## Discovery
 
@@ -42,8 +45,8 @@ _dead-drop._tcp.local.
 ```
 
 The service type is retained as a compatibility identifier even though the
-product is now named Drop. The local TCP listener is bound to `0.0.0.0` on a
-random ephemeral port. IPv6 discovery is disabled in v1.
+product is now named Drop. The local TCP listener is bound to `0.0.0.0` on the
+fixed Drop service port `39821`. IPv6 discovery is disabled in v1.
 
 The service instance and host names are derived from the local device UUID
 after removing hyphens:
@@ -52,15 +55,16 @@ after removing hyphens:
 | --- | --- |
 | Instance name | `Dead Drop {id_without_hyphens}` |
 | Host name | `dead-drop-{id_without_hyphens}.local.` |
-| SRV port | the ephemeral TCP transfer-listener port |
+| SRV port | the fixed TCP service port `39821` |
 | Addresses | automatically advertised usable local IPv4 addresses |
 
 The endpoint is **not** an IP address in a TXT record. A peer resolves the
 service, takes the resolved IPv4 addresses and SRV port, and forms
 `address:port` candidates. Loopback, unspecified, multicast, and broadcast
-addresses are discarded. The current mDNS source marks these endpoints as
-direct-local; the connection router ranks direct-local endpoints before any
-future overlay/other route, then prefers known reachability and a stable
+addresses are discarded. The mDNS source contributes these endpoints to the
+UUID-keyed peer registry as direct-local observations. Other sources may add
+overlay or remembered endpoints to the same peer. The connection router
+prefers known reachable endpoints, then route class and stable
 address/source ordering. Duplicates are removed before connection attempts.
 
 The implementation ignores a service with no usable address, port zero, the
@@ -85,11 +89,40 @@ TXT values are discovery hints, not an authenticated identity document. Extra
 TXT keys are ignored by the current browser and are safe only when they do not
 change the meaning of the required v1 keys.
 
+### Other endpoint sources
+
+The mDNS service is only one observation source. A local best-effort UDP
+broadcast fallback uses UDP `39821` with bounded marker packets and performs a
+normal TCP Hello probe before registry insertion. When a local Tailscale-
+compatible client is running, Drop reads structured `tailscale status --json`
+output, probes online IPv4 peer addresses on TCP `39821`, and keeps only
+compatible Drop responses. The coordination server is outside this protocol;
+Headscale and other compatible clients use the same local boundary. Successful
+connections may be remembered and revalidated later. All sources merge by
+the stable Drop UUID; hostname, display name, OS, and address alone do not
+identify a peer.
+
+### Identification probe
+
+Every non-mDNS endpoint source uses the same TCP listener and service port
+`39821`. The initiator writes one `hello` control frame and the listener
+returns one `hello` control frame. The identification frame budget is 16 KiB,
+and each read/write is bounded by two seconds. A probe never sends a transfer
+request. A listener that receives a valid Hello and then observes the
+connection close treats it as an identification-only probe and does not create
+transfer state.
+
+The response must contain a valid v1 Drop identity. The initiator rejects a
+self identity, an incompatible version, or (when the source already knows the
+peer UUID) a different UUID. A valid Hello identifies a service endpoint but
+does not authenticate the device or grant trust to arbitrary LAN traffic.
+
 ## TCP connection and framing
 
-After discovery, the initiator connects to one of the advertised IPv4
-endpoints. The connection is a byte stream; there are no message boundaries
-provided by TCP itself.
+After discovery or route selection, the initiator connects to one of the
+current IPv4 endpoints. The same listener and first Hello exchange are used by
+identification probes and transfers. The connection is a byte stream; there
+are no message boundaries provided by TCP itself.
 
 Every frame has this five-byte header followed by exactly the advertised number
 of payload bytes:
@@ -343,9 +376,10 @@ on the wire.
 
 | Operation | Current limit | Behavior on expiry |
 | --- | ---: | --- |
-| TCP connect across advertised candidates | 12 seconds total | Connection failure |
-| Hello, request, file-control, and frame reads | 45 seconds per required operation, except the pre-acceptance wait below | Transfer failure and cleanup |
-| Initial Hello/request writes | 45 seconds | Transfer failure |
+| TCP connect and bounded route attempts | 12 seconds total, up to eight candidates with a 150 ms stagger | Connection failure |
+| Identification Hello read/write | 2 seconds per operation | Candidate is rejected and the next route is tried |
+| Transfer Hello, request, file-control, and frame reads | 45 seconds per required operation, except the pre-acceptance wait below | Transfer failure and cleanup |
+| Transfer Hello/request writes | 45 seconds | Transfer failure |
 | Data/control writes during transfer | 45 seconds | Transfer failure and cleanup |
 | Waiting for recipient decision | 5 minutes | Request expires and is declined |
 | Cancellation, protocol-error, decision, and result writes | 2 seconds, best effort | The connection may close without the message being observed |
