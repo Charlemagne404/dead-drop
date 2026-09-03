@@ -21,7 +21,7 @@ use uuid::Uuid;
 pub use crate::{
     models::{
         DeviceIdentity, FaultPlan, FaultPoint, IncomingTransfer, InjectedFailure, Peer,
-        Preferences, TransferFile, TransferPhase, TransferSnapshot, PROTOCOL_VERSION,
+        Preferences, TransferFile, TransferPhase, TransferSnapshot, TrustRequest, PROTOCOL_VERSION,
     },
     peer::{
         DiscoveryObservation, Endpoint, EndpointReachability, EndpointSource, PeerRegistry,
@@ -66,6 +66,7 @@ pub fn state_for_tests(destination: &Path) -> Arc<AppState> {
             name: "Test device".to_string(),
             os: "Test OS".to_string(),
             protocol_version: PROTOCOL_VERSION,
+            fingerprint: String::new(),
         },
         Preferences {
             device_name: "Test device".to_string(),
@@ -109,11 +110,16 @@ struct PauseState {
 
 /// Records frontend-visible events and provides progress-based barriers for
 /// deterministic cancellation tests.
+type TrustCallback = Arc<dyn Fn(String) + Send + Sync>;
+
 pub struct TestEventSink {
     updates: Mutex<Vec<TransferSnapshot>>,
     incoming: Mutex<Vec<IncomingTransfer>>,
+    trust_requests: Mutex<Vec<TrustRequest>>,
+    trust_callback: Mutex<Option<TrustCallback>>,
     updates_changed: Notify,
     incoming_changed: Notify,
+    trust_changed: Notify,
     pause_changed: Notify,
     pause_released: Condvar,
     pause: Mutex<PauseState>,
@@ -124,8 +130,11 @@ impl TestEventSink {
         Self {
             updates: Mutex::new(Vec::new()),
             incoming: Mutex::new(Vec::new()),
+            trust_requests: Mutex::new(Vec::new()),
+            trust_callback: Mutex::new(None),
             updates_changed: Notify::new(),
             incoming_changed: Notify::new(),
+            trust_changed: Notify::new(),
             pause_changed: Notify::new(),
             pause_released: Condvar::new(),
             pause: Mutex::new(PauseState {
@@ -215,6 +224,38 @@ impl TestEventSink {
         }
     }
 
+    pub async fn wait_for_trust_request(&self) -> TrustRequest {
+        loop {
+            let notified = self.trust_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(request) = self.trust_requests.lock().first().cloned() {
+                return request;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_for_trust_request_after(&self, index: usize) -> TrustRequest {
+        loop {
+            let notified = self.trust_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(request) = self.trust_requests.lock().get(index).cloned() {
+                return request;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn trust_requests(&self) -> Vec<TrustRequest> {
+        self.trust_requests.lock().clone()
+    }
+
+    pub fn set_trust_callback(&self, callback: Option<Arc<dyn Fn(String) + Send + Sync>>) {
+        *self.trust_callback.lock() = callback;
+    }
+
     pub fn pause_on_first_data_progress(&self) {
         self.arm_pause(PauseCondition::FirstDataProgress);
     }
@@ -284,6 +325,15 @@ impl EventSink for TestEventSink {
     fn emit_incoming_transfer(&self, transfer: &IncomingTransfer) -> Result<(), String> {
         self.incoming.lock().push(transfer.clone());
         self.incoming_changed.notify_waiters();
+        Ok(())
+    }
+
+    fn emit_trust_request(&self, request: &TrustRequest) -> Result<(), String> {
+        self.trust_requests.lock().push(request.clone());
+        self.trust_changed.notify_waiters();
+        if let Some(callback) = self.trust_callback.lock().clone() {
+            callback(request.id.clone());
+        }
         Ok(())
     }
 }
@@ -432,6 +482,7 @@ impl Drop for FaultProxy {
 struct ProxyFrameProgress {
     bytes: usize,
     frames: usize,
+    preface_remaining: usize,
     header: Vec<u8>,
     payload_remaining: usize,
 }
@@ -441,7 +492,11 @@ impl ProxyFrameProgress {
         Self {
             bytes: 0,
             frames: 0,
-            header: Vec::with_capacity(5),
+            preface_remaining: crate::secure::SECURE_PREFACE.len(),
+            // Secure transport records use a four-byte ciphertext length.
+            // Counting those records keeps disconnect triggers useful after
+            // the v2 encryption layer, without inspecting ciphertext.
+            header: Vec::with_capacity(4),
             payload_remaining: 0,
         }
     }
@@ -462,6 +517,12 @@ impl ProxyFrameProgress {
                 }
                 let mut consumed = 0;
                 while consumed < data.len() && self.frames < limit {
+                    if self.preface_remaining > 0 {
+                        let count = (data.len() - consumed).min(self.preface_remaining);
+                        self.preface_remaining -= count;
+                        consumed += count;
+                        continue;
+                    }
                     if self.payload_remaining > 0 {
                         let count = (data.len() - consumed).min(self.payload_remaining);
                         self.payload_remaining -= count;
@@ -470,16 +531,16 @@ impl ProxyFrameProgress {
                             self.frames += 1;
                         }
                     } else {
-                        let count = (data.len() - consumed).min(5 - self.header.len());
+                        let count = (data.len() - consumed).min(4 - self.header.len());
                         self.header
                             .extend_from_slice(&data[consumed..consumed + count]);
                         consumed += count;
-                        if self.header.len() == 5 {
+                        if self.header.len() == 4 {
                             let payload_length = u32::from_be_bytes([
+                                self.header[0],
                                 self.header[1],
                                 self.header[2],
                                 self.header[3],
-                                self.header[4],
                             ]) as usize;
                             self.header.clear();
                             self.payload_remaining = payload_length;
@@ -641,22 +702,30 @@ impl TestPeer {
         let address = listener
             .local_addr()
             .expect("peer listener address should be available");
-        let identity = DeviceIdentity {
+        let mut identity = DeviceIdentity {
             id: Uuid::new_v4().to_string(),
             name: label.to_string(),
             os: crate::platform::platform_name(),
             protocol_version: PROTOCOL_VERSION,
+            fingerprint: String::new(),
         };
-        let state = Arc::new(AppState::new_with_faults(
+        let local_identity = crate::identity::test_identity(&identity.id);
+        identity.fingerprint = local_identity.fingerprint().to_string();
+        let state = Arc::new(AppState::new_with_local_identity_and_faults(
             identity.clone(),
             Preferences {
                 device_name: label.to_string(),
                 destination: destination.to_string_lossy().into_owned(),
             },
             address.port(),
+            local_identity,
             faults.clone(),
         ));
         let events = Arc::new(TestEventSink::new());
+        let state_for_trust = state.clone();
+        events.set_trust_callback(Some(Arc::new(move |request_id| {
+            let _ = state_for_trust.resolve_pending_trust_request(&request_id, true);
+        })));
         let listener_task =
             crate::transfer::start_listener_for_test(listener, state.clone(), events.clone());
         Self {
@@ -715,7 +784,122 @@ impl TestPeer {
         target: &TestPeer,
         paths: Vec<PathBuf>,
     ) -> Result<TransferRun, String> {
+        self.state.trust_peer(&target.identity)?;
+        target.state.trust_peer(&self.identity)?;
         self.start_send_to_peer(target.peer_record(), paths)
+    }
+
+    pub fn start_send_to_untrusted(
+        &self,
+        target: &TestPeer,
+        paths: Vec<PathBuf>,
+    ) -> Result<TransferRun, String> {
+        self.start_send_to_peer(target.peer_record(), paths)
+    }
+
+    /// Drive a custom transfer over the real secure channel for protocol
+    /// integration tests. The production transfer path remains responsible
+    /// for normal file selection; this helper only lets tests vary metadata
+    /// and payloads to exercise rollback and verification behavior.
+    pub async fn send_custom_transfer(
+        &self,
+        receiver: &TestPeer,
+        file: TransferFile,
+        payload: &[u8],
+        send_complete: bool,
+    ) -> String {
+        let stream = TcpStream::connect(receiver.address())
+            .await
+            .expect("secure test sender should connect");
+        let local = self.state.device();
+        let local_identity = self.state.local_identity();
+        let mut session = crate::secure::establish_initiator(stream, &local_identity)
+            .await
+            .expect("secure test sender should establish");
+        session
+            .channel
+            .write_control(&crate::protocol::ControlMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                device: local,
+            })
+            .await
+            .expect("secure test hello should write");
+        session
+            .channel
+            .read_control()
+            .await
+            .expect("secure test hello response should read");
+
+        let transfer_id = Uuid::new_v4().to_string();
+        session
+            .channel
+            .write_control(&crate::protocol::ControlMessage::TransferRequest {
+                transfer_id: transfer_id.clone(),
+                files: vec![file.clone()],
+                total_bytes: file.size,
+            })
+            .await
+            .expect("custom transfer request should write");
+        receiver.events.wait_for_incoming(&transfer_id).await;
+        receiver
+            .accept(&transfer_id)
+            .expect("receiver should accept custom transfer");
+        let decision = session
+            .channel
+            .read_control()
+            .await
+            .expect("custom transfer decision should read");
+        assert!(matches!(
+            decision,
+            crate::protocol::ControlMessage::TransferDecision { accepted: true, .. }
+        ));
+        session
+            .channel
+            .write_control(&crate::protocol::ControlMessage::FileStart {
+                transfer_id: transfer_id.clone(),
+                file_index: 0,
+            })
+            .await
+            .expect("custom file start should write");
+        session
+            .channel
+            .write_data(payload)
+            .await
+            .expect("custom file payload should write");
+        session
+            .channel
+            .write_control(&crate::protocol::ControlMessage::FileEnd {
+                transfer_id: transfer_id.clone(),
+                file_index: 0,
+            })
+            .await
+            .expect("custom file end should write");
+        if send_complete {
+            session
+                .channel
+                .write_control(&crate::protocol::ControlMessage::Complete {
+                    transfer_id: transfer_id.clone(),
+                })
+                .await
+                .expect("custom completion should write");
+            let _ = session
+                .channel
+                .read_control()
+                .await
+                .expect("custom transfer result should read");
+        }
+        transfer_id
+    }
+
+    /// Disable the test harness's default trust approval so a test can drive
+    /// the real first-contact decision path explicitly.
+    pub fn disable_auto_trust(&self) {
+        self.events.set_trust_callback(None);
+    }
+
+    pub fn respond_to_trust(&self, request_id: &str, accepted: bool) -> Result<(), String> {
+        self.state
+            .resolve_pending_trust_request(request_id, accepted)
     }
 
     pub fn start_send_to_peer(
@@ -800,7 +984,7 @@ mod tests {
     use super::*;
     use crate::{
         models::{Cancellation, TransferPhase},
-        protocol::{read_frame, ControlMessage, Frame},
+        secure::{MAX_HANDSHAKE_MESSAGE, SECURE_PREFACE},
         transfer,
     };
     use std::{fs, net::TcpListener as StdTcpListener, time::Duration};
@@ -844,24 +1028,23 @@ mod tests {
         let mut client = TcpStream::connect(address)
             .await
             .expect("test client should connect");
-        let payload = serde_json::to_vec(&ControlMessage::Cancel {
-            transfer_id: "22222222-2222-4222-8222-222222222222".to_string(),
-        })
-        .expect("test message should encode");
-        let mut frame = vec![1];
-        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&payload);
+        let malformed_preface = vec![0_u8; SECURE_PREFACE.len()];
         client
-            .write_all(&frame)
+            .write_all(&malformed_preface)
             .await
-            .expect("malformed frame should write");
-        let response = read_frame(&mut client)
+            .expect("malformed preface should write");
+        let mut response = vec![0_u8; SECURE_PREFACE.len()];
+        client
+            .read_exact(&mut response)
             .await
-            .expect("server should send a protocol error");
-        assert!(matches!(
-            response,
-            Frame::Control(crate::protocol::ControlMessage::ProtocolError { .. })
-        ));
+            .expect("server preface should be written before validation");
+        assert_eq!(response, SECURE_PREFACE);
+        let bytes_read =
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut response[..1]))
+                .await
+                .expect("server should close after a malformed preface")
+                .expect("client read should succeed");
+        assert_eq!(bytes_read, 0);
         assert!(state.is_idle());
         assert!(events.incoming_transfers().is_empty());
 
@@ -888,9 +1071,18 @@ mod tests {
             .await
             .expect("test client should connect");
         client
-            .write_all(&[2, 0xff, 0xff, 0xff, 0xff])
+            .write_all(SECURE_PREFACE)
             .await
-            .expect("oversized frame header should write");
+            .expect("secure preface should write");
+        let mut preface = vec![0_u8; SECURE_PREFACE.len()];
+        client
+            .read_exact(&mut preface)
+            .await
+            .expect("server preface should write");
+        client
+            .write_all(&((MAX_HANDSHAKE_MESSAGE as u32) + 1).to_be_bytes())
+            .await
+            .expect("oversized handshake length should write");
         let mut response = [0_u8; 1];
         let bytes_read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut response))
             .await
@@ -916,6 +1108,7 @@ mod tests {
                 name: "Test peer".to_string(),
                 os: "Test OS".to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                fingerprint: String::new(),
             },
             vec![crate::peer::Endpoint::new(
                 "127.0.0.1:1".parse().unwrap(),

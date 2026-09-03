@@ -91,6 +91,7 @@ fn run_registry(count: usize) -> Result<(), String> {
                 name: format!("Synthetic peer {index:05}"),
                 os: "Benchmark OS".to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                fingerprint: String::new(),
             },
             source,
             endpoints: vec![endpoint],
@@ -187,6 +188,7 @@ async fn run_sender(options: SenderOptions) -> Result<(), String> {
         name: options.name,
         os: options.os,
         protocol_version: PROTOCOL_VERSION,
+        fingerprint: String::new(),
     };
     let receiver = Peer::new(
         receiver_identity,

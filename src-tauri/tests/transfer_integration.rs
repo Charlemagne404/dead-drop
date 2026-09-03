@@ -20,9 +20,6 @@ use tokio::{
 use uuid::Uuid;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
-const DATA_FRAME: u8 = 2;
-const CONTROL_FRAME: u8 = 1;
-
 struct MeasuringAllocator;
 
 static LIVE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -202,151 +199,6 @@ fn assert_phase_order(snapshots: &[TransferSnapshot], expected: &[TransferPhase]
     }
 }
 
-async fn raw_frame(stream: &mut TcpStream, kind: u8, payload: &[u8]) {
-    stream
-        .write_u8(kind)
-        .await
-        .expect("raw frame kind should write");
-    stream
-        .write_u32(payload.len() as u32)
-        .await
-        .expect("raw frame length should write");
-    stream
-        .write_all(payload)
-        .await
-        .expect("raw frame payload should write");
-}
-
-async fn read_raw_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
-    let kind = stream.read_u8().await.expect("raw frame kind should read");
-    let length = stream
-        .read_u32()
-        .await
-        .expect("raw frame length should read") as usize;
-    assert!(length <= 512 * 1024, "fake peer frame should be bounded");
-    let mut payload = vec![0_u8; length];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .expect("raw frame payload should read");
-    (kind, payload)
-}
-
-fn fake_identity(name: &str) -> DeviceIdentity {
-    DeviceIdentity {
-        id: Uuid::new_v4().to_string(),
-        name: name.to_string(),
-        os: "Test OS".to_string(),
-        protocol_version: PROTOCOL_VERSION,
-    }
-}
-
-fn fake_peer(identity: &DeviceIdentity, address: SocketAddr) -> Peer {
-    Peer::new(
-        identity.clone(),
-        vec![Endpoint::new(
-            address,
-            EndpointSource::new(
-                "test-discovery",
-                "ipv4",
-                format!("{}._dead-drop._tcp.local.", identity.id),
-            ),
-            RouteClass::DirectLocal,
-            std::time::Instant::now(),
-        )],
-    )
-}
-
-async fn run_fake_peer_until_data_disconnect(listener: TcpListener, identity: DeviceIdentity) {
-    let (mut stream, _) = listener.accept().await.expect("fake peer should accept");
-    let (kind, _) = read_raw_frame(&mut stream).await;
-    assert_eq!(kind, CONTROL_FRAME);
-    raw_frame(
-        &mut stream,
-        CONTROL_FRAME,
-        &serde_json::to_vec(&serde_json::json!({
-            "type": "hello",
-            "protocol_version": PROTOCOL_VERSION,
-            "device": identity,
-        }))
-        .expect("fake hello should encode"),
-    )
-    .await;
-    let (kind, request_payload) = read_raw_frame(&mut stream).await;
-    assert_eq!(kind, CONTROL_FRAME);
-    let request: serde_json::Value =
-        serde_json::from_slice(&request_payload).expect("transfer request should be JSON");
-    let transfer_id = request["transfer_id"]
-        .as_str()
-        .expect("transfer request should contain an id");
-    raw_frame(
-        &mut stream,
-        CONTROL_FRAME,
-        &serde_json::to_vec(&serde_json::json!({
-            "type": "transfer_decision",
-            "transfer_id": transfer_id,
-            "accepted": true,
-            "reason": null,
-        }))
-        .expect("fake decision should encode"),
-    )
-    .await;
-    loop {
-        let (kind, _) = read_raw_frame(&mut stream).await;
-        if kind == DATA_FRAME {
-            break;
-        }
-    }
-    let _ = stream.shutdown().await;
-}
-
-async fn run_fake_peer_until_complete_disconnect(listener: TcpListener, identity: DeviceIdentity) {
-    let (mut stream, _) = listener.accept().await.expect("fake peer should accept");
-    let (kind, _) = read_raw_frame(&mut stream).await;
-    assert_eq!(kind, CONTROL_FRAME);
-    raw_frame(
-        &mut stream,
-        CONTROL_FRAME,
-        &serde_json::to_vec(&serde_json::json!({
-            "type": "hello",
-            "protocol_version": PROTOCOL_VERSION,
-            "device": identity,
-        }))
-        .expect("fake hello should encode"),
-    )
-    .await;
-    let (kind, request_payload) = read_raw_frame(&mut stream).await;
-    assert_eq!(kind, CONTROL_FRAME);
-    let request: serde_json::Value =
-        serde_json::from_slice(&request_payload).expect("transfer request should be JSON");
-    let transfer_id = request["transfer_id"]
-        .as_str()
-        .expect("transfer request should contain an id");
-    raw_frame(
-        &mut stream,
-        CONTROL_FRAME,
-        &serde_json::to_vec(&serde_json::json!({
-            "type": "transfer_decision",
-            "transfer_id": transfer_id,
-            "accepted": true,
-            "reason": null,
-        }))
-        .expect("fake decision should encode"),
-    )
-    .await;
-    loop {
-        let (kind, payload) = read_raw_frame(&mut stream).await;
-        if kind == CONTROL_FRAME {
-            let control: serde_json::Value =
-                serde_json::from_slice(&payload).expect("fake peer control should be JSON");
-            if control["type"] == "complete" {
-                break;
-            }
-        }
-    }
-    let _ = stream.shutdown().await;
-}
-
 async fn settle_simultaneous_transfers(
     a: &TestPeer,
     b: &TestPeer,
@@ -459,6 +311,84 @@ async fn transfers_successfully_over_real_tcp_in_both_directions() {
         reverse_contents
     );
     assert_no_part_files(&a.destination_dir());
+    wait_idle(&a, &b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn first_contact_requires_trust_and_trusted_identity_reconnects() {
+    let a = TestPeer::new("Peer A");
+    let b = TestPeer::new("Peer B");
+    a.disable_auto_trust();
+    b.disable_auto_trust();
+
+    let source = a.source_dir().join("first-contact.txt");
+    write_file(&source, b"first contact");
+    let a_requests_before = a.events.trust_requests().len();
+    let b_requests_before = b.events.trust_requests().len();
+    let run = a
+        .start_send_to_untrusted(&b, vec![source.clone()])
+        .expect("first-contact transfer should start");
+    let id = run.id().to_string();
+
+    let a_request = timeout(
+        TEST_TIMEOUT,
+        a.events.wait_for_trust_request_after(a_requests_before),
+    )
+    .await
+    .expect("sender should show a first-contact trust request");
+    assert_eq!(a_request.reason, "new_device");
+    assert_eq!(a_request.device.fingerprint, b.identity().fingerprint);
+    assert!(a_request.short_fingerprint.contains('…'));
+    a.respond_to_trust(&a_request.id, true)
+        .expect("sender trust decision should resolve");
+
+    let b_request = timeout(
+        TEST_TIMEOUT,
+        b.events.wait_for_trust_request_after(b_requests_before),
+    )
+    .await
+    .expect("receiver should show a first-contact trust request");
+    assert_eq!(b_request.reason, "new_device");
+    assert_eq!(b_request.device.fingerprint, a.identity().fingerprint);
+    b.respond_to_trust(&b_request.id, true)
+        .expect("receiver trust decision should resolve");
+
+    wait_incoming(&b.events, &id).await;
+    b.accept(&id).expect("receiver should accept first contact");
+    wait_run(run).await;
+    assert_eq!(
+        wait_terminal(&a.events, &id).await.phase,
+        TransferPhase::Completed
+    );
+    assert_eq!(
+        wait_terminal(&b.events, &id).await.phase,
+        TransferPhase::Completed
+    );
+    wait_idle(&a, &b).await;
+
+    let a_requests_before_reconnect = a.events.trust_requests().len();
+    let b_requests_before_reconnect = b.events.trust_requests().len();
+    let reconnect_source = a.source_dir().join("trusted-reconnect.txt");
+    write_file(&reconnect_source, b"trusted reconnect");
+    let reconnect = a
+        .start_send_to_untrusted(&b, vec![reconnect_source])
+        .expect("trusted reconnect should start");
+    let reconnect_id = reconnect.id().to_string();
+    let incoming = wait_incoming(&b.events, &reconnect_id).await;
+    assert_eq!(incoming.from.fingerprint, a.identity().fingerprint);
+    assert_eq!(a.events.trust_requests().len(), a_requests_before_reconnect);
+    assert_eq!(b.events.trust_requests().len(), b_requests_before_reconnect);
+    b.accept(&reconnect_id)
+        .expect("receiver should accept trusted reconnect");
+    wait_run(reconnect).await;
+    assert_eq!(
+        wait_terminal(&a.events, &reconnect_id).await.phase,
+        TransferPhase::Completed
+    );
+    assert_eq!(
+        wait_terminal(&b.events, &reconnect_id).await.phase,
+        TransferPhase::Completed
+    );
     wait_idle(&a, &b).await;
 }
 
@@ -938,55 +868,57 @@ async fn disconnects_during_negotiation_active_transfer_and_completion_do_not_ha
         .expect("negotiation disconnect should be readable");
     assert!(receiver.is_idle());
 
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("fake active listener should bind");
-    let address = listener.local_addr().unwrap();
-    let identity = fake_identity("Dropper");
-    let fake_task = tokio::spawn(run_fake_peer_until_data_disconnect(
-        listener,
-        identity.clone(),
-    ));
+    let mut receiver = TestPeer::new("Dropper");
+    receiver.events.pause_on_first_data_progress();
     let sender = TestPeer::new("Sender");
     let source = sender.source_dir().join("active-disconnect.bin");
     write_pattern_file(&source, 4 * 96 * 1024, 7);
     let active = sender
-        .start_send_to_peer(fake_peer(&identity, address), vec![source])
+        .start_send_to(&receiver, vec![source])
         .expect("active disconnect transfer should start");
     let active_id = active.id().to_string();
+    wait_incoming(&receiver.events, &active_id).await;
+    receiver
+        .accept(&active_id)
+        .expect("receiver should accept active transfer");
+    timeout(TEST_TIMEOUT, receiver.events.wait_until_paused())
+        .await
+        .expect("receiver should reach the active transfer barrier");
+    receiver.state().shutdown();
+    receiver.events.release_pause();
     wait_run(active).await;
-    fake_task.await.expect("fake active peer should not panic");
     assert_eq!(
         wait_terminal(&sender.events, &active_id).await.phase,
         TransferPhase::Failed
     );
     assert!(sender.is_idle());
+    receiver.shutdown().await;
 
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("fake completion listener should bind");
-    let address = listener.local_addr().unwrap();
-    let identity = fake_identity("Completion Dropper");
-    let fake_task = tokio::spawn(run_fake_peer_until_complete_disconnect(
-        listener,
-        identity.clone(),
-    ));
+    let mut receiver = TestPeer::new("Completion Dropper");
+    receiver.events.pause_on_phase(TransferPhase::Completing);
     let sender = TestPeer::new("Completion Sender");
     let source = sender.source_dir().join("completion-disconnect.txt");
     write_file(&source, b"drop after complete");
     let completion = sender
-        .start_send_to_peer(fake_peer(&identity, address), vec![source])
+        .start_send_to(&receiver, vec![source])
         .expect("completion disconnect transfer should start");
     let completion_id = completion.id().to_string();
-    wait_run(completion).await;
-    fake_task
+    wait_incoming(&receiver.events, &completion_id).await;
+    receiver
+        .accept(&completion_id)
+        .expect("receiver should accept completion transfer");
+    timeout(TEST_TIMEOUT, receiver.events.wait_until_paused())
         .await
-        .expect("fake completion peer should not panic");
+        .expect("receiver should reach the completion barrier");
+    receiver.state().shutdown();
+    receiver.events.release_pause();
+    wait_run(completion).await;
     assert_eq!(
         wait_terminal(&sender.events, &completion_id).await.phase,
         TransferPhase::Failed
     );
     assert!(sender.is_idle());
+    receiver.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1066,36 +998,51 @@ async fn busy_and_simultaneous_send_behavior_is_controlled_and_deadlock_free() {
     wait_idle(&a, &b).await;
 }
 
-async fn assert_malformed_frame_is_closed(peer: &TestPeer, bytes: &[u8]) {
+async fn assert_malformed_secure_handshake_is_closed(
+    peer: &TestPeer,
+    client_preface: &[u8],
+    suffix: &[u8],
+) {
     let mut stream = TcpStream::connect(peer.address())
         .await
         .expect("malformed peer socket should connect");
     stream
-        .write_all(bytes)
+        .write_all(client_preface)
         .await
-        .expect("malformed bytes should write");
+        .expect("malformed preface should write");
+    let mut server_preface = vec![0_u8; b"DROP-SECURE-V2".len()];
+    stream
+        .read_exact(&mut server_preface)
+        .await
+        .expect("server preface should write");
+    stream
+        .write_all(suffix)
+        .await
+        .expect("malformed handshake should write");
     let mut response = Vec::new();
-    timeout(TEST_TIMEOUT, stream.read_to_end(&mut response))
+    let result = timeout(TEST_TIMEOUT, stream.read_to_end(&mut response))
         .await
-        .expect("malformed peer should be closed without hanging")
-        .expect("malformed peer closure should be readable");
+        .expect("malformed peer should be closed without hanging");
+    if let Err(error) = result {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::BrokenPipe
+            ),
+            "malformed peer returned an unexpected error: {error}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn malformed_remote_frames_are_rejected_without_panic_or_large_allocation() {
     let peer = TestPeer::new("Protocol Receiver");
-    assert_malformed_frame_is_closed(&peer, &[DATA_FRAME, 0xff, 0xff, 0xff, 0xff]).await;
-    assert_malformed_frame_is_closed(&peer, &[CONTROL_FRAME, 0, 0, 0, 4, b'{', b'}', b'!', b'!'])
+    assert_malformed_secure_handshake_is_closed(&peer, &[0_u8; 13], &[]).await;
+    assert_malformed_secure_handshake_is_closed(&peer, b"DROP-SECURE-V2", &1025_u32.to_be_bytes())
         .await;
-    let cancel = serde_json::to_vec(&serde_json::json!({
-        "type": "cancel",
-        "transfer_id": "22222222-2222-4222-8222-222222222222",
-    }))
-    .unwrap();
-    let mut wrong_first = vec![CONTROL_FRAME];
-    wrong_first.extend_from_slice(&(cancel.len() as u32).to_be_bytes());
-    wrong_first.extend_from_slice(&cancel);
-    assert_malformed_frame_is_closed(&peer, &wrong_first).await;
+    assert_malformed_secure_handshake_is_closed(&peer, b"DROP-SECURE-V2", &[1, 0xff]).await;
     assert!(peer.is_idle());
 }
 

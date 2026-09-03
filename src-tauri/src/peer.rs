@@ -1,4 +1,4 @@
-use crate::routing;
+use crate::{identity, routing};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -17,6 +17,10 @@ pub struct DeviceIdentity {
     pub name: String,
     pub os: String,
     pub protocol_version: u16,
+    /// Empty only for untrusted discovery metadata or legacy persisted data.
+    /// Secure Hello messages must carry the full public-key fingerprint.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
 }
 
 /// Route classes describe how an endpoint was learned without becoming a
@@ -152,6 +156,10 @@ pub struct Peer {
     pub name: String,
     pub os: String,
     pub protocol_version: u16,
+    /// Discovery may refresh this value, but trust decisions never rely on
+    /// it until a secure Hello binds it to the Noise static key.
+    pub fingerprint: String,
+    authenticated_fingerprint: Option<String>,
     /// This is the deduplicated, currently retained endpoint view. The
     /// source-scoped observations below are intentionally backend-only.
     pub endpoints: Vec<Endpoint>,
@@ -181,6 +189,8 @@ impl Peer {
             name: identity.name,
             os: identity.os,
             protocol_version: identity.protocol_version,
+            fingerprint: identity.fingerprint,
+            authenticated_fingerprint: None,
             endpoints,
             source_observations,
             metadata_seen,
@@ -349,6 +359,7 @@ pub struct PeerDiagnosticsSnapshot {
     pub name: String,
     pub os: String,
     pub protocol_version: u16,
+    pub fingerprint: Option<String>,
     pub protocol_compatible: bool,
     pub selected_route: Option<String>,
     pub endpoints: Vec<EndpointDiagnosticsSnapshot>,
@@ -387,6 +398,7 @@ impl PeerRegistry {
                 name: peer.name.clone(),
                 os: peer.os.clone(),
                 protocol_version: peer.protocol_version,
+                fingerprint: (!peer.fingerprint.is_empty()).then(|| peer.fingerprint.clone()),
                 protocol_compatible: peer.protocol_version == crate::models::PROTOCOL_VERSION,
                 selected_route: routing::preferred_endpoint(&peer.endpoints)
                     .map(|endpoint| endpoint.address.to_string()),
@@ -464,6 +476,8 @@ impl PeerRegistry {
                 .chars()
                 .any(|character| character.is_control())
             || observation.identity.protocol_version == 0
+            || (!observation.identity.fingerprint.is_empty()
+                && !identity::valid_fingerprint(&observation.identity.fingerprint))
         {
             return ObservationChange::None;
         }
@@ -493,17 +507,24 @@ impl PeerRegistry {
                     name: observation.identity.name.clone(),
                     os: observation.identity.os.clone(),
                     protocol_version: observation.identity.protocol_version,
+                    fingerprint: observation.identity.fingerprint.clone(),
                 },
                 Vec::new(),
             )
         });
         let metadata_changed = if observed_at >= peer.metadata_seen {
-            let changed = peer.name != observation.identity.name
-                || peer.os != observation.identity.os
-                || peer.protocol_version != observation.identity.protocol_version;
-            peer.name = observation.identity.name;
-            peer.os = observation.identity.os;
-            peer.protocol_version = observation.identity.protocol_version;
+            let authenticated = peer.authenticated_fingerprint.is_some();
+            let changed = !authenticated
+                && (peer.name != observation.identity.name
+                    || peer.os != observation.identity.os
+                    || peer.protocol_version != observation.identity.protocol_version
+                    || peer.fingerprint != observation.identity.fingerprint);
+            if !authenticated {
+                peer.name = observation.identity.name;
+                peer.os = observation.identity.os;
+                peer.protocol_version = observation.identity.protocol_version;
+                peer.fingerprint = observation.identity.fingerprint;
+            }
             peer.metadata_seen = observed_at;
             changed
         } else {
@@ -591,6 +612,29 @@ impl PeerRegistry {
             occurred_at: Instant::now(),
         });
         true
+    }
+
+    pub fn record_authenticated_identity(&mut self, identity: DeviceIdentity) -> bool {
+        let Some(id) = canonical_device_id(&identity.id) else {
+            return false;
+        };
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return false;
+        };
+        if !identity::valid_fingerprint(&identity.fingerprint) {
+            return false;
+        }
+        let changed = peer.authenticated_fingerprint.as_deref() != Some(&identity.fingerprint)
+            || peer.fingerprint != identity.fingerprint
+            || peer.name != identity.name
+            || peer.os != identity.os
+            || peer.protocol_version != identity.protocol_version;
+        peer.authenticated_fingerprint = Some(identity.fingerprint.clone());
+        peer.fingerprint = identity.fingerprint;
+        peer.name = identity.name;
+        peer.os = identity.os;
+        peer.protocol_version = identity.protocol_version;
+        changed
     }
 
     pub fn record_route_failure(
@@ -786,7 +830,8 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             os: os.to_string(),
-            protocol_version: 1,
+            protocol_version: crate::models::PROTOCOL_VERSION,
+            fingerprint: String::new(),
         }
     }
 
@@ -846,6 +891,33 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert_eq!(peer.endpoints.len(), 1);
         assert_eq!(peer.source_labels_for(peer.endpoints[0].address).len(), 2);
+    }
+
+    #[test]
+    fn discovery_metadata_cannot_replace_an_authenticated_fingerprint() {
+        let id = "13131313-1313-4131-8131-131313131313";
+        let trusted_key = crate::identity::test_identity("authenticated-peer");
+        let spoofed_key = crate::identity::test_identity("spoofed-peer");
+        let mut trusted_observation = observation(id, "Home Server", "Linux", "mdns", &[10]);
+        trusted_observation.identity.fingerprint = trusted_key.fingerprint().to_string();
+        let mut registry = PeerRegistry::new();
+        assert!(registry.apply_observation(trusted_observation));
+        assert!(registry.record_authenticated_identity(DeviceIdentity {
+            id: id.to_string(),
+            name: "Home Server".to_string(),
+            os: "Linux".to_string(),
+            protocol_version: crate::models::PROTOCOL_VERSION,
+            fingerprint: trusted_key.fingerprint().to_string(),
+        }));
+
+        let mut spoofed_observation = observation(id, "Impostor", "Linux", "mdns", &[11]);
+        spoofed_observation.identity.fingerprint = spoofed_key.fingerprint().to_string();
+        registry.apply_observation(spoofed_observation);
+        let peer = registry
+            .peer(id)
+            .expect("authenticated peer should remain present");
+        assert_eq!(peer.fingerprint, trusted_key.fingerprint());
+        assert_eq!(peer.name, "Home Server");
     }
 
     #[test]

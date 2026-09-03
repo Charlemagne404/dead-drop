@@ -15,6 +15,7 @@ import {
   type Peer,
   type Preferences,
   type RuntimeDiagnostics,
+  type TrustRequest,
   type Transfer,
 } from "./lib/desktop";
 import "./styles.css";
@@ -25,14 +26,14 @@ const previewPeers: Peer[] = [
     name: "Charlie's ThinkPad",
     os: "Windows 11",
     online: true,
-    protocolVersion: 1,
+    protocolVersion: 2,
   },
   {
     id: "preview-desktop",
     name: "Desktop",
     os: "Linux",
     online: true,
-    protocolVersion: 1,
+    protocolVersion: 2,
   },
 ];
 
@@ -46,18 +47,20 @@ const previewDiagnostics: RuntimeDiagnostics = {
     version: "0.1.0",
     os: "Preview",
     architecture: "preview",
-    protocolVersion: 1,
+    protocolVersion: 2,
   },
   local: {
     deviceId: "preview-device",
     deviceName: initialPreferences.deviceName,
+    identityFingerprint: "preview identity",
+    identityStorageStatus: "preview",
     receiveDirectoryAvailable: true,
     serviceStatus: "preview",
     serviceDetail: null,
     servicePort: 0,
     transport: "IPv4",
     interfaceStatus: "addresses omitted",
-    transportLimitations: ["IPv4 only", "LAN traffic is not encrypted"],
+    transportLimitations: ["IPv4 only", "Drop v2 sessions are encrypted and authenticated"],
   },
   discovery: {
     mdns: { status: "preview", detail: null },
@@ -71,6 +74,7 @@ const previewDiagnostics: RuntimeDiagnostics = {
     retention: "preview",
     currentEntries: 0,
   },
+  trustedDevices: [],
   peers: [],
 };
 
@@ -112,6 +116,7 @@ function App() {
   );
   const [activeTransfer, setActiveTransfer] = useState<Transfer | null>(null);
   const [incoming, setIncoming] = useState<IncomingTransfer | null>(null);
+  const [trustRequest, setTrustRequest] = useState<TrustRequest | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [openDiagnostics, setOpenDiagnostics] = useState(false);
@@ -129,9 +134,9 @@ function App() {
     [peers, selectedId],
   );
   const transferLocked = Boolean(activeTransfer || incoming);
-  const viewLocked = Boolean(transferLocked || isSettingsOpen);
-  const hasAvailablePeer = peers.some((peer) => peer.online && peer.protocolVersion === 1);
-  const allPeersNeedUpdate = peers.length > 0 && peers.every((peer) => peer.protocolVersion !== 1);
+  const viewLocked = Boolean(transferLocked || isSettingsOpen || trustRequest);
+  const hasAvailablePeer = peers.some((peer) => peer.online && peer.protocolVersion === 2);
+  const allPeersNeedUpdate = peers.length > 0 && peers.every((peer) => peer.protocolVersion !== 2);
   const noDeviceState: NoDeviceState = hasAvailablePeer
     ? "select"
     : !peers.length
@@ -185,6 +190,11 @@ function App() {
           setIncoming(nextIncoming);
           setActiveTransfer((current) => (current?.id === nextIncoming.id ? null : current));
           setIsSettingsOpen(false);
+        }),
+        attach<TrustRequest>("trust-request", (nextTrustRequest) => {
+          setTrustRequest(nextTrustRequest);
+          setIsSettingsOpen(false);
+          setOpenDiagnostics(false);
         }),
         attach<string>("discovery-status", (status) => setNotice(status)),
         attach<RuntimeDiagnostics>("connectivity-diagnostics", (nextDiagnostics) => {
@@ -253,7 +263,7 @@ function App() {
       setNotice("Device went offline.");
       return;
     }
-    if (peer.protocolVersion !== 1) {
+    if (peer.protocolVersion !== 2) {
       setNotice("Update Drop on that device first.");
       return;
     }
@@ -350,7 +360,7 @@ function App() {
           <p className="eyebrow">Devices</p>
           <div className="device-list">
             {peers.map((peer) => {
-              const compatible = peer.protocolVersion === 1;
+              const compatible = peer.protocolVersion === 2;
               return (
                 <button
                   aria-current={peer.id === selectedId ? "true" : undefined}
@@ -440,6 +450,13 @@ function App() {
               preferences={preferences}
               diagnostics={diagnostics}
               openDiagnostics={openDiagnostics}
+              onForgetTrustedDevice={async (fingerprint) => {
+                if (native) await command.forgetTrustedDevice(fingerprint);
+                setDiagnostics((current) => current
+                  ? { ...current, trustedDevices: current.trustedDevices.filter((device) => device.fingerprint !== fingerprint) }
+                  : current);
+                setNotice("Device forgotten. Drop will ask before trusting it again.");
+              }}
               onClose={() => {
                 setOpenDiagnostics(false);
                 setIsSettingsOpen(false);
@@ -472,6 +489,17 @@ function App() {
                     : current,
                 );
                 setNotice("Saved. Devices will refresh shortly.");
+              }}
+            />
+          ) : trustRequest ? (
+            <TrustPanel
+              request={trustRequest}
+              onRespond={async (accepted) => {
+                const request = trustRequest;
+                if (!request) return;
+                if (native) await command.respondToTrust(request.id, accepted);
+                setTrustRequest(null);
+                if (!accepted) setNotice("Device was not trusted.");
               }}
             />
           ) : incoming ? (
@@ -523,10 +551,10 @@ function App() {
         </div>
         {isDragging && (
           <div className="drop-state" aria-live="polite">
-            <p>{incoming ? "Incoming request" : viewLocked ? "Transfer in progress" : selectedPeer ? "Drop to send" : "Choose a device first"}</p>
+            <p>{trustRequest ? "Confirm this device" : incoming ? "Incoming request" : viewLocked ? "Transfer in progress" : selectedPeer ? "Drop to send" : "Choose a device first"}</p>
             <span>
               <ArrowIcon />
-              {incoming ? "Respond before sending" : viewLocked ? "Finish the current transfer" : selectedPeer ? selectedPeer.name : "Select a device"}
+              {trustRequest ? trustRequest.device.name : incoming ? "Respond before sending" : viewLocked ? "Finish the current transfer" : selectedPeer ? selectedPeer.name : "Select a device"}
             </span>
           </div>
         )}
@@ -549,7 +577,7 @@ function App() {
 }
 
 function SendPanel({ peer, onChoose }: { peer: Peer; onChoose: () => void }) {
-  const compatible = peer.online && peer.protocolVersion === 1;
+  const compatible = peer.online && peer.protocolVersion === 2;
   const targetStatus = !peer.online ? "Offline" : compatible ? peer.os : "Needs a Drop update";
   const promptTitle = !peer.online ? "Device went offline." : compatible ? "Drop files anywhere" : "Update Drop to send";
   const promptCopy = compatible ? "or choose files" : "Choose another device";
@@ -568,6 +596,54 @@ function SendPanel({ peer, onChoose }: { peer: Peer; onChoose: () => void }) {
           Choose files
         </button>
       </div>
+    </div>
+  );
+}
+
+function TrustPanel({
+  request,
+  onRespond,
+}: {
+  request: TrustRequest;
+  onRespond: (accepted: boolean) => Promise<void>;
+}) {
+  const [responding, setResponding] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const changed = request.reason === "identity_changed";
+  const respond = async (accepted: boolean) => {
+    if (responding) return;
+    setResponding(true);
+    setError(null);
+    try {
+      await onRespond(accepted);
+    } catch (reason) {
+      setResponding(false);
+      setError(userFacingError(reason, "Couldn't update trusted devices."));
+    }
+  };
+  return (
+    <div className="trust-panel state-panel" role="dialog" aria-labelledby="trust-heading" aria-describedby="trust-copy">
+      <div className="trust-mark" aria-hidden="true"><ShieldIcon /></div>
+      <p className="eyebrow">{changed ? "Security identity changed" : "New device"}</p>
+      <h1 id="trust-heading" title={request.device.name}>{request.device.name}</h1>
+      <p id="trust-copy" className="trust-copy">
+        {changed
+          ? "This device is using a different security identity. Only trust it if the device was reset or replaced."
+          : "A secure session reached this device. Trust it to recognize it automatically on future routes."}
+      </p>
+      <div className="trust-device-card">
+        <DeviceIcon os={request.device.os} />
+        <div>
+          <strong>{request.device.os}</strong>
+          <small>Verification code: {request.shortFingerprint}</small>
+        </div>
+      </div>
+      <div className="trust-actions">
+        <button className="primary-button" type="button" onClick={() => void respond(true)} disabled={responding}>Trust</button>
+        <button className="outline-button" type="button" onClick={() => void respond(false)} disabled={responding}>Cancel</button>
+      </div>
+      {error && <p className="settings-error" role="alert">{error}</p>}
+      {responding && <p className="response-caption" aria-live="polite">Updating secure trust…</p>}
     </div>
   );
 }
@@ -743,6 +819,7 @@ function SettingsPanel({
   onClose,
   onNotice,
   onPeerConnected,
+  onForgetTrustedDevice,
   onSave,
 }: {
   native: boolean;
@@ -752,6 +829,7 @@ function SettingsPanel({
   onClose: () => void;
   onNotice: (message: string) => void;
   onPeerConnected: (peer: Peer) => void;
+  onForgetTrustedDevice: (fingerprint: string) => Promise<void>;
   onSave: (draft: Preferences) => Promise<void>;
 }) {
   const [draft, setDraft] = useState(preferences);
@@ -762,6 +840,7 @@ function SettingsPanel({
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [reportAction, setReportAction] = useState<"copy" | "export" | null>(null);
   const [reportError, setReportError] = useState<string | null>(null);
+  const [forgettingFingerprint, setForgettingFingerprint] = useState<string | null>(null);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(openDiagnostics);
   useEffect(() => setDraft(preferences), [preferences]);
   useEffect(() => {
@@ -823,6 +902,17 @@ function SettingsPanel({
       setReportError(userFacingError(reason, "Couldn't prepare the diagnostics report."));
     } finally {
       setReportAction(null);
+    }
+  };
+  const forget = async (fingerprint: string) => {
+    if (forgettingFingerprint) return;
+    setForgettingFingerprint(fingerprint);
+    try {
+      await onForgetTrustedDevice(fingerprint);
+    } catch (reason) {
+      setError(userFacingError(reason, "Couldn't forget that device."));
+    } finally {
+      setForgettingFingerprint(null);
     }
   };
   return (
@@ -930,6 +1020,8 @@ function SettingsPanel({
             <div className="diagnostic-grid">
               <DiagnosticValue label="Device UUID" value={diagnostics?.local.deviceId ?? "starting"} />
               <DiagnosticValue label="Device name" value={diagnostics?.local.deviceName ?? "starting"} />
+              <DiagnosticValue label="Identity fingerprint" value={diagnostics?.local.identityFingerprint ?? "starting"} />
+              <DiagnosticValue label="Identity storage" value={diagnostics?.local.identityStorageStatus ?? "starting"} />
               <DiagnosticValue label="Receive folder" value={diagnostics ? diagnosticAvailability(diagnostics.local.receiveDirectoryAvailable) : "starting"} />
               <DiagnosticValue
                 label="Listener"
@@ -958,6 +1050,32 @@ function SettingsPanel({
               {diagnostics?.logicalPeerCount ?? 0} logical peer{diagnostics?.logicalPeerCount === 1 ? "" : "s"} · {diagnostics?.discovery.rememberedPeers ?? 0} remembered for revalidation.
             </p>
           </section>
+          <section className="diagnostic-section" aria-labelledby="diagnostic-trusted">
+            <p className="diagnostic-section-label" id="diagnostic-trusted">Trusted devices</p>
+            {(diagnostics?.trustedDevices ?? []).length ? (
+              <div className="trusted-device-list">
+                {(diagnostics?.trustedDevices ?? []).map((device) => (
+                  <div className="trusted-device" key={device.fingerprint}>
+                    <div>
+                      <strong>{device.name}</strong>
+                      <small>{device.os} · {device.shortFingerprint} · {formatTimestamp(device.lastSeenAt)}</small>
+                    </div>
+                    <button
+                      className="text-button"
+                      type="button"
+                      disabled={Boolean(forgettingFingerprint)}
+                      onClick={() => void forget(device.fingerprint)}
+                    >
+                      {forgettingFingerprint === device.fingerprint ? "Forgetting…" : "Forget"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="diagnostic-empty">No devices have been trusted yet.</p>
+            )}
+            <p className="diagnostic-note">Trust is tied to the device's security identity, not its name or network address.</p>
+          </section>
           <form
             className="address-fallback"
             onSubmit={(event) => {
@@ -981,7 +1099,7 @@ function SettingsPanel({
                 </button>
               </span>
             </label>
-            <p>For private or overlay networks. LAN traffic is not encrypted.</p>
+            <p>For private or overlay networks. Drop v2 still authenticates and encrypts the session.</p>
             {connectionError && <p className="settings-error" role="alert">{connectionError}</p>}
           </form>
           <section className="diagnostic-section" aria-labelledby="diagnostic-peers">
@@ -1077,6 +1195,11 @@ function formatLastSeen(seconds: number) {
   return `seen ${Math.round(seconds / 60)}m ago`;
 }
 
+function formatTimestamp(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "last seen unknown";
+  return `last seen ${new Date(seconds * 1000).toLocaleDateString()}`;
+}
+
 function diagnosticAvailability(available: boolean) {
   return available ? "Available" : "Unavailable";
 }
@@ -1095,6 +1218,8 @@ function previewDiagnosticsReport(diagnostics: RuntimeDiagnostics) {
     "Local Drop instance",
     `Device UUID: ${diagnostics.local.deviceId}`,
     `Device name: ${diagnostics.local.deviceName}`,
+    `Identity fingerprint: ${diagnostics.local.identityFingerprint}`,
+    `Identity storage: ${diagnostics.local.identityStorageStatus}`,
     `Receive directory: ${diagnosticAvailability(diagnostics.local.receiveDirectoryAvailable)}`,
     `Listener/service: ${diagnostics.local.serviceStatus}`,
     `Service port: TCP/UDP ${diagnostics.local.servicePort}`,
@@ -1105,6 +1230,7 @@ function previewDiagnosticsReport(diagnostics: RuntimeDiagnostics) {
     `mDNS: ${diagnostics.discovery.mdns.status}`,
     `Local fallback: ${diagnostics.discovery.localFallback.status}`,
     `Tailscale: ${diagnostics.discovery.tailscale.status}`,
+    `Trusted devices: ${diagnostics.trustedDevices.length}`,
     "",
     "Privacy: preview report; files and secrets are not included.",
   ];
@@ -1140,6 +1266,7 @@ function downloadTextFile(filename: string, value: string) {
 
 function DeviceIcon({ os }: { os: string }) { return os.toLowerCase().includes("linux") || os.toLowerCase().includes("desktop") ? <DesktopIcon /> : <LaptopIcon />; }
 function FileIcon() { return <svg className="file-icon" viewBox="0 0 48 56" aria-hidden="true"><path d="M7 2h22l12 12v38a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Z"/><path d="M29 2v13h12"/></svg>; }
+function ShieldIcon() { return <svg className="shield-icon" viewBox="0 0 48 48" aria-hidden="true"><path d="M24 4 39 10v11c0 10-6.2 18.2-15 23-8.8-4.8-15-13-15-23V10l15-6Z"/><path d="m17 24 5 5 10-11"/></svg>; }
 function LaptopIcon() { return <svg className="device-icon" viewBox="0 0 32 32" aria-hidden="true"><rect x="6.25" y="7" width="19.5" height="15" rx="1"/><path d="M3.5 25h25M12 25h8"/></svg>; }
 function DesktopIcon() { return <svg className="device-icon" viewBox="0 0 32 32" aria-hidden="true"><rect x="5.5" y="6" width="21" height="15" rx="1"/><path d="M16 21v5M11.5 26h9"/></svg>; }
 function SettingsIcon() {

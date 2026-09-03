@@ -1,5 +1,8 @@
-use crate::models::{
-    DeviceIdentity, TransferFile, MAX_FILENAME_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES,
+use crate::{
+    identity,
+    models::{
+        DeviceIdentity, TransferFile, MAX_FILENAME_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -8,14 +11,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
-const CONTROL_FRAME: u8 = 1;
-const DATA_FRAME: u8 = 2;
-const FRAME_HEADER_SIZE: usize = 5;
+pub const CONTROL_FRAME: u8 = 1;
+pub const DATA_FRAME: u8 = 2;
+pub const FRAME_HEADER_SIZE: usize = 5;
 pub const MAX_CONTROL_FRAME_SIZE: usize = 512 * 1024;
 pub const MAX_DATA_FRAME_SIZE: usize = 128 * 1024;
 /// Identification is deliberately narrower than a normal control frame. A
 /// service probe only carries one small Hello message and must not be able to
 /// make the listener allocate the full control-frame budget.
+#[allow(dead_code)]
 pub const MAX_IDENTIFICATION_FRAME_SIZE: usize = 16 * 1024;
 const MAX_REASON_BYTES: usize = 1024;
 const MAX_OS_BYTES: usize = 32;
@@ -79,6 +83,7 @@ pub enum Frame {
     Data(Vec<u8>),
 }
 
+#[allow(dead_code)]
 pub async fn write_control<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &ControlMessage,
@@ -90,6 +95,7 @@ pub async fn write_control<W: AsyncWrite + Unpin>(
 /// Write the bounded v1 Hello used both to start a transfer and to identify a
 /// Drop service during discovery. Keeping this helper separate makes the
 /// small service-handshake limit explicit at every call site.
+#[allow(dead_code)]
 pub async fn write_identification<W: AsyncWrite + Unpin>(
     writer: &mut W,
     device: &DeviceIdentity,
@@ -116,6 +122,7 @@ pub fn encode_control_message(message: &ControlMessage) -> Result<Vec<u8>, Proto
     Ok(serde_json::to_vec(message)?)
 }
 
+#[allow(dead_code)]
 pub async fn write_data<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &[u8],
@@ -123,20 +130,33 @@ pub async fn write_data<W: AsyncWrite + Unpin>(
     write_frame(writer, DATA_FRAME, data).await
 }
 
+/// Encode one complete Drop frame. Secure transport uses this same v1 frame
+/// shape inside authenticated Noise records, so application framing remains
+/// compatible while the network representation is protected.
+pub fn encode_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    validate_frame_payload(kind, payload.len())?;
+    let length = u32::try_from(payload.len()).map_err(|_| {
+        ProtocolError::InvalidFrame("frame length cannot be represented".to_string())
+    })?;
+    let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
+    frame.push(kind);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+pub(crate) fn validate_frame_payload(kind: u8, length: usize) -> Result<(), ProtocolError> {
+    validate_frame_length(kind, length)
+}
+
+#[allow(dead_code)]
 async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     kind: u8,
     payload: &[u8],
 ) -> Result<(), ProtocolError> {
-    validate_frame_length(kind, payload.len())?;
-    let length = u32::try_from(payload.len()).map_err(|_| {
-        ProtocolError::InvalidFrame("frame length cannot be represented".to_string())
-    })?;
-    let mut header = [0_u8; FRAME_HEADER_SIZE];
-    header[0] = kind;
-    header[1..].copy_from_slice(&length.to_be_bytes());
-    writer.write_all(&header).await?;
-    writer.write_all(payload).await?;
+    let frame = encode_frame(kind, payload)?;
+    writer.write_all(&frame).await?;
     Ok(())
 }
 
@@ -155,6 +175,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, P
 /// Read one bounded control message for the service-identification exchange.
 /// The normal transfer decoder remains available for the larger control-frame
 /// budget, while a probe never waits for or allocates more than 16 KiB.
+#[allow(dead_code)]
 pub async fn read_identification<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<ControlMessage, ProtocolError> {
@@ -224,7 +245,7 @@ pub fn decode_control_message(payload: &[u8]) -> Result<ControlMessage, Protocol
 }
 
 fn decode_frame_payload(kind: u8, payload: &[u8]) -> Result<Frame, ProtocolError> {
-    validate_frame_length(kind, payload.len())?;
+    validate_frame_payload(kind, payload.len())?;
     match kind {
         CONTROL_FRAME => Ok(Frame::Control(decode_control_message(payload)?)),
         DATA_FRAME => Ok(Frame::Data(payload.to_vec())),
@@ -383,6 +404,21 @@ pub fn validate_device(device: &DeviceIdentity) -> Result<(), ProtocolError> {
     if !valid_bounded_text(&device.name, 64) || !valid_bounded_text(&device.os, MAX_OS_BYTES) {
         return Err(ProtocolError::InvalidMessage(
             "device metadata is invalid".to_string(),
+        ));
+    }
+    if !device.fingerprint.is_empty() && !identity::valid_fingerprint(&device.fingerprint) {
+        return Err(ProtocolError::InvalidMessage(
+            "device fingerprint is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_secure_device(device: &DeviceIdentity) -> Result<(), ProtocolError> {
+    validate_device(device)?;
+    if !identity::valid_fingerprint(&device.fingerprint) {
+        return Err(ProtocolError::InvalidMessage(
+            "secure device fingerprint is missing or invalid".to_string(),
         ));
     }
     Ok(())
@@ -545,7 +581,7 @@ fn validate_reason(reason: &str) -> Result<(), ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{DeviceIdentity, TransferFile, PROTOCOL_VERSION};
+    use crate::models::{DeviceIdentity, TransferFile, LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION};
     use proptest::prelude::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
@@ -556,6 +592,7 @@ mod tests {
             name: "Test device".to_string(),
             os: "Test OS".to_string(),
             protocol_version: PROTOCOL_VERSION,
+            fingerprint: String::new(),
         }
     }
 
@@ -592,8 +629,11 @@ mod tests {
             (
                 "hello",
                 ControlMessage::Hello {
-                    protocol_version: PROTOCOL_VERSION,
-                    device: device(),
+                    protocol_version: LEGACY_PROTOCOL_VERSION,
+                    device: DeviceIdentity {
+                        protocol_version: LEGACY_PROTOCOL_VERSION,
+                        ..device()
+                    },
                 },
             ),
             (

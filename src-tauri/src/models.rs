@@ -4,6 +4,7 @@ pub use crate::peer::{
 };
 use crate::{
     diagnostics::{self, LogCategory, LogLevel, SupportLogger},
+    identity::{self, IdentityStorageStatus, LocalIdentity},
     platform,
 };
 use parking_lot::{Mutex, RwLock};
@@ -23,7 +24,9 @@ use std::{
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+#[allow(dead_code)]
+pub const LEGACY_PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_TRANSFER_FILES: usize = 256;
 pub const MAX_FILENAME_BYTES: usize = 255;
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
@@ -320,6 +323,7 @@ pub struct RuntimeDiagnostics {
     pub discovery: DiscoveryDiagnostics,
     pub logical_peer_count: usize,
     pub logging: LoggingDiagnostics,
+    pub trusted_devices: Vec<TrustedDeviceSnapshot>,
     pub peers: Vec<PeerDiagnosticsSnapshot>,
 }
 
@@ -337,6 +341,8 @@ pub struct ApplicationDiagnostics {
 pub struct LocalDropDiagnostics {
     pub device_id: String,
     pub device_name: String,
+    pub identity_fingerprint: String,
+    pub identity_storage_status: String,
     pub receive_directory_available: bool,
     pub service_status: String,
     pub service_detail: Option<String>,
@@ -352,6 +358,26 @@ pub struct LoggingDiagnostics {
     pub storage_status: String,
     pub retention: String,
     pub current_entries: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustRequest {
+    pub id: String,
+    pub device: DeviceIdentity,
+    pub short_fingerprint: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedDeviceSnapshot {
+    pub id: String,
+    pub name: String,
+    pub os: String,
+    pub fingerprint: String,
+    pub short_fingerprint: String,
+    pub last_seen_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -373,6 +399,10 @@ struct PersistedRememberedPeer {
     protocol_version: u16,
     endpoints: Vec<String>,
     last_successful_at: u64,
+    #[serde(default)]
+    fingerprint: String,
+    #[serde(default)]
+    trusted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -380,6 +410,7 @@ struct RememberedPeer {
     identity: DeviceIdentity,
     endpoints: Vec<SocketAddr>,
     last_successful_at: u64,
+    trusted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -388,13 +419,23 @@ pub(crate) struct RememberedEndpointCandidate {
     pub address: SocketAddr,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrustStatus {
+    Trusted,
+    Unknown,
+    Changed,
+}
+
 pub struct AppState {
     device: RwLock<DeviceIdentity>,
+    local_identity: Arc<LocalIdentity>,
+    identity_storage_status: IdentityStorageStatus,
     preferences: RwLock<Preferences>,
     peers: RwLock<PeerRegistry>,
     remembered_peers: RwLock<Vec<RememberedPeer>>,
     discovery_status: RwLock<DiscoveryStatusState>,
     pending_requests: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    pending_trust_requests: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     cancellations: Mutex<HashMap<String, Arc<Cancellation>>>,
     active_transfer: Mutex<Option<String>>,
     transfer_changed: Notify,
@@ -449,8 +490,9 @@ impl Cancellation {
 }
 
 impl AppState {
-    pub fn load(listener_port: u16) -> Self {
+    pub fn load(listener_port: u16) -> Result<Self, String> {
         let logger = Arc::new(SupportLogger::persistent(platform::log_path()));
+        let loaded_identity = identity::load_or_create(platform::identity_path())?;
         let fallback_name = default_device_name();
         let fallback_destination = default_destination();
         if let Err(error) = fs::create_dir_all(&fallback_destination) {
@@ -492,6 +534,7 @@ impl AppState {
                 name: stored_device_name.clone(),
                 os: platform::platform_name(),
                 protocol_version: PROTOCOL_VERSION,
+                fingerprint: loaded_identity.identity.fingerprint().to_string(),
             },
             Preferences {
                 device_name: stored_device_name,
@@ -500,6 +543,8 @@ impl AppState {
             listener_port,
             remembered_peers,
             logger,
+            Arc::new(loaded_identity.identity),
+            loaded_identity.status,
         );
         if let Err(error) = state.persist() {
             state.log(
@@ -515,7 +560,15 @@ impl AppState {
             "application_started",
             Some("settings loaded"),
         );
-        state
+        if state.identity_storage_status != IdentityStorageStatus::Persistent {
+            state.log(
+                LogLevel::Warn,
+                LogCategory::Startup,
+                "device_identity_storage_status",
+                Some(state.identity_storage_status.as_str()),
+            );
+        }
+        Ok(state)
     }
 
     #[allow(dead_code)]
@@ -524,13 +577,50 @@ impl AppState {
         preferences: Preferences,
         listener_port: u16,
     ) -> Self {
+        let local_identity = Arc::new(
+            LocalIdentity::generate().expect("test/device identity generation should succeed"),
+        );
         Self::new_with_remembered_and_logger(
             device,
             preferences,
             listener_port,
             Vec::new(),
             Arc::new(SupportLogger::in_memory()),
+            local_identity,
+            IdentityStorageStatus::Ephemeral,
         )
+    }
+
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub(crate) fn new_with_local_identity(
+        device: DeviceIdentity,
+        preferences: Preferences,
+        listener_port: u16,
+        local_identity: LocalIdentity,
+    ) -> Self {
+        Self::new_with_remembered_and_logger(
+            device,
+            preferences,
+            listener_port,
+            Vec::new(),
+            Arc::new(SupportLogger::in_memory()),
+            Arc::new(local_identity),
+            IdentityStorageStatus::Ephemeral,
+        )
+    }
+
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub(crate) fn new_with_local_identity_and_faults(
+        device: DeviceIdentity,
+        preferences: Preferences,
+        listener_port: u16,
+        local_identity: LocalIdentity,
+        faults: Arc<FaultPlan>,
+    ) -> Self {
+        let mut state =
+            Self::new_with_local_identity(device, preferences, listener_port, local_identity);
+        state.faults = faults;
+        state
     }
 
     #[cfg(test)]
@@ -546,6 +636,10 @@ impl AppState {
             listener_port,
             remembered_peers,
             Arc::new(SupportLogger::in_memory()),
+            Arc::new(
+                LocalIdentity::generate().expect("test/device identity generation should succeed"),
+            ),
+            IdentityStorageStatus::Ephemeral,
         )
     }
 
@@ -555,14 +649,21 @@ impl AppState {
         listener_port: u16,
         remembered_peers: Vec<RememberedPeer>,
         logger: Arc<SupportLogger>,
+        local_identity: Arc<LocalIdentity>,
+        identity_storage_status: IdentityStorageStatus,
     ) -> Self {
+        let mut device = device;
+        device.fingerprint = local_identity.fingerprint().to_string();
         Self {
             device: RwLock::new(device),
+            local_identity,
+            identity_storage_status,
             preferences: RwLock::new(preferences),
             peers: RwLock::new(PeerRegistry::new()),
             remembered_peers: RwLock::new(remembered_peers),
             discovery_status: RwLock::new(DiscoveryStatusState::default()),
             pending_requests: Mutex::new(HashMap::new()),
+            pending_trust_requests: Mutex::new(HashMap::new()),
             cancellations: Mutex::new(HashMap::new()),
             active_transfer: Mutex::new(None),
             transfer_changed: Notify::new(),
@@ -580,18 +681,6 @@ impl AppState {
     }
 
     #[cfg(any(test, feature = "integration-tests"))]
-    pub(crate) fn new_with_faults(
-        device: DeviceIdentity,
-        preferences: Preferences,
-        listener_port: u16,
-        faults: Arc<FaultPlan>,
-    ) -> Self {
-        let mut state = Self::new(device, preferences, listener_port);
-        state.faults = faults;
-        state
-    }
-
-    #[cfg(any(test, feature = "integration-tests"))]
     pub(crate) fn take_fault(&self, point: FaultPoint) -> Option<io::Error> {
         self.faults.take(point)
     }
@@ -601,18 +690,28 @@ impl AppState {
     }
 
     fn persist(&self) -> Result<(), String> {
-        let Some(path) = Self::settings_path() else {
-            return Err("Could not determine an application settings directory.".to_string());
-        };
-        let device = self.device.read();
-        let preferences = self.preferences.read();
-        let value = PersistedSettings {
-            device_id: device.id.clone(),
-            device_name: preferences.device_name.clone(),
-            destination: preferences.destination.clone(),
-            remembered_peers: self.persisted_remembered_peers(),
-        };
-        persist_settings(&path, &value)
+        // Integration/unit peers deliberately use in-memory persistence. This
+        // keeps security tests from reading or mutating a developer's real
+        // Drop settings while preserving the production failure-closed path
+        // when the OS application-data directory is unavailable.
+        #[cfg(any(test, feature = "integration-tests"))]
+        return Ok(());
+
+        #[cfg(not(any(test, feature = "integration-tests")))]
+        {
+            let Some(path) = Self::settings_path() else {
+                return Err("Could not determine an application settings directory.".to_string());
+            };
+            let device = self.device.read();
+            let preferences = self.preferences.read();
+            let value = PersistedSettings {
+                device_id: device.id.clone(),
+                device_name: preferences.device_name.clone(),
+                destination: preferences.destination.clone(),
+                remembered_peers: self.persisted_remembered_peers(),
+            };
+            persist_settings(&path, &value)
+        }
     }
 
     pub fn try_begin_transfer(&self, id: &str) -> Result<(), String> {
@@ -643,6 +742,7 @@ impl AppState {
         }
         self.clear_cancellation(id);
         self.clear_pending_request(id);
+        self.clear_pending_trust_request(id);
         self.transfer_changed.notify_waiters();
     }
 
@@ -676,6 +776,10 @@ impl AppState {
         }
         let pending = std::mem::take(&mut *self.pending_requests.lock());
         for sender in pending.into_values() {
+            let _ = sender.send(false);
+        }
+        let pending_trust = std::mem::take(&mut *self.pending_trust_requests.lock());
+        for sender in pending_trust.into_values() {
             let _ = sender.send(false);
         }
         *self.active_transfer.lock() = None;
@@ -741,6 +845,142 @@ impl AppState {
         self.device.read().clone()
     }
 
+    pub(crate) fn local_identity(&self) -> Arc<LocalIdentity> {
+        self.local_identity.clone()
+    }
+
+    pub(crate) fn trust_status(&self, identity: &DeviceIdentity) -> TrustStatus {
+        if !identity::valid_fingerprint(&identity.fingerprint) {
+            return TrustStatus::Unknown;
+        }
+        let remembered = self.remembered_peers.read();
+        if remembered.iter().any(|peer| {
+            peer.trusted
+                && peer
+                    .identity
+                    .fingerprint
+                    .eq_ignore_ascii_case(&identity.fingerprint)
+        }) {
+            return TrustStatus::Trusted;
+        }
+        if remembered.iter().any(|peer| {
+            peer.trusted
+                && peer.identity.id == identity.id
+                && !peer
+                    .identity
+                    .fingerprint
+                    .eq_ignore_ascii_case(&identity.fingerprint)
+        }) {
+            return TrustStatus::Changed;
+        }
+        TrustStatus::Unknown
+    }
+
+    pub(crate) fn add_pending_trust_request(
+        &self,
+        id: String,
+        sender: oneshot::Sender<bool>,
+    ) -> Result<(), String> {
+        let mut pending = self.pending_trust_requests.lock();
+        if !pending.is_empty() {
+            return Err("Another trust decision is already pending.".to_string());
+        }
+        if pending.contains_key(&id) {
+            return Err("A trust decision is already pending.".to_string());
+        }
+        pending.insert(id, sender);
+        Ok(())
+    }
+
+    pub(crate) fn clear_pending_trust_request(&self, id: &str) {
+        self.pending_trust_requests.lock().remove(id);
+    }
+
+    pub(crate) fn resolve_pending_trust_request(
+        &self,
+        id: &str,
+        accepted: bool,
+    ) -> Result<(), String> {
+        let sender = self
+            .pending_trust_requests
+            .lock()
+            .remove(id)
+            .ok_or_else(|| "That trust request is no longer waiting for a decision.".to_string())?;
+        sender
+            .send(accepted)
+            .map_err(|_| "The secure connection is no longer waiting.".to_string())
+    }
+
+    pub(crate) fn trust_peer(&self, identity: &DeviceIdentity) -> Result<(), String> {
+        if !valid_device_id(&identity.id)
+            || !valid_device_name(&identity.name)
+            || !valid_device_os(&identity.os)
+            || identity.protocol_version != PROTOCOL_VERSION
+            || !identity::valid_fingerprint(&identity.fingerprint)
+        {
+            return Err("The device security identity was invalid.".to_string());
+        }
+        let mut remembered = self.remembered_peers.write();
+        let previous = remembered.clone();
+        for peer in remembered.iter_mut() {
+            if peer.identity.id == identity.id
+                && !peer
+                    .identity
+                    .fingerprint
+                    .eq_ignore_ascii_case(&identity.fingerprint)
+            {
+                peer.trusted = false;
+            }
+        }
+        if let Some(peer) = remembered.iter_mut().find(|peer| {
+            peer.identity
+                .fingerprint
+                .eq_ignore_ascii_case(&identity.fingerprint)
+        }) {
+            peer.identity = identity.clone();
+            peer.trusted = true;
+            peer.last_successful_at = unix_now();
+        } else {
+            remembered.push(RememberedPeer {
+                identity: identity.clone(),
+                endpoints: Vec::new(),
+                last_successful_at: unix_now(),
+                trusted: true,
+            });
+        }
+        drop(remembered);
+        if let Err(error) = self.persist() {
+            *self.remembered_peers.write() = previous;
+            self.log(
+                LogLevel::Warn,
+                LogCategory::PeerRegistry,
+                "trusted_peer_persist_failed",
+                Some(&error),
+            );
+            return Err("The device could not be saved as trusted.".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn forget_trusted_device(&self, fingerprint: &str) -> Result<(), String> {
+        if !identity::valid_fingerprint(fingerprint) {
+            return Err("That trusted device was invalid.".to_string());
+        }
+        let mut remembered = self.remembered_peers.write();
+        let previous = remembered.clone();
+        let before = remembered.len();
+        remembered.retain(|peer| !peer.identity.fingerprint.eq_ignore_ascii_case(fingerprint));
+        let changed = remembered.len() != before;
+        drop(remembered);
+        if changed {
+            if let Err(error) = self.persist() {
+                *self.remembered_peers.write() = previous;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub fn listener_port(&self) -> u16 {
         self.listener_port
     }
@@ -759,6 +999,10 @@ impl AppState {
 
     pub fn peer(&self, id: &str) -> Option<Peer> {
         self.peers.read().peer(id)
+    }
+
+    pub(crate) fn record_authenticated_identity(&self, identity: DeviceIdentity) -> bool {
+        self.peers.write().record_authenticated_identity(identity)
     }
 
     pub fn apply_discovery_observation(&self, observation: DiscoveryObservation) -> bool {
@@ -831,7 +1075,8 @@ impl AppState {
             .read()
             .iter()
             .filter(|peer| {
-                peer.last_successful_at <= now
+                peer.identity.protocol_version == PROTOCOL_VERSION
+                    && peer.last_successful_at <= now
                     && now.saturating_sub(peer.last_successful_at) <= MAX_REMEMBERED_AGE_SECONDS
             })
             .flat_map(|peer| {
@@ -850,7 +1095,9 @@ impl AppState {
         if !valid_device_id(&identity.id)
             || !valid_device_name(&identity.name)
             || !valid_device_os(&identity.os)
-            || identity.protocol_version == 0
+            || identity.protocol_version != PROTOCOL_VERSION
+            || (!identity.fingerprint.is_empty()
+                && !identity::valid_fingerprint(&identity.fingerprint))
             || !rememberable_endpoint(address)
         {
             return;
@@ -862,11 +1109,23 @@ impl AppState {
             let id = Uuid::parse_str(&identity.id)
                 .expect("validated remembered peer id should parse")
                 .to_string();
-            let peer = remembered.iter_mut().find(|peer| peer.identity.id == id);
+            let fingerprint = identity.fingerprint.to_ascii_lowercase();
+            let peer = remembered.iter_mut().find(|peer| {
+                (!fingerprint.is_empty()
+                    && peer.identity.fingerprint.eq_ignore_ascii_case(&fingerprint))
+                    || (peer.identity.id == id && peer.identity.fingerprint.is_empty())
+            });
             if let Some(peer) = peer {
                 let identity_changed = peer.identity != *identity;
                 let endpoint_changed = !peer.endpoints.contains(&address);
+                let was_unbound = peer.identity.fingerprint.is_empty();
                 peer.identity = identity.clone();
+                if was_unbound && !identity.fingerprint.is_empty() {
+                    // A legacy route record has no authority. Binding it to
+                    // the fingerprint learned from a secure Hello must never
+                    // inherit trust from untrusted/legacy metadata.
+                    peer.trusted = false;
+                }
                 peer.last_successful_at = now;
                 if endpoint_changed {
                     peer.endpoints.push(address);
@@ -886,6 +1145,7 @@ impl AppState {
                     identity: identity.clone(),
                     endpoints: vec![address],
                     last_successful_at: now,
+                    trusted: false,
                 });
                 durable_change = true;
                 remembered.sort_by(|left, right| {
@@ -1037,6 +1297,26 @@ impl AppState {
         }
     }
 
+    pub fn trusted_devices(&self) -> Vec<TrustedDeviceSnapshot> {
+        let mut devices = self
+            .remembered_peers
+            .read()
+            .iter()
+            .filter(|peer| peer.trusted && identity::valid_fingerprint(&peer.identity.fingerprint))
+            .map(|peer| TrustedDeviceSnapshot {
+                id: peer.identity.id.clone(),
+                name: peer.identity.name.clone(),
+                os: peer.identity.os.clone(),
+                fingerprint: peer.identity.fingerprint.clone(),
+                short_fingerprint: identity::short_fingerprint(&peer.identity.fingerprint),
+                last_seen_at: peer.last_successful_at,
+            })
+            .collect::<Vec<_>>();
+        devices
+            .sort_by_cached_key(|device| (device.name.to_lowercase(), device.fingerprint.clone()));
+        devices
+    }
+
     pub fn runtime_diagnostics(&self) -> RuntimeDiagnostics {
         let device = self.device();
         let preferences = self.preferences();
@@ -1053,6 +1333,8 @@ impl AppState {
             local: LocalDropDiagnostics {
                 device_id: device.id,
                 device_name: device.name,
+                identity_fingerprint: device.fingerprint,
+                identity_storage_status: self.identity_storage_status.as_str().to_string(),
                 receive_directory_available: usable_destination(Path::new(
                     &preferences.destination,
                 )),
@@ -1064,7 +1346,7 @@ impl AppState {
                     .to_string(),
                 transport_limitations: vec![
                     "IPv4 only".to_string(),
-                    "LAN traffic is not encrypted".to_string(),
+                    "Drop v2 encrypts authenticated sessions; v1 peers are rejected".to_string(),
                     "No public-internet relay or NAT traversal".to_string(),
                 ],
             },
@@ -1085,6 +1367,7 @@ impl AppState {
                 ),
                 current_entries: self.logger.current_entry_count(),
             },
+            trusted_devices: self.trusted_devices(),
             peers: peer_diagnostics,
         }
     }
@@ -1100,6 +1383,8 @@ impl AppState {
                 protocol_version: peer.identity.protocol_version,
                 endpoints: peer.endpoints.iter().map(ToString::to_string).collect(),
                 last_successful_at: peer.last_successful_at,
+                fingerprint: peer.identity.fingerprint.clone(),
+                trusted: peer.trusted,
             })
             .collect()
     }
@@ -1184,6 +1469,8 @@ fn sanitize_remembered_peers(peers: Vec<PersistedRememberedPeer>) -> Vec<Persist
                 && valid_device_name(&peer.device_name)
                 && valid_device_os(&peer.os)
                 && peer.protocol_version != 0
+                && (peer.fingerprint.is_empty() || identity::valid_fingerprint(&peer.fingerprint))
+                && (!peer.trusted || identity::valid_fingerprint(&peer.fingerprint))
                 && peer.endpoints.len() <= MAX_REMEMBERED_ENDPOINTS
                 && peer.endpoints.iter().all(|endpoint| {
                     endpoint
@@ -1201,6 +1488,7 @@ fn remembered_peer_from_persisted(peer: &PersistedRememberedPeer) -> Option<Reme
         name: peer.device_name.trim().to_string(),
         os: peer.os.trim().to_string(),
         protocol_version: peer.protocol_version,
+        fingerprint: peer.fingerprint.to_ascii_lowercase(),
     };
     let mut endpoints = peer
         .endpoints
@@ -1210,13 +1498,15 @@ fn remembered_peer_from_persisted(peer: &PersistedRememberedPeer) -> Option<Reme
         .collect::<Vec<_>>();
     endpoints.sort();
     endpoints.dedup();
-    if endpoints.is_empty() {
+    if endpoints.is_empty() && !peer.trusted {
         return None;
     }
+    let trusted = peer.trusted && identity::valid_fingerprint(&identity.fingerprint);
     Some(RememberedPeer {
         identity,
         endpoints,
         last_successful_at: peer.last_successful_at,
+        trusted,
     })
 }
 
@@ -1331,6 +1621,7 @@ mod tests {
                 name: "Test device".to_string(),
                 os: "Test OS".to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                fingerprint: String::new(),
             },
             Preferences {
                 device_name: "Test device".to_string(),
@@ -1446,6 +1737,21 @@ mod tests {
         assert!(!receiver.await.expect("decision should be received"));
     }
 
+    #[tokio::test]
+    async fn only_one_trust_decision_is_presented_at_a_time() {
+        let state = test_state();
+        let (first_sender, first_receiver) = oneshot::channel();
+        state
+            .add_pending_trust_request("first".to_string(), first_sender)
+            .expect("first trust request should be accepted");
+        let (second_sender, _second_receiver) = oneshot::channel();
+        assert!(state
+            .add_pending_trust_request("second".to_string(), second_sender)
+            .is_err());
+        state.clear_pending_trust_request("first");
+        drop(first_receiver);
+    }
+
     #[test]
     fn invalid_persisted_values_do_not_pass_validation() {
         assert!(!valid_device_id("short"));
@@ -1500,6 +1806,7 @@ mod tests {
                 name: "Test peer".to_string(),
                 os: "Linux".to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                fingerprint: String::new(),
             },
             vec![Endpoint::new(
                 "192.168.1.20:4040".parse().unwrap(),
@@ -1542,6 +1849,7 @@ mod tests {
                 name: "Home Server".to_string(),
                 os: "Linux".to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                fingerprint: String::new(),
             },
             source: source.clone(),
             endpoints: vec![Endpoint::new(
@@ -1573,6 +1881,65 @@ mod tests {
         assert!(!report.contains("hunter2"));
         assert!(!report.contains("/Users/alice"));
         assert!(!report.contains("service-key"));
+        assert!(!report.contains("private_key"));
+        assert!(!report.contains("privateKey"));
+    }
+
+    #[test]
+    fn trust_status_is_bound_to_the_public_key_fingerprint_not_route_or_uuid() {
+        let state = test_state();
+        let old_identity = DeviceIdentity {
+            id: "22222222-2222-4222-8222-222222222222".to_string(),
+            name: "Home Server".to_string(),
+            os: "Linux".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            fingerprint: identity::test_identity("old-server-key")
+                .fingerprint()
+                .to_string(),
+        };
+        let rotated_identity = DeviceIdentity {
+            fingerprint: identity::test_identity("rotated-server-key")
+                .fingerprint()
+                .to_string(),
+            ..old_identity.clone()
+        };
+        *state.remembered_peers.write() = vec![RememberedPeer {
+            identity: old_identity.clone(),
+            endpoints: vec!["192.168.1.20:39821".parse().unwrap()],
+            last_successful_at: unix_now(),
+            trusted: true,
+        }];
+
+        assert_eq!(state.trust_status(&old_identity), TrustStatus::Trusted);
+        assert_eq!(state.trust_status(&rotated_identity), TrustStatus::Changed);
+
+        let same_key_with_new_uuid = DeviceIdentity {
+            id: "33333333-3333-4333-8333-333333333333".to_string(),
+            ..old_identity.clone()
+        };
+        assert_eq!(
+            state.trust_status(&same_key_with_new_uuid),
+            TrustStatus::Trusted
+        );
+    }
+
+    #[test]
+    fn trusted_identity_without_a_route_survives_settings_migration() {
+        let key = identity::test_identity("trusted-without-route");
+        let persisted = PersistedRememberedPeer {
+            device_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            device_name: "Home Server".to_string(),
+            os: "Linux".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            endpoints: Vec::new(),
+            last_successful_at: unix_now(),
+            fingerprint: key.fingerprint().to_string(),
+            trusted: true,
+        };
+        let loaded = remembered_peer_from_persisted(&persisted)
+            .expect("a trusted device should not require a remembered route");
+        assert!(loaded.trusted);
+        assert!(loaded.endpoints.is_empty());
     }
 
     #[test]
@@ -1582,6 +1949,7 @@ mod tests {
             name: "Remembered peer".to_string(),
             os: "Linux".to_string(),
             protocol_version: PROTOCOL_VERSION,
+            fingerprint: String::new(),
         };
         let state = AppState::new_with_remembered(
             DeviceIdentity {
@@ -1589,6 +1957,7 @@ mod tests {
                 name: "Test device".to_string(),
                 os: "Test OS".to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                fingerprint: String::new(),
             },
             Preferences {
                 device_name: "Test device".to_string(),
@@ -1600,6 +1969,7 @@ mod tests {
                     identity: identity.clone(),
                     endpoints: vec!["192.168.1.40:39821".parse().unwrap()],
                     last_successful_at: unix_now().saturating_sub(60),
+                    trusted: false,
                 },
                 RememberedPeer {
                     identity: DeviceIdentity {
@@ -1607,9 +1977,11 @@ mod tests {
                         name: "Stale peer".to_string(),
                         os: "Linux".to_string(),
                         protocol_version: PROTOCOL_VERSION,
+                        fingerprint: String::new(),
                     },
                     endpoints: vec!["192.168.1.41:39821".parse().unwrap()],
                     last_successful_at: unix_now().saturating_sub(MAX_REMEMBERED_AGE_SECONDS + 1),
+                    trusted: false,
                 },
             ],
         );
@@ -1627,6 +1999,7 @@ mod tests {
                 name: "Test device".to_string(),
                 os: "Test OS".to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                fingerprint: String::new(),
             },
             Preferences {
                 device_name: "Test device".to_string(),
@@ -1639,6 +2012,7 @@ mod tests {
             name: "Public peer".to_string(),
             os: "Linux".to_string(),
             protocol_version: PROTOCOL_VERSION,
+            fingerprint: String::new(),
         };
 
         state.remember_peer(&identity, "203.0.113.10:39821".parse().unwrap());

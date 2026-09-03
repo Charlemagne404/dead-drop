@@ -407,6 +407,14 @@ pub(crate) fn render_report(diagnostics: &RuntimeDiagnostics, logger: &SupportLo
         redact_text(&diagnostics.local.device_name)
     ));
     report.push_str(&format!(
+        "Identity fingerprint: {}\n",
+        diagnostics.local.identity_fingerprint
+    ));
+    report.push_str(&format!(
+        "Identity storage: {}\n",
+        diagnostics.local.identity_storage_status
+    ));
+    report.push_str(&format!(
         "Receive directory: {}\n",
         availability_label(diagnostics.local.receive_directory_available)
     ));
@@ -453,6 +461,21 @@ pub(crate) fn render_report(diagnostics: &RuntimeDiagnostics, logger: &SupportLo
         "Remembered peers: {}\n\n",
         diagnostics.discovery.remembered_peers
     ));
+
+    report.push_str("Trusted devices\n");
+    if diagnostics.trusted_devices.is_empty() {
+        report.push_str("No trusted devices.\n");
+    } else {
+        for device in &diagnostics.trusted_devices {
+            report.push_str(&format!(
+                "- {} ({}, fingerprint {})\n",
+                redact_text(&device.name),
+                device.short_fingerprint,
+                device.fingerprint
+            ));
+        }
+    }
+    report.push('\n');
 
     report.push_str("Peer diagnostics\n");
     if diagnostics.peers.is_empty() {
