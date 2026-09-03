@@ -59,7 +59,7 @@ listener or any discovery worker.
 | Frontend bridge | `src/lib/desktop.ts`, `src/lib/events.ts` | Typed command wrappers and the canonical list of Rust-emitted event names. |
 | Frontend coordinator | `src/main.tsx` | Owns selected peer, current incoming/outgoing transfer, settings visibility, drag/drop, and native/preview orchestration. |
 | Frontend presentation | `src/components/`, `src/lib/presentation.ts`, `src/lib/preview.ts` | Renders panels/icons, contains pure display formatting, and supplies browser preview data. It does not call Rust directly except the settings panel's command boundary. |
-| Application state | `src-tauri/src/models.rs` | Owns `AppState`, transfer admission/cancellation, settings, persisted remembered peers, runtime DTOs, and cross-boundary transfer DTOs. |
+| Application state | `src-tauri/src/models.rs` | Owns `AppState`, transfer admission/cancellation, secure-session activity, the updater installation gate, settings, persisted remembered peers, runtime DTOs, and cross-boundary transfer DTOs. |
 | Peer model | `src-tauri/src/peer.rs` | Owns stable device identity, source-scoped endpoint observations, reachability, route history, registry reconciliation, and snapshots. |
 | Discovery | `src-tauri/src/discovery.rs` | Runs mDNS, local IPv4 fallback, Tailscale status, and remembered-endpoint workers. It submits `DiscoveryObservation` values to `AppState`. |
 | Connectivity | `src-tauri/src/connectivity.rs` | Resolves/probes an IPv4 endpoint, performs the bounded Noise XX handshake, and exchanges the encrypted Hello. It validates the peer before a route is used. |
@@ -202,8 +202,10 @@ The command matrix and its limitations are documented in
 
 The current implementation is IPv4-only, supports one active transfer, and
 does not provide resume, relay, NAT traversal, or public-internet exposure.
-The optional signed updater is separate from the transfer protocol and does
-not restart Drop during an active transfer or secure-session setup. The
-historical plaintext v1 contract is rejected by the current listener; there is
+The optional signed updater is separate from the transfer protocol. Its
+backend installation gate does not restart Drop during an active transfer or
+secure-session setup, and rejects new session setup while installation is
+reserved. The historical plaintext v1 contract is rejected by the current
+listener; there is
 no silent downgrade. Compatibility identifiers remain where they are needed
 for upgrades and discovery.

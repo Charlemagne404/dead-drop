@@ -256,6 +256,27 @@ test("active transfers prevent install and a transfer that starts during downloa
   await deferred.dispose();
 });
 
+test("backend session activity gate prevents install even when the UI is idle", async () => {
+  const fixture = fakeUpdate("0.1.1");
+  let backendBusy = true;
+  const service = clientFor(fixture.update, {
+    beginInstall: async () => !backendBusy,
+    endInstall: async () => {},
+  });
+  const controller = new UpdaterController(service.client, "0.1.0");
+  await controller.check(true);
+  await controller.startUpdate();
+  assert.equal(fixture.downloadCalls, 1);
+  assert.equal(fixture.installCalls, 0);
+  assert.equal(controller.getState().kind, "ready");
+
+  backendBusy = false;
+  await controller.startUpdate();
+  assert.equal(fixture.installCalls, 1);
+  assert.equal(service.relaunchCalls, 1);
+  await controller.dispose();
+});
+
 test("pending update state survives preference and transfer state changes", async () => {
   const fixture = fakeUpdate("0.1.1");
   const service = clientFor(fixture.update);

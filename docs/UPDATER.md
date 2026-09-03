@@ -30,11 +30,15 @@ process plugin after a successful explicit install.
 
 The updater receives the same busy signal as the transfer UI. Settings is
 unavailable while an incoming request or outgoing transfer is active, and the
-controller checks again immediately before starting a download or install.
-If a transfer begins while a user-selected download is already in progress,
-the verified package is held in the **Ready to restart** state. It is never
-installed or relaunched until the transfer ends and the user presses the finish
-button. There is no background restart path.
+controller checks that UI state before starting a download. Before installation,
+the backend atomically reserves the update slot.
+Active transfers, inbound connections, discovery probes, manual connections, and
+pending secure-session setup therefore block installation; new session setup
+is rejected while that reservation is held. If a transfer or secure session
+begins while a user-selected download is already in progress, the verified
+package is held in the **Ready to restart** state. It is never installed or
+relaunched until the activity ends and the user presses the finish button.
+There is no background restart path.
 
 ## Tauri manifest contract
 
@@ -157,7 +161,7 @@ not disable or replace production signature verification. They cover no update,
 newer and older metadata, SemVer/prerelease ordering, malformed metadata,
 invalid signatures, unsupported architecture, network failure, manual errors,
 automatic-check opt-out, active-transfer blocking, deferred installation, and
-state retention.
+secure-session activity blocking, and state retention.
 
 An unsigned native development bundle can be built with:
 

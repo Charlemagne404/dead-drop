@@ -22,6 +22,12 @@ export type UpdateHandle = {
 export type UpdateClient = {
   check: () => Promise<UpdateHandle | null>;
   relaunch: () => Promise<void>;
+  /** Atomically reserves installation against active transfers/session setup. */
+  beginInstall?: () => Promise<boolean>;
+  /** Releases the installation reservation when install/relaunch returns. */
+  endInstall?: () => Promise<void>;
+  /** Compatibility fallback for non-native/test clients without the reservation API. */
+  isBusy?: () => Promise<boolean>;
 };
 
 export type UpdateSummary = {
@@ -326,6 +332,7 @@ export class UpdaterController {
   }
 
   private async performUpdate(update: UpdateHandle, summary: UpdateSummary) {
+    let installGateAcquired = false;
     if (!this.downloaded) {
       this.setState({ kind: "downloading", update: summary, downloadedBytes: 0, contentLength: null });
       try {
@@ -345,7 +352,8 @@ export class UpdaterController {
       }
     }
 
-    if (this.transferBusy) {
+    installGateAcquired = await this.acquireInstallGate();
+    if (!installGateAcquired) {
       this.setState({ kind: "ready", update: summary });
       return this.state;
     }
@@ -357,7 +365,32 @@ export class UpdaterController {
     } catch (error) {
       this.setState({ kind: "failed", message: userFacingError(error, "install"), manual: true, update: summary });
       return this.state;
+    } finally {
+      if (installGateAcquired && this.client.beginInstall && this.client.endInstall) {
+        try {
+          await this.client.endInstall();
+        } catch {
+          // A successful relaunch normally ends the process before this runs.
+        }
+      }
     }
     return this.state;
+  }
+
+  private async acquireInstallGate() {
+    if (this.transferBusy) return false;
+    if (this.client.beginInstall && this.client.endInstall) {
+      try {
+        return await this.client.beginInstall();
+      } catch {
+        return false;
+      }
+    }
+    if (!this.client.isBusy) return true;
+    try {
+      return !(await this.client.isBusy());
+    } catch {
+      return false;
+    }
   }
 }

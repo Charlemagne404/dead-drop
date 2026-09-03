@@ -8,6 +8,7 @@ use std::time::Duration;
 
 pub(crate) const PROTOCOL_VERSION: u16 = 2;
 pub(crate) const DROP_SERVICE_PORT: u16 = 39_821;
+pub(crate) const MAX_CONNECTION_SLOTS: usize = 8;
 pub(crate) const MAX_TRANSFER_FILES: usize = 256;
 pub(crate) const MAX_FILENAME_BYTES: usize = 255;
 pub(crate) const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;

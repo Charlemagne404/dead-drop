@@ -1,6 +1,7 @@
 import packageJson from "../../package.json";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { DownloadEvent, Update as TauriUpdate } from "@tauri-apps/plugin-updater";
+import { command } from "./desktop";
 import {
   UPDATE_CHECK_INTERVAL_MS,
   UpdaterController,
@@ -74,6 +75,9 @@ export function createTauriUpdateClient(): UpdateClient {
       const { relaunch } = await import("@tauri-apps/plugin-process");
       await relaunch();
     },
+    beginInstall: () => command.beginUpdaterInstall(),
+    endInstall: () => command.endUpdaterInstall(),
+    isBusy: () => command.updaterIsBusy(),
   };
 }
 

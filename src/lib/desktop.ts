@@ -199,6 +199,9 @@ export const command = {
     invoke<void>("forget_trusted_device", { fingerprint }),
   connectByAddress: (address: string) =>
     invoke<Peer>("connect_by_address", { address }),
+  beginUpdaterInstall: () => invoke<boolean>("begin_updater_install"),
+  endUpdaterInstall: () => invoke<void>("end_updater_install"),
+  updaterIsBusy: () => invoke<boolean>("updater_is_busy"),
   updatePreferences: (draft: Preferences) =>
     invoke<Preferences>("update_preferences", { draft }),
 };

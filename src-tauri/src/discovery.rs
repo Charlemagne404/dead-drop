@@ -485,11 +485,15 @@ async fn probe_candidates(
         let Ok(slot) = slots.clone().acquire_owned().await else {
             break;
         };
+        let Some(connection_activity) = state.try_begin_connection_activity() else {
+            continue;
+        };
         let local = local.clone();
         let local_identity = local_identity.clone();
         let shutdown = shutdown.clone();
         tasks.spawn(async move {
             let _slot = slot;
+            let _connection_activity = connection_activity;
             let probe_cancellation = Cancellation::new();
             let result = connect_and_identify(
                 candidate.address,

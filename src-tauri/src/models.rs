@@ -22,7 +22,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -443,12 +443,28 @@ pub struct AppState {
     active_transfer: Mutex<Option<String>>,
     transfer_changed: Notify,
     connection_slots: Arc<Semaphore>,
+    active_connections: Arc<AtomicUsize>,
+    update_gate: Mutex<()>,
+    updater_installing: AtomicBool,
     shutdown: Arc<Cancellation>,
     listener_status: RwLock<DiscoverySourceDiagnostics>,
     logger: Arc<SupportLogger>,
     listener_port: u16,
     #[cfg(any(test, feature = "integration-tests"))]
     faults: Arc<FaultPlan>,
+}
+
+/// Keeps the updater from restarting Drop while a secure session is being
+/// established. The guard is held by inbound, discovery, and manual-connect
+/// tasks until their handshake has completed or failed.
+pub(crate) struct ConnectionActivityGuard {
+    active_connections: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionActivityGuard {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub struct Cancellation {
@@ -670,7 +686,10 @@ impl AppState {
             cancellations: Mutex::new(HashMap::new()),
             active_transfer: Mutex::new(None),
             transfer_changed: Notify::new(),
-            connection_slots: Arc::new(Semaphore::new(8)),
+            connection_slots: Arc::new(Semaphore::new(crate::config::MAX_CONNECTION_SLOTS)),
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            update_gate: Mutex::new(()),
+            updater_installing: AtomicBool::new(false),
             shutdown: Arc::new(Cancellation::new()),
             listener_status: RwLock::new(DiscoverySourceDiagnostics {
                 status: "starting".to_string(),
@@ -724,6 +743,10 @@ impl AppState {
         if self.is_shutting_down() {
             return Err("Drop is shutting down.".to_string());
         }
+        let _update_gate = self.update_gate.lock();
+        if self.updater_installing.load(Ordering::Acquire) {
+            return Err("Drop is updating; try again when the update is finished.".to_string());
+        }
         let mut active = self.active_transfer.lock();
         if self.is_shutting_down() {
             return Err("Drop is shutting down.".to_string());
@@ -751,6 +774,41 @@ impl AppState {
 
     pub fn try_acquire_connection_slot(&self) -> Option<OwnedSemaphorePermit> {
         self.connection_slots.clone().try_acquire_owned().ok()
+    }
+
+    pub(crate) fn try_begin_connection_activity(&self) -> Option<ConnectionActivityGuard> {
+        let _update_gate = self.update_gate.lock();
+        if self.is_shutting_down() || self.updater_installing.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active_connections.fetch_add(1, Ordering::AcqRel);
+        Some(ConnectionActivityGuard {
+            active_connections: self.active_connections.clone(),
+        })
+    }
+
+    pub(crate) fn try_begin_updater_install(&self) -> bool {
+        let _update_gate = self.update_gate.lock();
+        if self.is_shutting_down()
+            || self.updater_installing.load(Ordering::Acquire)
+            || self.active_transfer.lock().is_some()
+            || self.active_connections.load(Ordering::Acquire) > 0
+        {
+            return false;
+        }
+        self.updater_installing.store(true, Ordering::Release);
+        true
+    }
+
+    pub(crate) fn end_updater_install(&self) {
+        let _update_gate = self.update_gate.lock();
+        self.updater_installing.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn updater_is_busy(&self) -> bool {
+        self.updater_installing.load(Ordering::Acquire)
+            || self.active_transfer.lock().is_some()
+            || self.active_connections.load(Ordering::Acquire) > 0
     }
 
     pub fn shutdown_token(&self) -> Arc<Cancellation> {
@@ -1705,6 +1763,29 @@ mod tests {
         assert!(new_cancellation.is_cancelled());
         state.finish_transfer(new_id);
         assert!(state.is_idle());
+    }
+
+    #[test]
+    fn updater_install_gate_blocks_transfers_and_session_setup() {
+        let state = test_state();
+        assert!(!state.updater_is_busy());
+        assert!(state.try_begin_updater_install());
+        assert!(state.updater_is_busy());
+        assert!(state
+            .try_begin_transfer("22222222-2222-4222-8222-222222222222")
+            .is_err());
+        assert!(state.try_begin_connection_activity().is_none());
+        state.end_updater_install();
+        assert!(!state.updater_is_busy());
+
+        let connection = state
+            .try_begin_connection_activity()
+            .expect("idle Drop should allow session setup");
+        assert!(state.updater_is_busy());
+        assert!(!state.try_begin_updater_install());
+        drop(connection);
+        assert!(state.try_begin_updater_install());
+        state.end_updater_install();
     }
 
     #[tokio::test]

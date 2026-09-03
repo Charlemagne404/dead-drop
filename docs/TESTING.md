@@ -40,7 +40,7 @@ tests.
 | `npm run test:integration` | integration + chaos | slower | real loopback sockets, production listener, framed transfers, staging, cancellation, deterministic faults |
 | `npm run test:stress` | ignored stress tests | slow/opt-in | repeated transfer and randomized chaos passes; never part of the default test command |
 | `npm run test:release` | release-tool tests | fast | versioning, artifact metadata, checksums, and release-script behavior |
-| `npm run test:updater` | updater tests | fast | signed-update state transitions, metadata bounds, busy-transfer gating, and deferred installation |
+| `npm run test:updater` | updater tests | fast | signed-update state transitions, metadata bounds, transfer/session gating, and deferred installation |
 | `npm run build` | frontend production build | fast | `tsc --noEmit` and Vite output |
 | `npm run perf` | benchmark | slow/opt-in | transfer memory/throughput and synthetic peer-registry measurements; see [`PERFORMANCE.md`](PERFORMANCE.md) |
 | `npm run package` | native package handoff | slow/platform-specific | delegates to the existing release preparation flow on the current host |

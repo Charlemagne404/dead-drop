@@ -34,6 +34,21 @@ fn diagnostics_report(state: State<'_, Arc<AppState>>) -> String {
 }
 
 #[tauri::command]
+fn begin_updater_install(state: State<'_, Arc<AppState>>) -> bool {
+    state.try_begin_updater_install()
+}
+
+#[tauri::command]
+fn end_updater_install(state: State<'_, Arc<AppState>>) {
+    state.end_updater_install();
+}
+
+#[tauri::command]
+fn updater_is_busy(state: State<'_, Arc<AppState>>) -> bool {
+    state.updater_is_busy()
+}
+
+#[tauri::command]
 fn update_preferences(
     state: State<'_, Arc<AppState>>,
     draft: PreferencesDraft,
@@ -132,6 +147,9 @@ async fn connect_by_address(
     let local = state.device();
     let local_identity = state.local_identity();
     let shutdown = state.shutdown_token();
+    let Some(_connection_activity) = state.try_begin_connection_activity() else {
+        return Err("Drop is updating; try again when the update is finished.".to_string());
+    };
     let cancellation = Cancellation::new();
     let mut last_error = None;
     for endpoint in endpoints {
@@ -241,7 +259,10 @@ fn run_inner() -> Result<(), Box<dyn Error>> {
             send_files,
             connect_by_address,
             cancel_transfer,
-            diagnostics_report
+            diagnostics_report,
+            begin_updater_install,
+            end_updater_install,
+            updater_is_busy
         ])
         .build(tauri::generate_context!())?;
     app.run(move |_app_handle, event| {

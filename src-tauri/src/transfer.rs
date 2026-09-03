@@ -242,11 +242,21 @@ async fn run_listener(
                     );
                     continue;
                 };
+                let Some(connection_activity) = state.try_begin_connection_activity() else {
+                    state.log(
+                        LogLevel::Info,
+                        LogCategory::Connection,
+                        "connection_rejected",
+                        Some(&format!("reason=update installing address={address}")),
+                    );
+                    continue;
+                };
                 let state = state.clone();
                 let log_state = state.clone();
                 let events = events.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let _connection_activity = connection_activity;
                     if let Err(error) = handle_incoming(stream, state, events).await {
                         log_state.log(
                             LogLevel::Warn,
