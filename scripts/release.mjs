@@ -709,6 +709,7 @@ function parseArgs(argv) {
 function runChecks(target) {
   run("npm", ["ci"]);
   run("npm", ["run", "check:workflows"]);
+  run("npm", ["run", "check:licenses"]);
   run("npm", ["run", "test:release"]);
   run("npm", ["run", "build"]);
   run("cargo", ["fmt", "--manifest-path", "src-tauri/Cargo.toml", "--", "--check"]);

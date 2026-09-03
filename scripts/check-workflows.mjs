@@ -12,6 +12,26 @@ function fail(message) {
   throw new Error(message);
 }
 
+const IMMUTABLE_ACTION_REFERENCE = /^[^/\s]+\/[^@\s]+@[0-9a-f]{40}$/;
+
+function checkActionReferences(value, relativePath, location = "workflow") {
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => checkActionReferences(entry, relativePath, `${location}[${index}]`));
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+
+  for (const [key, entry] of Object.entries(value)) {
+    const entryLocation = `${location}.${key}`;
+    if (key === "uses" && typeof entry === "string" && !IMMUTABLE_ACTION_REFERENCE.test(entry)) {
+      fail(
+        `${relativePath} ${entryLocation} must pin an action to a 40-character commit SHA; keep the release tag in a comment.`,
+      );
+    }
+    checkActionReferences(entry, relativePath, entryLocation);
+  }
+}
+
 function workflowFiles() {
   return readdirSync(WORKFLOW_DIRECTORY)
     .filter((entry) => entry.endsWith(".yml") || entry.endsWith(".yaml"))
@@ -45,6 +65,8 @@ function checkWorkflow(filePath) {
   if (!workflow.jobs || typeof workflow.jobs !== "object" || Array.isArray(workflow.jobs)) {
     fail(`${relativePath} must define jobs.`);
   }
+
+  checkActionReferences(workflow, relativePath);
 
   for (const [jobId, job] of Object.entries(workflow.jobs)) {
     if (!job || typeof job !== "object" || Array.isArray(job)) {

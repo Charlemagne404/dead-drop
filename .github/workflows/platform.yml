@@ -28,7 +28,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NODE_VERSION: "24"
+  NODE_VERSION: "24.14.1"
   RUST_BACKTRACE: "1"
 
 jobs:
@@ -37,24 +37,29 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: "1.96.0"
 
       - name: Install JavaScript dependencies
         run: npm ci
 
       - name: Validate workflow YAML
         run: npm run check:workflows
+
+      - name: Validate third-party notices
+        run: npm run check:licenses
 
       - name: Validate release metadata
         run: npm run release:check
@@ -90,7 +95,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -113,18 +118,19 @@ jobs:
             wget
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: "1.96.0"
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo downloads
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry
@@ -190,7 +196,7 @@ jobs:
             bundles: deb,appimage
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -213,18 +219,19 @@ jobs:
             wget
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: "1.96.0"
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo downloads
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry
@@ -247,7 +254,7 @@ jobs:
         run: npm run release:audit -- --target "${{ matrix.target }}" --path "src-tauri/target/${{ matrix.target }}/release/bundle"
 
       - name: Upload unsigned platform bundles
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: drop-unsigned-bundles-${{ matrix.target }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle
@@ -273,12 +280,12 @@ jobs:
       artifact-metadata: write
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -290,7 +297,7 @@ jobs:
         run: node scripts/release.mjs verify-tag "${{ github.ref_name }}"
 
       - name: Download platform bundles
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: drop-unsigned-bundles-*
           path: .release-output-input
@@ -301,12 +308,12 @@ jobs:
 
       - name: Attest regular package files when explicitly requested
         if: inputs.attest == true
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-checksums: ${{ github.workspace }}/.release-output/SHA256SUMS.txt
 
       - name: Upload release-preparation bundle
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: drop-release-preparation
           path: .release-output
