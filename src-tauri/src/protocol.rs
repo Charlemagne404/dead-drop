@@ -132,10 +132,11 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     let length = u32::try_from(payload.len()).map_err(|_| {
         ProtocolError::InvalidFrame("frame length cannot be represented".to_string())
     })?;
-    writer.write_u8(kind).await?;
-    writer.write_u32(length).await?;
+    let mut header = [0_u8; FRAME_HEADER_SIZE];
+    header[0] = kind;
+    header[1..].copy_from_slice(&length.to_be_bytes());
+    writer.write_all(&header).await?;
     writer.write_all(payload).await?;
-    writer.flush().await?;
     Ok(())
 }
 
@@ -157,8 +158,11 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, P
 pub async fn read_identification<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<ControlMessage, ProtocolError> {
-    let kind = reader.read_u8().await?;
-    let length = reader.read_u32().await? as usize;
+    let mut header = [0_u8; FRAME_HEADER_SIZE];
+    reader.read_exact(&mut header).await?;
+    let kind = header[0];
+    let length =
+        u32::from_be_bytes(header[1..].try_into().expect("frame header is 5 bytes")) as usize;
     if kind != CONTROL_FRAME {
         return Err(ProtocolError::InvalidFrame(
             "identification requires a control frame".to_string(),

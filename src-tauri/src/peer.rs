@@ -115,6 +115,21 @@ struct SourceEndpointObservation {
     reachability: EndpointReachability,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObservationChange {
+    None,
+    Refreshed,
+    Visible,
+}
+
+impl SourceEndpointObservation {
+    fn same_visible_state(&self, other: &Self) -> bool {
+        self.address == other.address
+            && self.route_class == other.route_class
+            && self.reachability == other.reachability
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Peer {
     pub id: String,
@@ -318,12 +333,7 @@ impl PeerRegistry {
 
     pub fn snapshots(&self) -> Vec<PeerSnapshot> {
         let mut peers: Vec<_> = self.peers.values().map(PeerSnapshot::from).collect();
-        peers.sort_by(|left, right| {
-            left.name
-                .to_lowercase()
-                .cmp(&right.name.to_lowercase())
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        peers.sort_by_cached_key(|peer| (peer.name.to_lowercase(), peer.id.clone()));
         peers
     }
 
@@ -359,18 +369,27 @@ impl PeerRegistry {
                     .collect(),
             })
             .collect::<Vec<_>>();
-        peers.sort_by(|left, right| {
-            left.name
-                .to_lowercase()
-                .cmp(&right.name.to_lowercase())
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        peers.sort_by_cached_key(|peer| (peer.name.to_lowercase(), peer.id.clone()));
         peers
     }
 
     pub fn apply_observation(&mut self, observation: DiscoveryObservation) -> bool {
+        !matches!(
+            self.apply_observation_change(observation),
+            ObservationChange::None
+        )
+    }
+
+    pub(crate) fn apply_observation_visible(&mut self, observation: DiscoveryObservation) -> bool {
+        matches!(
+            self.apply_observation_change(observation),
+            ObservationChange::Visible
+        )
+    }
+
+    fn apply_observation_change(&mut self, observation: DiscoveryObservation) -> ObservationChange {
         let Some(id) = canonical_device_id(&observation.identity.id) else {
-            return false;
+            return ObservationChange::None;
         };
         if observation.identity.name.trim().is_empty()
             || observation.identity.name.len() > 64
@@ -388,10 +407,10 @@ impl PeerRegistry {
                 .any(|character| character.is_control())
             || observation.identity.protocol_version == 0
         {
-            return false;
+            return ObservationChange::None;
         }
         if !valid_source(&observation.source) {
-            return false;
+            return ObservationChange::None;
         }
         let endpoints = observation
             .endpoints
@@ -400,7 +419,7 @@ impl PeerRegistry {
             .take(MAX_ENDPOINTS_PER_OBSERVATION)
             .collect::<Vec<_>>();
         if endpoints.is_empty() {
-            return false;
+            return ObservationChange::None;
         }
         let source = observation.source;
         let observed_at = endpoints
@@ -468,12 +487,29 @@ impl PeerRegistry {
         let before = peer.endpoints.clone();
         peer.reconcile_endpoints();
         let endpoint_changed = before != peer.endpoints;
+        let endpoint_visible_changed = !endpoints_have_same_visible_state(&before, &peer.endpoints);
         let source_changed = before_sources != peer.source_observations;
+        let source_visible_changed = !source_observations_have_same_visible_state(
+            &before_sources,
+            &peer.source_observations,
+        );
+        let visible_changed =
+            !existed || metadata_changed || endpoint_visible_changed || source_visible_changed;
         if peer.endpoints.is_empty() {
-            return existed || metadata_changed || endpoint_changed || source_changed;
+            return if existed || metadata_changed || endpoint_changed || source_changed {
+                ObservationChange::Visible
+            } else {
+                ObservationChange::None
+            };
         }
         self.peers.insert(id, peer);
-        !existed || metadata_changed || endpoint_changed || source_changed
+        if visible_changed {
+            ObservationChange::Visible
+        } else if endpoint_changed || source_changed {
+            ObservationChange::Refreshed
+        } else {
+            ObservationChange::None
+        }
     }
 
     pub fn mark_endpoint_reachability(
@@ -578,6 +614,33 @@ impl PeerRegistry {
     fn len(&self) -> usize {
         self.peers.len()
     }
+}
+
+fn endpoints_have_same_visible_state(left: &[Endpoint], right: &[Endpoint]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.address == right.address
+                && left.source == right.source
+                && left.route_class == right.route_class
+                && left.reachability == right.reachability
+        })
+}
+
+fn source_observations_have_same_visible_state(
+    left: &HashMap<EndpointSource, Vec<SourceEndpointObservation>>,
+    right: &HashMap<EndpointSource, Vec<SourceEndpointObservation>>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(source, left_observations)| {
+            right.get(source).is_some_and(|right_observations| {
+                left_observations.len() == right_observations.len()
+                    && left_observations.iter().all(|left_observation| {
+                        right_observations.iter().any(|right_observation| {
+                            left_observation.same_visible_state(right_observation)
+                        })
+                    })
+            })
+        })
 }
 
 fn canonical_device_id(id: &str) -> Option<String> {
@@ -882,6 +945,27 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.snapshots().len(), 1);
         assert_eq!(peer.endpoints.len(), 1);
+    }
+
+    #[test]
+    fn repeated_probe_refreshes_do_not_look_like_visible_changes() {
+        let id = "79797979-7979-4797-8797-797979797979";
+        let mut registry = PeerRegistry::new();
+        assert!(registry.apply_observation_visible(observation(
+            id,
+            "Home Server",
+            "Linux",
+            "ethernet",
+            &[10],
+        )));
+        assert!(!registry.apply_observation_visible(observation(
+            id,
+            "Home Server",
+            "Linux",
+            "ethernet",
+            &[10],
+        )));
+        assert_eq!(registry.peer(id).unwrap().endpoints.len(), 1);
     }
 
     #[test]

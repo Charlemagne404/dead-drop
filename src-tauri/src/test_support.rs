@@ -203,6 +203,18 @@ impl TestEventSink {
         }
     }
 
+    pub async fn wait_for_any_incoming(&self) -> IncomingTransfer {
+        loop {
+            let notified = self.incoming_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(transfer) = self.incoming.lock().first().cloned() {
+                return transfer;
+            }
+            notified.await;
+        }
+    }
+
     pub fn pause_on_first_data_progress(&self) {
         self.arm_pause(PauseCondition::FirstDataProgress);
     }

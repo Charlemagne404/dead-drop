@@ -10,6 +10,7 @@
     "dev": "vite",
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "preview": "vite preview",
+    "perf": "node scripts/performance.mjs",
     "tauri": "tauri",
     "check": "npm run check:workflows && npm run check:licenses && npm run release:check && npm run test:release && npm run build",
     "check:workflows": "node scripts/check-workflows.mjs",
