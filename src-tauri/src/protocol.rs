@@ -1,8 +1,13 @@
+//! Versioned wire framing, control messages, and protocol validation.
+//!
+//! This module is the executable counterpart to `docs/PROTOCOL_V1.md`. It is
+//! transport-agnostic and never chooses routes or writes destination files.
+
 use crate::{
+    config::{MAX_FILENAME_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES},
     identity,
-    models::{
-        DeviceIdentity, TransferFile, MAX_FILENAME_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES,
-    },
+    models::TransferFile,
+    peer::DeviceIdentity,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -581,7 +586,11 @@ fn validate_reason(reason: &str) -> Result<(), ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{DeviceIdentity, TransferFile, LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION};
+    use crate::{
+        config::PROTOCOL_VERSION,
+        models::{TransferFile, LEGACY_PROTOCOL_VERSION},
+        peer::DeviceIdentity,
+    };
     use proptest::prelude::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};

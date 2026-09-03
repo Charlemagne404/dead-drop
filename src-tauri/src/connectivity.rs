@@ -1,6 +1,13 @@
+//! Bounded TCP connection and identification operations.
+//!
+//! This module validates an endpoint before the transfer engine uses it. It
+//! does not own discovery, peer merging, file I/O, or UI state.
+
 use crate::{
+    config::{DROP_SERVICE_PORT, PROTOCOL_VERSION},
     identity::{self, LocalIdentity},
-    models::{Cancellation, DeviceIdentity, PROTOCOL_VERSION},
+    models::Cancellation,
+    peer::{same_device_id, DeviceIdentity},
     protocol::{validate_secure_device, ControlMessage},
     secure::{self, SecureChannel, SecureError},
 };
@@ -15,12 +22,10 @@ use tokio::{
     net::{lookup_host, TcpStream},
     time::timeout,
 };
-use uuid::Uuid;
 
 /// One predictable TCP service port is shared by discovery identification and
 /// transfer negotiation. The same numeric port is also used by the optional
 /// local UDP discovery fallback.
-pub const DROP_SERVICE_PORT: u16 = 39_821;
 pub const IDENTIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
 pub const ROUTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 pub const ROUTE_STAGGER: Duration = Duration::from_millis(150);
@@ -314,11 +319,6 @@ fn validate_local_identity(
     }
     Ok(())
 }
-
-fn same_device_id(left: &str, right: &str) -> bool {
-    Uuid::parse_str(left).ok() == Uuid::parse_str(right).ok()
-}
-
 /// Parse the unobtrusive Settings/Diagnostics address field. A missing port
 /// means the fixed Drop service port. IPv6 literals must use bracket syntax so
 /// a hostname and its optional port remain unambiguous.

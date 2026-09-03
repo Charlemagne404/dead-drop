@@ -1,3 +1,5 @@
+//! Deterministic endpoint ranking and preferred-route selection.
+
 use crate::peer::{Endpoint, EndpointReachability, RouteClass};
 #[cfg(test)]
 use std::{collections::HashSet, net::SocketAddr};

@@ -21,11 +21,17 @@ The normal workflow is intended to be identical on all three first-class targets
 ## Run it from source
 
 ```sh
-npm ci
+npm run setup
 npm run tauri dev
 ```
 
 The native app advertises `_dead-drop._tcp.local.` over mDNS/DNS-SD, discovers peers running the same secure protocol version, and listens on the fixed Drop service port `39821` for both secure identification and transfers. The service type is retained as a compatibility identifier from the earlier release.
+
+For the source map, subsystem boundaries, and startup sequence, see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The canonical local command and
+test matrix is in [docs/TESTING.md](docs/TESTING.md); architectural decisions
+that explain identity, endpoint merging, staging, and compatibility are in
+[docs/DECISIONS.md](docs/DECISIONS.md).
 
 ## Reachability and firewall behavior
 
@@ -152,7 +158,7 @@ Current v2 has Drop-level authenticated encryption, per-session forward secrecy 
 
 Inter is bundled from `@fontsource/inter` under the SIL Open Font License 1.1; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Automated local integration tests
+## Testing and benchmarks
 
 The `integration-tests` feature exposes a test-only peer harness. Each test peer has its own deterministic test-only cryptographic identity, loopback TCP listener, receive directory, transfer state, and temporary filesystem tree. Discovery is injected; the secure handshake, trust decision, request decision, encrypted framed transfer, checksum verification, staging, finalization, cancellation, and shutdown paths use the production implementation.
 
@@ -186,6 +192,10 @@ cargo test --manifest-path src-tauri/Cargo.toml \
 The randomized pass prints and preserves seed `0xd05eed20260903` for
 reproduction.
 
+The complete normal, chaos, stress, release, native, and performance command
+matrix is maintained in [docs/TESTING.md](docs/TESTING.md). Performance metric
+definitions remain in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
 ## Performance benchmark
 
 The repeatable transfer and registry benchmark generates temporary fixtures and
@@ -207,13 +217,12 @@ output. `DROP_PERF_LARGE_BYTES`, `DROP_PERF_SMALL_FILE_COUNT`,
 ## Validate
 
 ```sh
-npm run build
-cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
-npm run tauri -- build --ci --no-sign --bundles app,dmg
-git diff --check
+npm run verify
 ```
 
-The last packaging command is for a macOS host; use the platform-specific command above on Windows or Linux. Local builds and cross-compilation are not substitutes for installing the artifacts and completing a Windows ↔ macOS ↔ Linux transfer test. Actual native testing is still required for firewall prompts, Bonjour/Avahi interoperability on ordinary LANs, Windows path/locking behavior, macOS app lifecycle and Retina rendering, Linux Wayland/X11 file dialogs and scaling, large files, removable destinations, and network sleep/wake transitions.
+Use `npm run package` for the existing release-preparation flow and the
+platform-specific native packaging commands in [docs/TESTING.md](docs/TESTING.md)
+for `.app`, NSIS/MSI, `.deb`, and AppImage output. Local builds are not a
+substitute for installing artifacts and completing a Windows ↔ macOS ↔ Linux
+transfer test; native firewall, drag/drop, file-dialog, sleep/wake, and
+removable-destination behavior still require platform testing.

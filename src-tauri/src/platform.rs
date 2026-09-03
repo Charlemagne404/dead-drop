@@ -1,3 +1,8 @@
+//! Small operating-system adapters for paths, app metadata, and file moves.
+//!
+//! Platform-specific behavior stays behind these helpers so transfer policy
+//! can express destination semantics without knowing OS APIs.
+
 use std::{
     io,
     path::{Path, PathBuf},
@@ -34,9 +39,9 @@ pub fn default_destination() -> PathBuf {
         return downloads.join("Drop");
     }
 
-    // A missing XDG/known Downloads directory should not silently send files
-    // to a volatile temporary directory. Keep a persistent, OS-managed app
-    // data location as the next-best fallback.
+    // A missing XDG/known Downloads directory should prefer a persistent,
+    // OS-managed app-data location. The temporary fallback is only used when
+    // the platform cannot provide an application-data directory at all.
     if let Some(dirs) = project_dirs(APPLICATION) {
         return dirs.data_local_dir().join("Received");
     }

@@ -2,6 +2,10 @@
 
 Status: frozen historical contract; not accepted by the current v2 listener.
 
+The ownership map around this contract is in
+[`ARCHITECTURE.md`](ARCHITECTURE.md); this document remains the canonical
+wire-level reference.
+
 This document describes the protocol implemented by Drop at the time of the v1
 freeze. It is intentionally an implementation contract,
 not a redesign. The Rust protocol encoder/decoder, transfer state machine, and
