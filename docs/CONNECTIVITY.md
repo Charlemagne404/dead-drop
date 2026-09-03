@@ -148,9 +148,30 @@ device identity require a separate protocol design.
 ## Diagnostics and logs
 
 The normal UI receives only `id`, `name`, `os`, protocol version, and online
-state. Settings → Connection diagnostics exposes source status, remembered
-count, stable UUIDs, endpoint address/family, sources, route class,
-reachability, last-seen age, and selected route. Logs use the same distinction:
+state. Settings → Connection diagnostics is a secondary support surface; it
+exposes application and local-service state, source status, remembered count,
+stable UUIDs, endpoint address/family, sources, route class, reachability,
+last-seen age, selected route, and recent route failures. The same view can
+copy the plain-text report to the clipboard or download it as a text file.
+
+Support logging uses bounded structured JSON records with stable categories:
+`startup`, `shutdown`, `discovery`, `peer_registry`, `route_selection`,
+`connection`, `transfer`, `filesystem`, `settings`, and `errors`. The current
+session retains at most 256 records; the persistent local sink is capped at
+128 KiB plus two rotated files. It records lifecycle, discovery, route, and
+failure events, not every transfer chunk or progress update. A report includes
+the current session records and states the retention policy without exposing
+the on-disk path.
+
+Reports and logs intentionally include enough context to troubleshoot a
+connection—such as Drop UUIDs, endpoint addresses, route classes, and source
+statuses—but redact credential-shaped values and path-like values. They do not
+include file contents, filenames, full receive paths, passwords, auth tokens,
+Tailscale keys, or unrelated system information. Raw Rust, socket, and
+filesystem errors remain in the internal diagnostic context only; normal UI
+messages are concise and user-facing.
+
+Logs use the same distinction:
 
 ```text
 Peer discovered via mDNS

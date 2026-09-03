@@ -3,9 +3,10 @@ use crate::{
         connect_and_identify, ConnectivityError, IdentifiedConnection, IDENTIFICATION_TIMEOUT,
         MAX_ROUTE_ATTEMPTS, ROUTE_CONNECT_TIMEOUT, ROUTE_STAGGER,
     },
+    diagnostics::{LogCategory, LogLevel, SupportLogger},
     models::{
-        AppState, Cancellation, DeviceIdentity, Endpoint, EndpointReachability, IncomingTransfer,
-        Peer, RuntimeDiagnostics, TransferFile, TransferLifecycle, TransferPhase, TransferSnapshot,
+        AppState, Cancellation, DeviceIdentity, Endpoint, IncomingTransfer, Peer,
+        RuntimeDiagnostics, TransferFile, TransferLifecycle, TransferPhase, TransferSnapshot,
         MAX_FILENAME_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES,
     },
     platform,
@@ -114,6 +115,27 @@ impl TransferError {
         }
     }
 
+    fn diagnostic_message(&self) -> String {
+        match self {
+            Self::Canceled => "transfer cancelled locally".to_string(),
+            Self::RemoteCanceled => "transfer cancelled by peer".to_string(),
+            Self::ShuttingDown => "application shutting down".to_string(),
+            Self::Timeout(stage) => format!("timed out during {stage}"),
+            Self::Connection(_) | Self::ConnectionClosed => "connection failed".to_string(),
+            Self::Protocol(_) => "protocol negotiation or framing failed".to_string(),
+            Self::IncompatibleVersion => "incompatible Drop protocol version".to_string(),
+            Self::InvalidPeerResponse(_) => "peer response was invalid".to_string(),
+            Self::RemoteFailure(_) => "peer reported a transfer failure".to_string(),
+            Self::FileRead { .. } => "source file could not be read".to_string(),
+            Self::Prepare { .. } => "files could not be prepared".to_string(),
+            Self::UnsupportedSelection => "selection was not a regular file".to_string(),
+            Self::Destination { .. } => "receive destination was unavailable".to_string(),
+            Self::DiskFull => "receive destination is full".to_string(),
+            Self::Verification { .. } => "file verification failed".to_string(),
+            Self::AppUnavailable => "incoming request could not be shown".to_string(),
+        }
+    }
+
     fn is_cancelled(&self) -> bool {
         matches!(
             self,
@@ -137,6 +159,15 @@ pub(crate) trait EventSink: Send + Sync {
     fn emit_transfer_update(&self, snapshot: &TransferSnapshot) -> Result<(), String>;
     fn emit_incoming_transfer(&self, transfer: &IncomingTransfer) -> Result<(), String>;
 
+    fn record_log(
+        &self,
+        _level: LogLevel,
+        _category: LogCategory,
+        _event: &str,
+        _detail: Option<&str>,
+    ) {
+    }
+
     fn emit_connectivity_diagnostics(
         &self,
         _diagnostics: &RuntimeDiagnostics,
@@ -147,28 +178,69 @@ pub(crate) trait EventSink: Send + Sync {
 
 struct TauriEventSink {
     app: AppHandle,
+    logger: Arc<SupportLogger>,
 }
 
 impl EventSink for TauriEventSink {
     fn emit_transfer_update(&self, snapshot: &TransferSnapshot) -> Result<(), String> {
-        self.app
+        let result = self
+            .app
             .emit("transfer-update", snapshot)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string());
+        if let Err(error) = &result {
+            self.record_log(
+                LogLevel::Warn,
+                LogCategory::Errors,
+                "transfer_update_emit_failed",
+                Some(error),
+            );
+        }
+        result
     }
 
     fn emit_incoming_transfer(&self, transfer: &IncomingTransfer) -> Result<(), String> {
-        self.app
+        let result = self
+            .app
             .emit("incoming-transfer", transfer)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string());
+        if let Err(error) = &result {
+            self.record_log(
+                LogLevel::Warn,
+                LogCategory::Errors,
+                "incoming_update_emit_failed",
+                Some(error),
+            );
+        }
+        result
+    }
+
+    fn record_log(
+        &self,
+        level: LogLevel,
+        category: LogCategory,
+        event: &str,
+        detail: Option<&str>,
+    ) {
+        self.logger.record(level, category, event, detail);
     }
 
     fn emit_connectivity_diagnostics(
         &self,
         diagnostics: &RuntimeDiagnostics,
     ) -> Result<(), String> {
-        self.app
+        let result = self
+            .app
             .emit("connectivity-diagnostics", diagnostics)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string());
+        if let Err(error) = &result {
+            self.record_log(
+                LogLevel::Warn,
+                LogCategory::Errors,
+                "diagnostics_update_emit_failed",
+                Some(error),
+            );
+        }
+        result
     }
 }
 
@@ -208,9 +280,11 @@ impl TransferTracker {
 
     fn emit(&self) {
         if let Err(error) = self.events.emit_transfer_update(&self.snapshot) {
-            eprintln!(
-                "[dead-drop][transfer] could not emit update for {}: {error}",
-                self.snapshot.id
+            self.events.record_log(
+                LogLevel::Warn,
+                LogCategory::Errors,
+                "transfer_update_failed",
+                Some(&error),
             );
         }
     }
@@ -227,9 +301,11 @@ impl TransferTracker {
             return;
         }
         if let Err(previous) = self.lifecycle.transition(next) {
-            eprintln!(
-                "[dead-drop][transfer] ignored invalid transition for {}: {:?} -> {:?}",
-                self.snapshot.id, previous, next
+            self.events.record_log(
+                LogLevel::Warn,
+                LogCategory::Errors,
+                "invalid_transfer_transition",
+                Some(&format!("from={previous:?} to={next:?}")),
             );
             return;
         }
@@ -282,7 +358,10 @@ impl TransferTracker {
 }
 
 pub fn start_listener(std_listener: StdTcpListener, state: Arc<AppState>, app: AppHandle) {
-    let events = Arc::new(TauriEventSink { app });
+    let events = Arc::new(TauriEventSink {
+        app,
+        logger: state.logger(),
+    });
     tauri::async_runtime::spawn(run_listener(std_listener, state, events));
 }
 
@@ -303,11 +382,24 @@ async fn run_listener(
     let listener = match TcpListener::from_std(std_listener) {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("[dead-drop][network] could not start transfer listener: {error}");
+            state.set_listener_status("unavailable", Some("listener could not start"));
+            state.log(
+                LogLevel::Error,
+                LogCategory::Startup,
+                "listener_start_failed",
+                Some(&error.to_string()),
+            );
             return;
         }
     };
-    eprintln!("[dead-drop][network] transfer listener started");
+    state.set_listener_status("running", None);
+    state.log(
+        LogLevel::Info,
+        LogCategory::Startup,
+        "listener_started",
+        Some(&format!("port={}", state.listener_port())),
+    );
+    let _ = events.emit_connectivity_diagnostics(&state.runtime_diagnostics());
     let shutdown = state.shutdown_token();
     loop {
         let accepted = tokio::select! {
@@ -317,17 +409,26 @@ async fn run_listener(
         match accepted {
             Ok((stream, address)) => {
                 let Some(permit) = state.try_acquire_connection_slot() else {
-                    eprintln!(
-                        "[dead-drop][network] rejected connection from {address}: connection limit reached"
+                    state.log(
+                        LogLevel::Warn,
+                        LogCategory::Connection,
+                        "connection_rejected",
+                        Some(&format!("reason=connection limit address={address}")),
                     );
                     continue;
                 };
                 let state = state.clone();
+                let log_state = state.clone();
                 let events = events.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(error) = handle_incoming(stream, state, events).await {
-                        eprintln!("[dead-drop][network] incoming connection ended: {error:?}");
+                        log_state.log(
+                            LogLevel::Warn,
+                            LogCategory::Connection,
+                            "incoming_connection_ended",
+                            Some(&error.diagnostic_message()),
+                        );
                     }
                 });
             }
@@ -335,12 +436,24 @@ async fn run_listener(
                 if state.is_shutting_down() {
                     break;
                 }
-                eprintln!("[dead-drop][network] listener accept failed: {error}");
+                state.log(
+                    LogLevel::Error,
+                    LogCategory::Connection,
+                    "listener_accept_failed",
+                    Some(&error.to_string()),
+                );
                 sleep(Duration::from_secs(1)).await;
             }
         }
     }
-    eprintln!("[dead-drop][network] transfer listener stopped");
+    state.set_listener_status("stopped", None);
+    state.log(
+        LogLevel::Info,
+        LogCategory::Shutdown,
+        "listener_stopped",
+        None,
+    );
+    let _ = events.emit_connectivity_diagnostics(&state.runtime_diagnostics());
 }
 
 pub async fn run_outgoing(
@@ -352,7 +465,10 @@ pub async fn run_outgoing(
     cancellation: Arc<Cancellation>,
 ) {
     run_outgoing_with_events(
-        Arc::new(TauriEventSink { app }),
+        Arc::new(TauriEventSink {
+            app,
+            logger: state.logger(),
+        }),
         state,
         transfer_id,
         peer,
@@ -390,9 +506,11 @@ pub(crate) async fn run_outgoing_with_events(
     )
     .await;
     if let Err(error) = result {
-        eprintln!(
-            "[dead-drop][transfer] outgoing {} failed: {error:?}",
-            transfer_id
+        state.log(
+            LogLevel::Warn,
+            LogCategory::Transfer,
+            "outgoing_transfer_failed",
+            Some(&error.diagnostic_message()),
         );
         tracker.finish_error(&error);
     }
@@ -413,10 +531,11 @@ async fn send_files(
             detail: "invalid local file count".to_string(),
         });
     }
-    eprintln!(
-        "[dead-drop][transfer] outgoing {transfer_id} preparing {} file(s) for {}",
-        paths.len(),
-        peer.id
+    state.log(
+        LogLevel::Info,
+        LogCategory::Transfer,
+        "outgoing_transfer_preparing",
+        Some(&format!("files={} peer={}", paths.len(), peer.id)),
     );
     let prepared = prepare_files(paths, cancellation.clone(), shutdown.clone()).await?;
     if prepared.is_empty() {
@@ -497,12 +616,20 @@ async fn send_files(
             let message = rejection_message(reason.as_deref());
             if message == "Transfer was cancelled." {
                 tracker.transition(TransferPhase::Canceled, Some(message));
-                eprintln!(
-                    "[dead-drop][transfer] outgoing {transfer_id} was cancelled before acceptance"
+                state.log(
+                    LogLevel::Info,
+                    LogCategory::Transfer,
+                    "outgoing_transfer_cancelled",
+                    Some("before acceptance"),
                 );
             } else {
                 tracker.transition(TransferPhase::Rejected, Some(message));
-                eprintln!("[dead-drop][transfer] outgoing {transfer_id} was rejected");
+                state.log(
+                    LogLevel::Info,
+                    LogCategory::Transfer,
+                    "outgoing_transfer_rejected",
+                    None,
+                );
             }
             return Ok(());
         }
@@ -518,9 +645,11 @@ async fn send_files(
             ))
         }
     }
-    eprintln!(
-        "[dead-drop][transfer] outgoing {transfer_id} accepted by {}",
-        peer.id
+    state.log(
+        LogLevel::Info,
+        LogCategory::Transfer,
+        "outgoing_transfer_accepted",
+        Some(&format!("peer={}", peer.id)),
     );
     tracker.transition(TransferPhase::Accepted, None);
     tracker.transition(TransferPhase::Transferring, None);
@@ -638,7 +767,12 @@ async fn send_files(
             } if received_id == transfer_id => {
                 tracker.progress(total_bytes, started_at, true);
                 tracker.transition(TransferPhase::Completed, None);
-                eprintln!("[dead-drop][transfer] outgoing {transfer_id} completed");
+                state.log(
+                    LogLevel::Info,
+                    LogCategory::Transfer,
+                    "outgoing_transfer_completed",
+                    None,
+                );
                 Ok(())
             }
             RemoteSignal::Result {
@@ -733,10 +867,15 @@ async fn handle_incoming(
         shutdown.as_ref(),
     )
     .await?;
-    eprintln!(
-        "[dead-drop][protocol] negotiated version {} with {}",
-        crate::models::PROTOCOL_VERSION,
-        sender.id
+    state.log(
+        LogLevel::Info,
+        LogCategory::Connection,
+        "protocol_negotiated",
+        Some(&format!(
+            "version={} peer={}",
+            crate::models::PROTOCOL_VERSION,
+            sender.id
+        )),
     );
     let request = match read_control_with_timeout(
         &mut reader,
@@ -750,8 +889,11 @@ async fn handle_incoming(
         Ok(request) => request,
         Err(TransferError::ConnectionClosed) => {
             if let Some(remote_address) = remote_address {
-                eprintln!(
-                    "[dead-drop][discovery] identification probe completed from {remote_address}"
+                state.log(
+                    LogLevel::Info,
+                    LogCategory::Discovery,
+                    "identification_probe_completed",
+                    Some(&format!("endpoint={remote_address}")),
                 );
             }
             return Ok(());
@@ -782,7 +924,12 @@ async fn handle_incoming(
         );
     }
     if let Err(_reason) = state.try_begin_transfer(&transfer_id) {
-        eprintln!("[dead-drop][transfer] rejected incoming {transfer_id}: application is busy");
+        state.log(
+            LogLevel::Info,
+            LogCategory::Transfer,
+            "incoming_transfer_rejected",
+            Some("application busy"),
+        );
         send_control_bounded(
             &mut writer,
             &ControlMessage::TransferDecision {
@@ -809,9 +956,11 @@ async fn handle_incoming(
     )
     .await;
     if let Err(error) = &result {
-        eprintln!(
-            "[dead-drop][transfer] incoming {} ended: {error:?}",
-            transfer_id
+        state.log(
+            LogLevel::Warn,
+            LogCategory::Transfer,
+            "incoming_transfer_failed",
+            Some(&error.diagnostic_message()),
         );
     }
     state.finish_transfer(&transfer_id);
@@ -852,10 +1001,20 @@ async fn receive_incoming(
         state.clear_pending_request(&transfer_id);
         tracker.finish_error(&TransferError::AppUnavailable);
         send_protocol_error(writer, "Drop could not show the incoming transfer.").await;
-        eprintln!("[dead-drop][transfer] incoming event failed: {error}");
+        state.log(
+            LogLevel::Warn,
+            LogCategory::Errors,
+            "incoming_event_failed",
+            Some(&error),
+        );
         return Err(TransferError::AppUnavailable);
     }
-    eprintln!("[dead-drop][transfer] incoming {transfer_id} waiting for acceptance");
+    state.log(
+        LogLevel::Info,
+        LogCategory::Transfer,
+        "incoming_transfer_waiting",
+        None,
+    );
     let decision = wait_for_decision(
         reader,
         &transfer_id,
@@ -875,7 +1034,12 @@ async fn receive_incoming(
                 return Err(error);
             }
             tracker.transition(TransferPhase::Rejected, Some(reason));
-            eprintln!("[dead-drop][transfer] incoming {transfer_id} declined");
+            state.log(
+                LogLevel::Info,
+                LogCategory::Transfer,
+                "incoming_transfer_declined",
+                None,
+            );
             return Ok(());
         }
         Err(error @ TransferError::Canceled) => {
@@ -898,7 +1062,12 @@ async fn receive_incoming(
         tracker.finish_error(&error);
         return Err(error);
     }
-    eprintln!("[dead-drop][transfer] incoming {transfer_id} accepted");
+    state.log(
+        LogLevel::Info,
+        LogCategory::Transfer,
+        "incoming_transfer_accepted",
+        None,
+    );
     tracker.transition(TransferPhase::Accepted, None);
     tracker.transition(TransferPhase::Transferring, None);
     let preferences = state.preferences();
@@ -1063,12 +1232,20 @@ async fn receive_incoming(
     )
     .await
     {
-        eprintln!(
-            "[dead-drop][transfer] incoming {transfer_id} completed locally but the sender disconnected"
+        state.log(
+            LogLevel::Warn,
+            LogCategory::Connection,
+            "incoming_completion_ack_failed",
+            Some("sender disconnected after local finalization"),
         );
     }
     tracker.transition(TransferPhase::Completed, None);
-    eprintln!("[dead-drop][transfer] incoming {transfer_id} completed");
+    state.log(
+        LogLevel::Info,
+        LogCategory::Transfer,
+        "incoming_transfer_completed",
+        None,
+    );
     Ok(())
 }
 
@@ -1199,9 +1376,11 @@ async fn receive_files(
                 name: expected.name.clone(),
             });
         }
-        eprintln!(
-            "[dead-drop][integrity] verified {} ({received} bytes)",
-            expected.name
+        state.log(
+            LogLevel::Info,
+            LogCategory::Transfer,
+            "file_verified",
+            Some(&format!("file_index={index} bytes={received}")),
         );
     }
     match read_control_with_timeout(reader, FRAME_TIMEOUT, "read", cancellation, shutdown).await? {
@@ -1239,13 +1418,12 @@ async fn prepare_files(
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "selected item".to_string());
-        let metadata = fs::metadata(&source).await.map_err(|error| {
-            eprintln!("[dead-drop][file] could not access {source_name}: {error}");
-            TransferError::FileRead {
+        let metadata = fs::metadata(&source)
+            .await
+            .map_err(|error| TransferError::FileRead {
                 name: source_name.clone(),
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
         if !metadata.is_file() {
             return Err(TransferError::UnsupportedSelection);
         }
@@ -1275,10 +1453,6 @@ async fn prepare_files(
         .map_err(|error| TransferError::Prepare {
             detail: error.to_string(),
         })??;
-        eprintln!(
-            "[dead-drop][transfer] prepared {name} ({} bytes)",
-            metadata.len()
-        );
         prepared.push(PreparedFile {
             source,
             wire: TransferFile {
@@ -1462,9 +1636,9 @@ async fn move_staged_file(source: &Path, destination: &Path) -> std::io::Result<
                 // operation, so remove it before returning the failure and
                 // let the batch rollback path handle any remaining files.
                 if let Err(cleanup_error) = fs::remove_file(destination).await {
-                    eprintln!(
-                        "[dead-drop][file] could not roll back hard-link destination: {cleanup_error}"
-                    );
+                    // The caller logs the bounded destination failure. Do not
+                    // include paths or raw filesystem text in the transfer UI.
+                    let _ = cleanup_error;
                 }
                 return Err(remove_error);
             }
@@ -1508,7 +1682,12 @@ async fn cleanup_staged(staged: &[StagedFile], state: &AppState) {
                 Ok(()) => break,
                 Err(error) if error.kind() == ErrorKind::NotFound => break,
                 Err(error) if attempt == 2 => {
-                    eprintln!("[dead-drop][file] could not remove temporary receive file: {error}");
+                    state.log(
+                        LogLevel::Warn,
+                        LogCategory::Filesystem,
+                        "staged_file_cleanup_failed",
+                        Some(&error.to_string()),
+                    );
                 }
                 Err(_) => tokio::task::yield_now().await,
             }
@@ -1516,11 +1695,16 @@ async fn cleanup_staged(staged: &[StagedFile], state: &AppState) {
     }
 }
 
-async fn rollback_finalized(finalized: &[PathBuf]) {
+async fn rollback_finalized(finalized: &[PathBuf], state: &AppState) {
     for path in finalized.iter().rev() {
         if let Err(error) = fs::remove_file(path).await {
             if error.kind() != ErrorKind::NotFound {
-                eprintln!("[dead-drop][file] could not roll back finalized file: {error}");
+                state.log(
+                    LogLevel::Warn,
+                    LogCategory::Filesystem,
+                    "finalized_file_rollback_failed",
+                    Some(&error.to_string()),
+                );
             }
         }
     }
@@ -1536,7 +1720,7 @@ async fn finish_incoming_error(
     finalized: &[PathBuf],
 ) -> Result<(), TransferError> {
     cleanup_staged(staged, state).await;
-    rollback_finalized(finalized).await;
+    rollback_finalized(finalized, state).await;
     if matches!(error, TransferError::Canceled) {
         send_cancel(writer, transfer_id).await;
     }
@@ -1651,18 +1835,10 @@ async fn connect_to_peer(
                 match result {
                     Some(Ok(Ok((endpoint, connection)))) => {
                         attempts.abort_all();
-                        let changed = state.mark_endpoint_reachability(
-                            &peer.id,
-                            endpoint.address,
-                            EndpointReachability::Reachable,
-                        );
+                        let changed = state.record_route_success(&peer.id, endpoint.address);
                         if changed {
                             let _ = events.emit_connectivity_diagnostics(&state.runtime_diagnostics());
                         }
-                        eprintln!(
-                            "[dead-drop][route] Connected to {} via {}",
-                            peer.name, endpoint.address
-                        );
                         return Ok(ConnectedPeer {
                             stream: connection.stream,
                             identity: connection.identity,
@@ -1671,19 +1847,16 @@ async fn connect_to_peer(
                     }
                     Some(Ok(Err((endpoint, error)))) => {
                         if !matches!(error, ConnectivityError::Canceled | ConnectivityError::ShuttingDown) {
-                            let changed = state.mark_endpoint_reachability(
+                            let reason = error.diagnostic_message();
+                            let changed = state.record_route_failure(
                                 &peer.id,
                                 endpoint.address,
-                                EndpointReachability::Unreachable,
+                                &reason,
                             );
                             if changed {
                                 let _ = events.emit_connectivity_diagnostics(&state.runtime_diagnostics());
                             }
-                            eprintln!(
-                                "[dead-drop][route] Endpoint {} unavailable: {}",
-                                endpoint.address, error
-                            );
-                            last_error = Some(error.to_string());
+                            last_error = Some(reason);
                         }
                         if matches!(error, ConnectivityError::Canceled) {
                             return Err(TransferError::Canceled);
@@ -1693,7 +1866,13 @@ async fn connect_to_peer(
                         }
                     }
                     Some(Err(error)) => {
-                        last_error = Some(format!("route attempt failed: {error}"));
+                        state.log(
+                            LogLevel::Warn,
+                            LogCategory::RouteSelection,
+                            "route_attempt_task_failed",
+                            Some(&error.to_string()),
+                        );
+                        last_error = Some("route attempt failed".to_string());
                     }
                     None => {}
                 }
@@ -1705,9 +1884,11 @@ async fn connect_to_peer(
                 let expected_peer_id = peer.id.clone();
                 let attempt_cancellation = cancellation.clone();
                 let attempt_shutdown = shutdown.clone();
-                eprintln!(
-                    "[dead-drop][route] Trying {} endpoint {}",
-                    peer.name, endpoint.address
+                state.log(
+                    LogLevel::Info,
+                    LogCategory::RouteSelection,
+                    "route_attempt_started",
+                    Some(&format!("endpoint={}", endpoint.address)),
                 );
                 attempts.spawn(async move {
                     let result = connect_and_identify(
@@ -1725,6 +1906,12 @@ async fn connect_to_peer(
                 next_launch = tokio::time::Instant::now() + ROUTE_STAGGER;
             }
             _ = sleep_until(deadline) => {
+                state.log(
+                    LogLevel::Warn,
+                    LogCategory::RouteSelection,
+                    "route_attempt_deadline",
+                    Some("all candidate routes timed out"),
+                );
                 last_error = Some("connection timed out".to_string());
                 attempts.abort_all();
                 break;
@@ -2118,7 +2305,6 @@ fn same_device_id(left: &str, right: &str) -> bool {
 }
 
 fn destination_error(error: std::io::Error) -> TransferError {
-    eprintln!("[dead-drop][file] destination operation failed: {error}");
     if matches!(error.raw_os_error(), Some(28) | Some(39) | Some(112)) {
         TransferError::DiskFull
     } else {
@@ -2144,6 +2330,24 @@ mod tests {
     use proptest::prelude::*;
     use std::{io::Write, net::Ipv4Addr};
     use uuid::Uuid;
+
+    #[test]
+    fn transfer_errors_keep_raw_cause_out_of_the_user_message() {
+        let error = TransferError::Connection(
+            "connection refused while opening /Users/alice/private.txt".to_string(),
+        );
+        assert_eq!(error.user_message(), "Device went offline.");
+        assert_eq!(error.diagnostic_message(), "connection failed");
+        let file_error = TransferError::FileRead {
+            name: "private-name.txt".to_string(),
+            detail: "permission denied".to_string(),
+        };
+        assert_eq!(file_error.user_message(), "File could not be read.");
+        assert_eq!(
+            file_error.diagnostic_message(),
+            "source file could not be read"
+        );
+    }
 
     #[test]
     fn checksum_comparison_is_case_insensitive() {

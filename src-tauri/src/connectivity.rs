@@ -50,6 +50,66 @@ pub enum ConnectivityError {
     SelfConnection,
 }
 
+impl ConnectivityError {
+    pub(crate) fn user_message(&self) -> &'static str {
+        match self {
+            Self::Canceled => "Connection cancelled.",
+            Self::ShuttingDown => "Drop is closing.",
+            Self::IncompatibleVersion => "That device uses a different Drop protocol version.",
+            Self::UnexpectedPeer => "That address belongs to a different Drop device.",
+            Self::SelfConnection => "That address belongs to this device.",
+            Self::Timeout(_) | Self::Connection(_) | Self::Protocol(_) => {
+                "Couldn't connect to that device."
+            }
+        }
+    }
+
+    pub(crate) fn diagnostic_message(&self) -> String {
+        match self {
+            Self::Canceled => "connection cancelled".to_string(),
+            Self::ShuttingDown => "application shutting down".to_string(),
+            Self::Timeout(stage) => format!("timed out during {stage}"),
+            Self::Connection(detail) => {
+                format!("connection {}", classify_connection_detail(detail))
+            }
+            Self::Protocol(detail) => format!("protocol {}", classify_protocol_detail(detail)),
+            Self::IncompatibleVersion => "incompatible Drop protocol version".to_string(),
+            Self::UnexpectedPeer => "endpoint identified a different Drop device".to_string(),
+            Self::SelfConnection => "endpoint identified this device".to_string(),
+        }
+    }
+}
+
+fn classify_connection_detail(detail: &str) -> &'static str {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("refused") {
+        "refused"
+    } else if detail.contains("timed out") || detail.contains("timeout") {
+        "timed out"
+    } else if detail.contains("reset") {
+        "reset"
+    } else if detail.contains("unreachable") {
+        "network unreachable"
+    } else if detail.contains("permission") || detail.contains("access") {
+        "blocked"
+    } else if detail.contains("dns") || detail.contains("resolve") {
+        "name resolution failed"
+    } else {
+        "failed"
+    }
+}
+
+fn classify_protocol_detail(detail: &str) -> &'static str {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("invalid") || detail.contains("malformed") {
+        "message was invalid"
+    } else if detail.contains("expected") {
+        "message was unexpected"
+    } else {
+        "negotiation failed"
+    }
+}
+
 #[derive(Debug)]
 pub struct IdentifiedConnection {
     pub stream: TcpStream,
@@ -305,6 +365,23 @@ mod tests {
     fn public_manual_addresses_are_rejected() {
         assert!(parse_manual_target("203.0.113.10:39821").is_err());
         assert!(parse_manual_target("example.com").is_ok());
+    }
+
+    #[test]
+    fn connectivity_errors_have_concise_ui_and_safe_diagnostic_messages() {
+        let refused = ConnectivityError::Connection(
+            "connection refused while opening /Users/alice/private.txt".to_string(),
+        );
+        assert_eq!(refused.user_message(), "Couldn't connect to that device.");
+        assert_eq!(refused.diagnostic_message(), "connection refused");
+        assert_eq!(
+            ConnectivityError::Timeout("connect").user_message(),
+            "Couldn't connect to that device."
+        );
+        assert_eq!(
+            ConnectivityError::Protocol("invalid secret token".to_string()).diagnostic_message(),
+            "protocol message was invalid"
+        );
     }
 
     #[tokio::test]

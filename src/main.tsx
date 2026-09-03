@@ -43,14 +43,34 @@ const initialPreferences: Preferences = {
 };
 
 const previewDiagnostics: RuntimeDiagnostics = {
-  transport: "IPv4",
-  listenerPort: 0,
-  receiveDirectoryAvailable: true,
+  application: {
+    version: "0.1.0",
+    os: "Preview",
+    architecture: "preview",
+    protocolVersion: 1,
+  },
+  local: {
+    deviceId: "preview-device",
+    deviceName: initialPreferences.deviceName,
+    receiveDirectoryAvailable: true,
+    serviceStatus: "preview",
+    serviceDetail: null,
+    servicePort: 0,
+    transport: "IPv4",
+    interfaceStatus: "addresses omitted",
+    transportLimitations: ["IPv4 only", "LAN traffic is not encrypted"],
+  },
   discovery: {
     mdns: { status: "preview", detail: null },
     localFallback: { status: "preview", detail: null },
     tailscale: { status: "not-detected", detail: null },
     rememberedPeers: 0,
+  },
+  logicalPeerCount: 0,
+  logging: {
+    storageStatus: "current session only",
+    retention: "preview",
+    currentEntries: 0,
   },
   peers: [],
 };
@@ -156,7 +176,7 @@ function App() {
         setPeers(snapshot.peers);
         setPreferences(snapshot.preferences);
         setDiagnostics(snapshot.diagnostics);
-        if (!snapshot.diagnostics.receiveDirectoryAvailable) {
+        if (!snapshot.diagnostics.local.receiveDirectoryAvailable) {
           setNotice("Your receive folder is unavailable. Choose another folder in Settings.");
         }
       } catch {
@@ -405,6 +425,7 @@ function App() {
               preferences={preferences}
               diagnostics={diagnostics}
               onClose={() => setIsSettingsOpen(false)}
+              onNotice={setNotice}
               onPeerConnected={(peer) => {
                 setPeers((current) => {
                   const withoutPeer = current.filter((candidate) => candidate.id !== peer.id);
@@ -423,7 +444,12 @@ function App() {
                 const saved = await command.updatePreferences(draft);
                 setPreferences(saved);
                 setDiagnostics((current) =>
-                  current ? { ...current, receiveDirectoryAvailable: true } : current,
+                  current
+                    ? {
+                        ...current,
+                        local: { ...current.local, receiveDirectoryAvailable: true },
+                      }
+                    : current,
                 );
                 setNotice("Saved. Devices will refresh shortly.");
               }}
@@ -646,6 +672,7 @@ function SettingsPanel({
   preferences,
   diagnostics,
   onClose,
+  onNotice,
   onPeerConnected,
   onSave,
 }: {
@@ -653,6 +680,7 @@ function SettingsPanel({
   preferences: Preferences;
   diagnostics: RuntimeDiagnostics | null;
   onClose: () => void;
+  onNotice: (message: string) => void;
   onPeerConnected: (peer: Peer) => void;
   onSave: (draft: Preferences) => Promise<void>;
 }) {
@@ -662,6 +690,8 @@ function SettingsPanel({
   const [address, setAddress] = useState("");
   const [connecting, setConnecting] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [reportAction, setReportAction] = useState<"copy" | "export" | null>(null);
+  const [reportError, setReportError] = useState<string | null>(null);
   useEffect(() => setDraft(preferences), [preferences]);
   const save = async () => {
     if (saving) return;
@@ -693,6 +723,27 @@ function SettingsPanel({
       setConnecting(false);
     }
   };
+  const runReportAction = async (action: "copy" | "export") => {
+    if (reportAction) return;
+    setReportAction(action);
+    setReportError(null);
+    try {
+      const report = native
+        ? await command.diagnosticsReport()
+        : previewDiagnosticsReport(diagnostics ?? previewDiagnostics);
+      if (action === "copy") {
+        await copyText(report);
+        onNotice("Diagnostics report copied.");
+      } else {
+        downloadTextFile("drop-diagnostics.txt", report);
+        onNotice("Diagnostics report exported.");
+      }
+    } catch (reason) {
+      setReportError(userFacingError(reason, "Couldn't prepare the diagnostics report."));
+    } finally {
+      setReportAction(null);
+    }
+  };
   return (
     <div className="settings-panel state-panel">
       <form
@@ -704,12 +755,12 @@ function SettingsPanel({
       >
         <h1>Settings</h1>
       <p className="settings-intro">Name this device and choose where received files go.</p>
-      <div className={`settings-health ${diagnostics?.receiveDirectoryAvailable === false ? "is-warning" : ""}`} role="status">
+      <div className={`settings-health ${diagnostics?.local.receiveDirectoryAvailable === false ? "is-warning" : ""}`} role="status">
         <span className="health-mark" aria-hidden="true" />
         <span>
-          <strong>{diagnostics?.receiveDirectoryAvailable === false ? "Receive folder unavailable" : "Ready"}</strong>
+          <strong>{diagnostics?.local.receiveDirectoryAvailable === false ? "Receive folder unavailable" : "Ready"}</strong>
           <small>
-            {diagnostics?.transport ?? "IPv4"} · {diagnostics?.listenerPort ? `TCP ${diagnostics.listenerPort}` : "automatic service port"} · automatic discovery
+            {diagnostics?.local.transport ?? "IPv4"} · {diagnostics?.local.servicePort ? `TCP ${diagnostics.local.servicePort}` : "automatic service port"} · automatic discovery
           </small>
         </span>
       </div>
@@ -738,14 +789,73 @@ function SettingsPanel({
       <details className="diagnostics-disclosure">
         <summary>Connection diagnostics</summary>
         <div className="diagnostics-body">
-          <div className="diagnostic-status-list" aria-label="Discovery status">
-            <DiagnosticStatus label="mDNS" source={diagnostics?.discovery.mdns} />
-            <DiagnosticStatus label="Local fallback" source={diagnostics?.discovery.localFallback} />
-            <DiagnosticStatus label="Tailscale" source={diagnostics?.discovery.tailscale} />
+          <div className="diagnostic-report">
+            <div>
+              <p className="diagnostic-section-label">Support report</p>
+              <p className="diagnostic-count">Copy or export the current, redacted connection state when asking for help.</p>
+            </div>
+            <div className="diagnostic-report-actions">
+              <button
+                className="outline-button diagnostic-action"
+                type="button"
+                disabled={Boolean(reportAction)}
+                onClick={() => void runReportAction("copy")}
+              >
+                {reportAction === "copy" ? "Copying…" : "Copy report"}
+              </button>
+              <button
+                className="text-button diagnostic-action"
+                type="button"
+                disabled={Boolean(reportAction)}
+                onClick={() => void runReportAction("export")}
+              >
+                {reportAction === "export" ? "Exporting…" : "Export .txt"}
+              </button>
+            </div>
           </div>
-          <p className="diagnostic-count">
-            {diagnostics?.discovery.rememberedPeers ?? 0} remembered peer{diagnostics?.discovery.rememberedPeers === 1 ? "" : "s"} available for revalidation.
-          </p>
+          {reportError && <p className="settings-error" role="alert">{reportError}</p>}
+          <section className="diagnostic-section" aria-labelledby="diagnostic-application">
+            <p className="diagnostic-section-label" id="diagnostic-application">Application</p>
+            <div className="diagnostic-grid">
+              <DiagnosticValue label="Version" value={diagnostics?.application.version ?? "starting"} />
+              <DiagnosticValue label="OS" value={diagnostics?.application.os ?? "starting"} />
+              <DiagnosticValue label="Architecture" value={diagnostics?.application.architecture ?? "starting"} />
+              <DiagnosticValue label="Protocol" value={diagnostics ? `v${diagnostics.application.protocolVersion}` : "starting"} />
+            </div>
+          </section>
+          <section className="diagnostic-section" aria-labelledby="diagnostic-local">
+            <p className="diagnostic-section-label" id="diagnostic-local">Local Drop instance</p>
+            <div className="diagnostic-grid">
+              <DiagnosticValue label="Device UUID" value={diagnostics?.local.deviceId ?? "starting"} />
+              <DiagnosticValue label="Device name" value={diagnostics?.local.deviceName ?? "starting"} />
+              <DiagnosticValue label="Receive folder" value={diagnostics ? diagnosticAvailability(diagnostics.local.receiveDirectoryAvailable) : "starting"} />
+              <DiagnosticValue
+                label="Listener"
+                value={diagnostics ? diagnosticStatusLabel(diagnostics.local.serviceStatus) : "starting"}
+                detail={diagnostics?.local.serviceDetail ?? undefined}
+              />
+              <DiagnosticValue label="Service port" value={diagnostics ? `TCP/UDP ${diagnostics.local.servicePort}` : "starting"} />
+              <DiagnosticValue label="Transport" value={diagnostics?.local.transport ?? "starting"} />
+            </div>
+            {diagnostics?.local.interfaceStatus && <p className="diagnostic-note">{diagnostics.local.interfaceStatus}</p>}
+            <div className="diagnostic-limitations">
+              <span>Current limitations</span>
+              <ul>
+                {(diagnostics?.local.transportLimitations ?? []).map((limitation) => <li key={limitation}>{limitation}</li>)}
+              </ul>
+            </div>
+          </section>
+          <section className="diagnostic-section" aria-labelledby="diagnostic-discovery">
+            <p className="diagnostic-section-label" id="diagnostic-discovery">Discovery / connectivity</p>
+            <div className="diagnostic-status-list" aria-label="Discovery status">
+              <DiagnosticStatus label="mDNS" source={diagnostics?.discovery.mdns} />
+              <DiagnosticStatus label="Local fallback" source={diagnostics?.discovery.localFallback} />
+              <DiagnosticStatus label="Tailscale" source={diagnostics?.discovery.tailscale} />
+            </div>
+            <p className="diagnostic-count">
+              {diagnostics?.logicalPeerCount ?? 0} logical peer{diagnostics?.logicalPeerCount === 1 ? "" : "s"} · {diagnostics?.discovery.rememberedPeers ?? 0} remembered for revalidation.
+            </p>
+          </section>
           <form
             className="address-fallback"
             onSubmit={(event) => {
@@ -772,21 +882,38 @@ function SettingsPanel({
             <p>For private or overlay networks. LAN traffic is not encrypted.</p>
             {connectionError && <p className="settings-error" role="alert">{connectionError}</p>}
           </form>
-          <div className="diagnostic-peer-list">
+          <section className="diagnostic-section" aria-labelledby="diagnostic-peers">
+            <p className="diagnostic-section-label" id="diagnostic-peers">Peer diagnostics</p>
+            <div className="diagnostic-peer-list">
             {(diagnostics?.peers ?? []).map((peer) => (
               <div className="diagnostic-peer" key={peer.id}>
                 <strong>{peer.name}</strong>
-                <small>{peer.os} · protocol {peer.protocolVersion} · {peer.id}</small>
-                <small>{peer.selectedRoute ? `Selected ${peer.selectedRoute}` : "No route selected"}</small>
+                <small>{peer.os} · protocol v{peer.protocolVersion} · {peer.protocolCompatible ? "compatible" : "incompatible"} · {peer.id}</small>
+                <small>{peer.selectedRoute ? `Preferred ${peer.selectedRoute}` : "No preferred route"}{peer.lastSuccessfulRoute ? ` · last success ${peer.lastSuccessfulRoute.endpoint} (${formatLastSeen(peer.lastSuccessfulRoute.secondsAgo)})` : ""}</small>
                 {peer.endpoints.map((endpoint) => (
                   <span className="diagnostic-endpoint" key={`${peer.id}-${endpoint.address}`}>
-                    {endpoint.address} · {endpoint.reachability} · {endpoint.sources.join(", ") || "unknown source"} · {formatLastSeen(endpoint.lastSeenSecondsAgo)}
+                    {endpoint.address} · {endpoint.reachability} · {endpoint.routeClass} · {endpoint.sources.join(", ") || "unknown source"} · {formatLastSeen(endpoint.lastSeenSecondsAgo)}
+                  </span>
+                ))}
+                {peer.recentRouteFailures.map((failure, index) => (
+                  <span className="diagnostic-route-failure" key={`${peer.id}-failure-${failure.endpoint}-${index}`}>
+                    Failed {failure.endpoint} ({failure.routeClass}): {failure.reason} · {formatLastSeen(failure.secondsAgo)}
                   </span>
                 ))}
               </div>
             ))}
             {diagnostics && !diagnostics.peers.length && <p className="diagnostic-empty">No Drop peers are currently available.</p>}
-          </div>
+            </div>
+          </section>
+          <section className="diagnostic-section" aria-labelledby="diagnostic-logging">
+            <p className="diagnostic-section-label" id="diagnostic-logging">Logging</p>
+            <div className="diagnostic-grid">
+              <DiagnosticValue label="Storage" value={diagnostics?.logging.storageStatus ?? "starting"} />
+              <DiagnosticValue label="Entries" value={diagnostics ? String(diagnostics.logging.currentEntries) : "starting"} />
+            </div>
+            <p className="diagnostic-note">{diagnostics?.logging.retention ?? "Recent structured entries are included in exported reports."}</p>
+          </section>
+          <p className="diagnostic-privacy">Reports include device and endpoint diagnostics only. File contents, filenames, secrets, full receive paths, and Tailscale keys are excluded.</p>
         </div>
       </details>
       <section className="about-section" aria-labelledby="about-heading">
@@ -796,6 +923,24 @@ function SettingsPanel({
         <p className="about-credit">Made by Continental</p>
       </section>
       {!native && <p className="preview-caption">Preview only. Transfers run in the installed app.</p>}
+    </div>
+  );
+}
+
+function DiagnosticValue({
+  label,
+  value,
+  detail,
+}: {
+  label: string;
+  value: string;
+  detail?: string;
+}) {
+  return (
+    <div className="diagnostic-value">
+      <span>{label}</span>
+      <strong title={value}>{value}</strong>
+      {detail && <small title={detail}>{detail}</small>}
     </div>
   );
 }
@@ -828,6 +973,67 @@ function formatLastSeen(seconds: number) {
   if (seconds < 5) return "seen just now";
   if (seconds < 60) return `seen ${Math.round(seconds)}s ago`;
   return `seen ${Math.round(seconds / 60)}m ago`;
+}
+
+function diagnosticAvailability(available: boolean) {
+  return available ? "Available" : "Unavailable";
+}
+
+function previewDiagnosticsReport(diagnostics: RuntimeDiagnostics) {
+  const lines = [
+    "Drop diagnostics",
+    "================",
+    "",
+    "Application",
+    `Version: ${diagnostics.application.version}`,
+    `OS: ${diagnostics.application.os}`,
+    `Architecture: ${diagnostics.application.architecture}`,
+    `Protocol: v${diagnostics.application.protocolVersion}`,
+    "",
+    "Local Drop instance",
+    `Device UUID: ${diagnostics.local.deviceId}`,
+    `Device name: ${diagnostics.local.deviceName}`,
+    `Receive directory: ${diagnosticAvailability(diagnostics.local.receiveDirectoryAvailable)}`,
+    `Listener/service: ${diagnostics.local.serviceStatus}`,
+    `Service port: TCP/UDP ${diagnostics.local.servicePort}`,
+    `Transport: ${diagnostics.local.transport}`,
+    "",
+    "Discovery / connectivity",
+    `Logical peers: ${diagnostics.logicalPeerCount}`,
+    `mDNS: ${diagnostics.discovery.mdns.status}`,
+    `Local fallback: ${diagnostics.discovery.localFallback.status}`,
+    `Tailscale: ${diagnostics.discovery.tailscale.status}`,
+    "",
+    "Privacy: preview report; files and secrets are not included.",
+  ];
+  return lines.join("\n");
+}
+
+async function copyText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("Clipboard is unavailable.");
+}
+
+function downloadTextFile(filename: string, value: string) {
+  const blob = new Blob([value], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function DeviceIcon({ os }: { os: string }) { return os.toLowerCase().includes("linux") || os.toLowerCase().includes("desktop") ? <DesktopIcon /> : <LaptopIcon />; }
@@ -899,14 +1105,21 @@ function phaseLabel(phase: Transfer["phase"]) {
 
 function userFacingError(reason: unknown, fallback: string) {
   const message = typeof reason === "string" ? reason : reason instanceof Error ? reason.message : "";
-  if (
-    message.trim() &&
-    message.length <= 180 &&
-    ![...message].some((character) => character.charCodeAt(0) < 32)
-  ) {
-    return message.trim();
-  }
+  const normalized = message.trim();
+  if (isKnownUserMessage(normalized)) return normalized;
   return fallback;
+}
+
+function isKnownUserMessage(message: string) {
+  if (
+    !message ||
+    message.length > 180 ||
+    [...message].some((character) => character.charCodeAt(0) < 32) ||
+    /(?:\/Users\/|\/home\/|[A-Z]:\\\\|password|token|secret|os error|backtrace)/i.test(message)
+  ) {
+    return false;
+  }
+  return /^(Address lookup|Choose |Couldn't |Could not |Destination |Device |Drop |Enter |Finish |For safety|Incoming|Not enough|Only files|Receive |Settings |That |The port|The other|This device|Transfer |Your receive|Update )/.test(message);
 }
 
 const root = document.getElementById("root");

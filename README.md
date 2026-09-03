@@ -44,6 +44,12 @@ Discovery sources contribute endpoint observations to one backend registry:
 
 Every candidate must complete a bounded Drop identification handshake before an endpoint learned from the fallback, Tailscale, remembered, or manual sources is added. Endpoints with the same Drop UUID are merged; route choice is automatic and prefers a recently verified path, then direct local paths, overlay paths, and revalidated remembered paths. If a preferred endpoint fails, Drop makes short staggered attempts to other candidates.
 
+The secondary Connection diagnostics area in Settings can copy or export a
+plain-text support report with local service state, discovery sources, peer
+routes, recent route failures, and bounded structured logs. Reports exclude
+file contents, filenames, receive paths, credentials, Tailscale keys, and
+unrelated system information.
+
 v1 is intentionally IPv4-first. IPv6-only networks are not supported until the listener, discovery, and endpoint handling are made dual-stack together. VPN, virtual-machine, bridge, and other local IPv4 addresses can participate through normal discovery or remembered endpoints; Drop does not implement a VPN or a Tailscale control plane. A Headscale-operated tailnet works through the same local Tailscale client status interface.
 
 The transfer/identification listener binds TCP `39821` on local IPv4 interfaces. The conservative fallback uses UDP `39821` for a small TTL-1 broadcast exchange, and mDNS uses UDP port 5353. If the operating-system firewall prompts, allow Drop inbound TCP/UDP `39821` on trusted private/local networks and UDP 5353 multicast where local mDNS is desired. Drop does not modify firewall rules automatically. Do not expose the listener to the public internet: v1 has no Drop-level authenticated device identity, transport encryption, or replay protection.

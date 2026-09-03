@@ -1,8 +1,11 @@
 pub use crate::peer::{
-    DeviceIdentity, DiscoveryObservation, Endpoint, EndpointReachability, EndpointSource, Peer,
-    PeerDiagnosticsSnapshot, PeerRegistry, PeerSnapshot,
+    DeviceIdentity, DiscoveryObservation, Endpoint, EndpointSource, Peer, PeerDiagnosticsSnapshot,
+    PeerRegistry, PeerSnapshot,
 };
-use crate::platform;
+use crate::{
+    diagnostics::{self, LogCategory, LogLevel, SupportLogger},
+    platform,
+};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -312,11 +315,43 @@ pub struct StartupSnapshot {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeDiagnostics {
-    pub transport: String,
-    pub listener_port: u16,
-    pub receive_directory_available: bool,
+    pub application: ApplicationDiagnostics,
+    pub local: LocalDropDiagnostics,
     pub discovery: DiscoveryDiagnostics,
+    pub logical_peer_count: usize,
+    pub logging: LoggingDiagnostics,
     pub peers: Vec<PeerDiagnosticsSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplicationDiagnostics {
+    pub version: String,
+    pub os: String,
+    pub architecture: String,
+    pub protocol_version: u16,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalDropDiagnostics {
+    pub device_id: String,
+    pub device_name: String,
+    pub receive_directory_available: bool,
+    pub service_status: String,
+    pub service_detail: Option<String>,
+    pub service_port: u16,
+    pub transport: String,
+    pub interface_status: String,
+    pub transport_limitations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoggingDiagnostics {
+    pub storage_status: String,
+    pub retention: String,
+    pub current_entries: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -365,6 +400,8 @@ pub struct AppState {
     transfer_changed: Notify,
     connection_slots: Arc<Semaphore>,
     shutdown: Arc<Cancellation>,
+    listener_status: RwLock<DiscoverySourceDiagnostics>,
+    logger: Arc<SupportLogger>,
     listener_port: u16,
     #[cfg(any(test, feature = "integration-tests"))]
     faults: Arc<FaultPlan>,
@@ -413,11 +450,15 @@ impl Cancellation {
 
 impl AppState {
     pub fn load(listener_port: u16) -> Self {
+        let logger = Arc::new(SupportLogger::persistent(platform::log_path()));
         let fallback_name = default_device_name();
         let fallback_destination = default_destination();
         if let Err(error) = fs::create_dir_all(&fallback_destination) {
-            eprintln!(
-                "[dead-drop][settings] could not prepare the default receive folder: {error}"
+            logger.record(
+                LogLevel::Warn,
+                LogCategory::Filesystem,
+                "receive_directory_prepare_failed",
+                Some(&error.to_string()),
             );
         }
         let stored = load_persisted_settings()
@@ -445,7 +486,7 @@ impl AppState {
             .filter_map(remembered_peer_from_persisted)
             .collect();
 
-        let state = Self::new_with_remembered(
+        let state = Self::new_with_remembered_and_logger(
             DeviceIdentity {
                 id: stored.device_id,
                 name: stored_device_name.clone(),
@@ -458,10 +499,22 @@ impl AppState {
             },
             listener_port,
             remembered_peers,
+            logger,
         );
         if let Err(error) = state.persist() {
-            eprintln!("[dead-drop][settings] could not persist startup settings: {error}");
+            state.log(
+                LogLevel::Warn,
+                LogCategory::Settings,
+                "startup_settings_persist_failed",
+                Some(&error),
+            );
         }
+        state.log(
+            LogLevel::Info,
+            LogCategory::Startup,
+            "application_started",
+            Some("settings loaded"),
+        );
         state
     }
 
@@ -471,14 +524,37 @@ impl AppState {
         preferences: Preferences,
         listener_port: u16,
     ) -> Self {
-        Self::new_with_remembered(device, preferences, listener_port, Vec::new())
+        Self::new_with_remembered_and_logger(
+            device,
+            preferences,
+            listener_port,
+            Vec::new(),
+            Arc::new(SupportLogger::in_memory()),
+        )
     }
 
+    #[cfg(test)]
     fn new_with_remembered(
         device: DeviceIdentity,
         preferences: Preferences,
         listener_port: u16,
         remembered_peers: Vec<RememberedPeer>,
+    ) -> Self {
+        Self::new_with_remembered_and_logger(
+            device,
+            preferences,
+            listener_port,
+            remembered_peers,
+            Arc::new(SupportLogger::in_memory()),
+        )
+    }
+
+    fn new_with_remembered_and_logger(
+        device: DeviceIdentity,
+        preferences: Preferences,
+        listener_port: u16,
+        remembered_peers: Vec<RememberedPeer>,
+        logger: Arc<SupportLogger>,
     ) -> Self {
         Self {
             device: RwLock::new(device),
@@ -492,6 +568,11 @@ impl AppState {
             transfer_changed: Notify::new(),
             connection_slots: Arc::new(Semaphore::new(8)),
             shutdown: Arc::new(Cancellation::new()),
+            listener_status: RwLock::new(DiscoverySourceDiagnostics {
+                status: "starting".to_string(),
+                detail: None,
+            }),
+            logger,
             listener_port,
             #[cfg(any(test, feature = "integration-tests"))]
             faults: Arc::new(FaultPlan::new()),
@@ -581,7 +662,13 @@ impl AppState {
         if self.is_shutting_down() {
             return;
         }
-        eprintln!("[dead-drop][lifecycle] shutting down transfer and discovery services");
+        self.log(
+            LogLevel::Info,
+            LogCategory::Shutdown,
+            "application_shutdown_requested",
+            Some("transfer and discovery services"),
+        );
+        self.set_listener_status("stopping", None);
         self.shutdown.cancel();
         let cancellations = std::mem::take(&mut *self.cancellations.lock());
         for cancellation in cancellations.into_values() {
@@ -633,7 +720,12 @@ impl AppState {
         let path = Self::settings_path()
             .ok_or_else(|| "Could not determine an application settings directory.".to_string())?;
         persist_settings(&path, &value).map_err(|error| {
-            eprintln!("[dead-drop][settings] could not save preferences: {error}");
+            self.log(
+                LogLevel::Warn,
+                LogCategory::Settings,
+                "preferences_save_failed",
+                Some(&error),
+            );
             "Settings could not be saved.".to_string()
         })?;
         {
@@ -673,15 +765,38 @@ impl AppState {
         self.peers.write().apply_observation(observation)
     }
 
-    pub fn mark_endpoint_reachability(
+    pub(crate) fn record_route_success(&self, peer_id: &str, address: SocketAddr) -> bool {
+        let changed = self.peers.write().record_route_success(peer_id, address);
+        if changed {
+            self.log(
+                LogLevel::Info,
+                LogCategory::RouteSelection,
+                "route_connected",
+                Some(&format!("endpoint={address}")),
+            );
+        }
+        changed
+    }
+
+    pub(crate) fn record_route_failure(
         &self,
         peer_id: &str,
         address: SocketAddr,
-        reachability: EndpointReachability,
+        reason: &str,
     ) -> bool {
-        self.peers
+        let changed = self
+            .peers
             .write()
-            .mark_endpoint_reachability(peer_id, address, reachability)
+            .record_route_failure(peer_id, address, reason);
+        if changed {
+            self.log(
+                LogLevel::Warn,
+                LogCategory::RouteSelection,
+                "route_failed",
+                Some(&format!("endpoint={address} reason={reason}")),
+            );
+        }
+        changed
     }
 
     pub fn remove_endpoint_source(&self, source: &EndpointSource) -> bool {
@@ -771,7 +886,12 @@ impl AppState {
             }
         }
         if let Err(error) = self.persist() {
-            eprintln!("[dead-drop][settings] could not remember peer: {error}");
+            self.log(
+                LogLevel::Warn,
+                LogCategory::PeerRegistry,
+                "remembered_peer_persist_failed",
+                Some(&error),
+            );
         }
     }
 
@@ -788,13 +908,66 @@ impl AppState {
             "tailscale" => &mut diagnostics.tailscale,
             _ => return false,
         };
-        let detail = detail.map(str::to_string);
+        let detail = detail.map(diagnostics::redact_text);
         if target.status == status && target.detail == detail {
             return false;
         }
         target.status = status.to_string();
         target.detail = detail;
+        let detail_for_log = target.detail.clone();
+        drop(diagnostics);
+        let log_detail = detail_for_log
+            .as_deref()
+            .map(|detail| format!("source={source} status={status} detail={detail}"))
+            .unwrap_or_else(|| format!("source={source} status={status}"));
+        self.log(
+            LogLevel::Info,
+            LogCategory::Discovery,
+            "discovery_status_changed",
+            Some(&log_detail),
+        );
         true
+    }
+
+    pub(crate) fn set_listener_status(&self, status: &str, detail: Option<&str>) -> bool {
+        let mut listener = self.listener_status.write();
+        let detail = detail.map(diagnostics::redact_text);
+        if listener.status == status && listener.detail == detail {
+            return false;
+        }
+        listener.status = status.to_string();
+        listener.detail = detail;
+        let detail_for_log = listener.detail.clone();
+        drop(listener);
+        let log_detail = detail_for_log
+            .as_deref()
+            .map(|detail| format!("status={status} detail={detail}"))
+            .unwrap_or_else(|| format!("status={status}"));
+        self.log(
+            LogLevel::Info,
+            LogCategory::Connection,
+            "listener_status_changed",
+            Some(&log_detail),
+        );
+        true
+    }
+
+    pub(crate) fn logger(&self) -> Arc<SupportLogger> {
+        self.logger.clone()
+    }
+
+    pub(crate) fn log(
+        &self,
+        level: LogLevel,
+        category: LogCategory,
+        event: &str,
+        detail: Option<&str>,
+    ) {
+        self.logger.record(level, category, event, detail);
+    }
+
+    pub fn diagnostics_report(&self) -> String {
+        diagnostics::render_report(&self.runtime_diagnostics(), &self.logger)
     }
 
     pub fn add_pending_request(&self, id: String, sender: oneshot::Sender<bool>) {
@@ -828,7 +1001,12 @@ impl AppState {
             .cloned()
             .ok_or_else(|| "That transfer is no longer active.".to_string())?;
         token.cancel();
-        eprintln!("[dead-drop][transfer] cancellation requested for {id}");
+        self.log(
+            LogLevel::Info,
+            LogCategory::Transfer,
+            "transfer_cancellation_requested",
+            None,
+        );
         Ok(())
     }
 
@@ -846,19 +1024,54 @@ impl AppState {
     }
 
     pub fn runtime_diagnostics(&self) -> RuntimeDiagnostics {
+        let device = self.device();
         let preferences = self.preferences();
         let discovery_status = self.discovery_status.read().clone();
+        let listener_status = self.listener_status.read().clone();
+        let peer_diagnostics = self.peer_diagnostics();
         RuntimeDiagnostics {
-            transport: platform::TRANSPORT_NAME.to_string(),
-            listener_port: self.listener_port,
-            receive_directory_available: usable_destination(Path::new(&preferences.destination)),
+            application: ApplicationDiagnostics {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                os: device.os.clone(),
+                architecture: std::env::consts::ARCH.to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            local: LocalDropDiagnostics {
+                device_id: device.id,
+                device_name: device.name,
+                receive_directory_available: usable_destination(Path::new(
+                    &preferences.destination,
+                )),
+                service_status: listener_status.status,
+                service_detail: listener_status.detail,
+                service_port: self.listener_port,
+                transport: platform::TRANSPORT_NAME.to_string(),
+                interface_status: "IPv4 listener on local interfaces; addresses omitted"
+                    .to_string(),
+                transport_limitations: vec![
+                    "IPv4 only".to_string(),
+                    "LAN traffic is not encrypted".to_string(),
+                    "No public-internet relay or NAT traversal".to_string(),
+                ],
+            },
             discovery: DiscoveryDiagnostics {
                 mdns: discovery_status.mdns,
                 local_fallback: discovery_status.local_fallback,
                 tailscale: discovery_status.tailscale,
                 remembered_peers: self.remembered_peers.read().len(),
             },
-            peers: self.peer_diagnostics(),
+            logical_peer_count: peer_diagnostics.len(),
+            logging: LoggingDiagnostics {
+                storage_status: self.logger.storage_status().to_string(),
+                retention: format!(
+                    "up to {} entries in memory; {} rotated files of {} KiB",
+                    diagnostics::MAX_LOG_ENTRIES,
+                    diagnostics::MAX_ROTATED_LOG_FILES,
+                    diagnostics::MAX_LOG_FILE_BYTES / 1024
+                ),
+                current_entries: self.logger.current_entry_count(),
+            },
+            peers: peer_diagnostics,
         }
     }
 
@@ -1286,6 +1499,66 @@ mod tests {
         assert!(value.get("endpoint").is_none());
         assert!(value.get("endpointCandidates").is_none());
         assert!(value.get("serviceFullname").is_none());
+    }
+
+    #[test]
+    fn diagnostics_report_includes_support_context_without_private_paths_or_secrets() {
+        let state = test_state();
+        assert!(!state.set_discovery_status("unknown-source", "malformed", None));
+        state.set_discovery_status(
+            "mdns",
+            "malformed",
+            Some("untrusted response at /Users/alice/Library/Drop token=hunter2"),
+        );
+        state.set_listener_status(
+            "unavailable",
+            Some("permission denied at /Users/alice/Drop"),
+        );
+        state.set_discovery_status(
+            "tailscale",
+            "unavailable",
+            Some("status output contained token=hunter2"),
+        );
+        let peer_id = "22222222-2222-4222-8222-222222222222";
+        let source = EndpointSource::new("mdns", "ipv4", "service-key");
+        let endpoint = "192.168.1.40:39821".parse().unwrap();
+        state.apply_discovery_observation(DiscoveryObservation {
+            identity: DeviceIdentity {
+                id: peer_id.to_string(),
+                name: "Home Server".to_string(),
+                os: "Linux".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            source: source.clone(),
+            endpoints: vec![Endpoint::new(
+                endpoint,
+                source,
+                RouteClass::DirectLocal,
+                std::time::Instant::now(),
+            )],
+        });
+        state.record_route_failure(peer_id, endpoint, "connection refused secret=hunter2");
+        state.log(
+            LogLevel::Warn,
+            LogCategory::Errors,
+            "test_error",
+            Some("password=hunter2 /Users/alice/private.txt"),
+        );
+
+        let diagnostics = state.runtime_diagnostics();
+        assert_eq!(diagnostics.application.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(diagnostics.application.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(diagnostics.local.service_status, "unavailable");
+        assert_eq!(diagnostics.logical_peer_count, 1);
+        assert_eq!(diagnostics.peers[0].recent_route_failures.len(), 1);
+        let report = state.diagnostics_report();
+        assert!(report.contains("Application"));
+        assert!(report.contains("Logical peers: 1"));
+        assert!(report.contains("mDNS: malformed"));
+        assert!(report.contains("Tailscale: unavailable"));
+        assert!(!report.contains("hunter2"));
+        assert!(!report.contains("/Users/alice"));
+        assert!(!report.contains("service-key"));
     }
 
     #[test]
