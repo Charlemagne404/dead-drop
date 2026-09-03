@@ -38,3 +38,8 @@ proptest = "1"
 name = "transfer_integration"
 path = "tests/transfer_integration.rs"
 required-features = ["integration-tests"]
+
+[[test]]
+name = "chaos_integration"
+path = "tests/chaos_integration.rs"
+required-features = ["integration-tests"]

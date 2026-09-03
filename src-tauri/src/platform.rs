@@ -171,13 +171,16 @@ pub fn move_file_without_overwrite(source: &Path, destination: &Path) -> io::Res
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn move_file_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
-    if destination.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "destination already exists",
-        ));
+    // A check followed by rename is a TOCTOU window, and rename may replace
+    // an existing destination on Unix-like platforms. Hard-linking first is
+    // the portable no-replace primitive; both paths are in the receive
+    // directory, so they are expected to share a filesystem.
+    std::fs::hard_link(source, destination)?;
+    if let Err(error) = std::fs::remove_file(source) {
+        let _ = std::fs::remove_file(destination);
+        return Err(error);
     }
-    std::fs::rename(source, destination)
+    Ok(())
 }
 
 #[cfg(windows)]

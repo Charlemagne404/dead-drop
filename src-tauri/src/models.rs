@@ -29,6 +29,118 @@ const MAX_REMEMBERED_PEERS: usize = 64;
 const MAX_REMEMBERED_ENDPOINTS: usize = 8;
 const MAX_REMEMBERED_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 
+#[cfg(any(test, feature = "integration-tests"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FaultPoint {
+    SourceOpen,
+    SourceRead,
+    DestinationMetadata,
+    StageCreate,
+    StageWrite,
+    StageFlush,
+    Finalize,
+    Cleanup,
+}
+
+#[cfg(any(test, feature = "integration-tests"))]
+#[derive(Clone, Debug)]
+pub struct InjectedFailure {
+    pub kind: io::ErrorKind,
+    pub raw_os_error: Option<i32>,
+    pub message: String,
+}
+
+#[cfg(any(test, feature = "integration-tests"))]
+impl InjectedFailure {
+    pub fn new(kind: io::ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            raw_os_error: None,
+            message: message.into(),
+        }
+    }
+
+    pub fn with_raw_os_error(
+        kind: io::ErrorKind,
+        raw_os_error: i32,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            raw_os_error: Some(raw_os_error),
+            message: message.into(),
+        }
+    }
+
+    fn into_io_error(self) -> io::Error {
+        self.raw_os_error
+            .map(io::Error::from_raw_os_error)
+            .unwrap_or_else(|| io::Error::new(self.kind, self.message))
+    }
+}
+
+#[cfg(any(test, feature = "integration-tests"))]
+struct FaultRule {
+    point: FaultPoint,
+    call: Option<usize>,
+    failure: InjectedFailure,
+}
+
+/// Deterministic, per-peer failure injection used by the real-socket chaos
+/// harness. Rules are consumed once and can target a precise operation call.
+#[cfg(any(test, feature = "integration-tests"))]
+pub struct FaultPlan {
+    calls: Mutex<HashMap<FaultPoint, usize>>,
+    rules: Mutex<Vec<FaultRule>>,
+}
+
+#[cfg(any(test, feature = "integration-tests"))]
+impl FaultPlan {
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(HashMap::new()),
+            rules: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn fail_next(&self, point: FaultPoint, failure: InjectedFailure) {
+        self.rules.lock().push(FaultRule {
+            point,
+            call: None,
+            failure,
+        });
+    }
+
+    pub fn fail_on_call(&self, point: FaultPoint, call: usize, failure: InjectedFailure) {
+        self.rules.lock().push(FaultRule {
+            point,
+            call: Some(call.max(1)),
+            failure,
+        });
+    }
+
+    pub(crate) fn take(&self, point: FaultPoint) -> Option<io::Error> {
+        let call = {
+            let mut calls = self.calls.lock();
+            let entry = calls.entry(point).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        let mut rules = self.rules.lock();
+        let index = rules.iter().position(|rule| {
+            rule.point == point && (rule.call.is_none() || rule.call == Some(call))
+        })?;
+        Some(rules.remove(index).failure.into_io_error())
+    }
+}
+
+#[cfg(any(test, feature = "integration-tests"))]
+impl Default for FaultPlan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverySourceDiagnostics {
@@ -254,6 +366,8 @@ pub struct AppState {
     connection_slots: Arc<Semaphore>,
     shutdown: Arc<Cancellation>,
     listener_port: u16,
+    #[cfg(any(test, feature = "integration-tests"))]
+    faults: Arc<FaultPlan>,
 }
 
 pub struct Cancellation {
@@ -279,11 +393,21 @@ impl Cancellation {
     }
 
     pub async fn cancelled(&self) {
-        let notified = self.notify.notified();
-        if self.is_cancelled() {
-            return;
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register before checking the atomic flag. Without enable(), a
+            // notify_waiters call between the check and the await can be
+            // lost, leaving a cancellation waiter stuck forever.
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+            if self.is_cancelled() {
+                return;
+            }
         }
-        notified.await;
     }
 }
 
@@ -369,7 +493,26 @@ impl AppState {
             connection_slots: Arc::new(Semaphore::new(8)),
             shutdown: Arc::new(Cancellation::new()),
             listener_port,
+            #[cfg(any(test, feature = "integration-tests"))]
+            faults: Arc::new(FaultPlan::new()),
         }
+    }
+
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub(crate) fn new_with_faults(
+        device: DeviceIdentity,
+        preferences: Preferences,
+        listener_port: u16,
+        faults: Arc<FaultPlan>,
+    ) -> Self {
+        let mut state = Self::new(device, preferences, listener_port);
+        state.faults = faults;
+        state
+    }
+
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub(crate) fn take_fault(&self, point: FaultPoint) -> Option<io::Error> {
+        self.faults.take(point)
     }
 
     fn settings_path() -> Option<PathBuf> {
@@ -461,6 +604,8 @@ impl AppState {
     pub(crate) async fn wait_until_idle(&self) {
         loop {
             let notified = self.transfer_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.is_idle() {
                 return;
             }
