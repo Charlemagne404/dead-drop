@@ -1,3 +1,9 @@
+//! Bounded structured logging and redacted support-report generation.
+//!
+//! Diagnostics are deliberately separate from transfer and discovery policy:
+//! subsystems record events here, while the frontend only receives the safe
+//! report DTO and runtime snapshot.
+
 use crate::models::RuntimeDiagnostics;
 use parking_lot::Mutex;
 use serde::Serialize;

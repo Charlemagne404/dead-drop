@@ -21,11 +21,17 @@ The normal workflow is intended to be identical on all three first-class targets
 ## Run it from source
 
 ```sh
-npm ci
+npm run setup
 npm run tauri dev
 ```
 
 The native app advertises `_dead-drop._tcp.local.` over mDNS/DNS-SD, discovers peers running the same protocol version, and listens on the fixed Drop service port `39821` for both identification and transfers. The service type is retained as a compatibility identifier from the earlier release.
+
+For the source map, subsystem boundaries, and startup sequence, see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The canonical local command and
+test matrix is in [docs/TESTING.md](docs/TESTING.md); architectural decisions
+that explain identity, endpoint merging, staging, and compatibility are in
+[docs/DECISIONS.md](docs/DECISIONS.md).
 
 ## Reachability and firewall behavior
 
@@ -150,39 +156,14 @@ There is no transport encryption, trusted-device authentication, replay protecti
 
 Inter is bundled from `@fontsource/inter` under the SIL Open Font License 1.1; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Automated local integration tests
+## Testing and benchmarks
 
-The `integration-tests` feature exposes a test-only peer harness. Each test peer has its own device identity, loopback TCP listener, receive directory, transfer state, and temporary filesystem tree. Discovery is injected; the handshake, request decision, framed transfer, checksum verification, staging, finalization, cancellation, and shutdown paths use the production implementation.
-
-Run the normal local scenarios serially to keep progress-barrier and allocation measurements deterministic:
-
-```sh
-cargo test --manifest-path src-tauri/Cargo.toml \
-  --features integration-tests --test transfer_integration -- --test-threads=1
-```
-
-The repeated 50-transfer stress pass is intentionally ignored in the normal run:
-
-```sh
-cargo test --manifest-path src-tauri/Cargo.toml \
-  --features integration-tests --test transfer_integration \
-  -- --ignored --test-threads=1
-```
-
-The deterministic chaos suite adds reusable fault plans, protocol-aware TCP
-shaping, lifecycle barriers, registry-source simulation, and an opt-in seeded
-randomized pass:
-
-```sh
-cargo test --manifest-path src-tauri/Cargo.toml \
-  --features integration-tests --test chaos_integration -- --test-threads=1
-cargo test --manifest-path src-tauri/Cargo.toml \
-  --features integration-tests --test chaos_integration \
-  -- --ignored --test-threads=1
-```
-
-The randomized pass prints and preserves seed `0xd05eed20260903` for
-reproduction.
+The test-only peer harness covers real loopback sockets, discovery injection,
+request decisions, framed transfers, checksum verification, staging,
+finalization, cancellation, and shutdown. The normal, chaos, stress, release,
+native, and performance command matrix is maintained in
+[docs/TESTING.md](docs/TESTING.md). Performance metric definitions remain in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## Performance benchmark
 
@@ -205,13 +186,12 @@ output. `DROP_PERF_LARGE_BYTES`, `DROP_PERF_SMALL_FILE_COUNT`,
 ## Validate
 
 ```sh
-npm run build
-cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
-npm run tauri -- build --ci --no-sign --bundles app,dmg
-git diff --check
+npm run verify
 ```
 
-The last packaging command is for a macOS host; use the platform-specific command above on Windows or Linux. Local builds and cross-compilation are not substitutes for installing the artifacts and completing a Windows ↔ macOS ↔ Linux transfer test. Actual native testing is still required for firewall prompts, Bonjour/Avahi interoperability on ordinary LANs, Windows path/locking behavior, macOS app lifecycle and Retina rendering, Linux Wayland/X11 file dialogs and scaling, large files, removable destinations, and network sleep/wake transitions.
+Use `npm run package` for the existing release-preparation flow and the
+platform-specific native packaging commands in [docs/TESTING.md](docs/TESTING.md)
+for `.app`, NSIS/MSI, `.deb`, and AppImage output. Local builds are not a
+substitute for installing artifacts and completing a Windows ↔ macOS ↔ Linux
+transfer test; native firewall, drag/drop, file-dialog, sleep/wake, and
+removable-destination behavior still require platform testing.

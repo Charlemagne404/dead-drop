@@ -1,15 +1,19 @@
+//! Discovery workers that turn source-specific observations into peer updates.
+//!
+//! mDNS, local IPv4 fallback, Tailscale status, and remembered endpoints all
+//! feed the same `PeerRegistry`; source workers do not own transfer routing.
+
 use crate::{
+    config::{DROP_SERVICE_PORT, PROTOCOL_VERSION},
     connectivity::{
-        connect_and_identify, is_allowed_ipv4, ConnectivityError, DROP_SERVICE_PORT,
-        MAX_DISCOVERY_PROBES,
+        connect_and_identify, is_allowed_ipv4, ConnectivityError, MAX_DISCOVERY_PROBES,
     },
     diagnostics::{LogCategory, LogLevel},
-    models::{
-        AppState, Cancellation, DeviceIdentity, RememberedEndpointCandidate, PROTOCOL_VERSION,
-    },
+    events::{CONNECTIVITY_DIAGNOSTICS, DISCOVERY_STATUS, PEERS_UPDATED},
+    models::{AppState, Cancellation, RememberedEndpointCandidate},
     peer::{
-        DiscoveryObservation, DiscoverySource, Endpoint, EndpointReachability, EndpointSource,
-        RouteClass,
+        DeviceIdentity, DiscoveryObservation, DiscoverySource, Endpoint, EndpointReachability,
+        EndpointSource, RouteClass,
     },
     protocol::validate_device,
 };
@@ -412,7 +416,7 @@ fn bounded_property(value: Option<&str>, fallback: &str, maximum: usize) -> Stri
 }
 
 pub(crate) fn emit_state(app: &AppHandle, state: &AppState) {
-    if let Err(error) = app.emit("peers-updated", state.peers()) {
+    if let Err(error) = app.emit(PEERS_UPDATED, state.peers()) {
         state.log(
             LogLevel::Warn,
             LogCategory::Errors,
@@ -420,7 +424,7 @@ pub(crate) fn emit_state(app: &AppHandle, state: &AppState) {
             Some(&error.to_string()),
         );
     }
-    if let Err(error) = app.emit("connectivity-diagnostics", state.runtime_diagnostics()) {
+    if let Err(error) = app.emit(CONNECTIVITY_DIAGNOSTICS, state.runtime_diagnostics()) {
         state.log(
             LogLevel::Warn,
             LogCategory::Errors,
@@ -438,7 +442,7 @@ fn report_failure(state: &AppState, app: &AppHandle, detail: &str) {
         Some(detail),
     );
     let _ = app.emit(
-        "discovery-status",
+        DISCOVERY_STATUS,
         "Nearby device discovery is unavailable. Check local network access and UDP port 5353.",
     );
 }

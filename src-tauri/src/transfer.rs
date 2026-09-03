@@ -1,15 +1,18 @@
+//! Transfer admission, lifecycle orchestration, and framed byte streaming.
+//!
+//! Protocol sequencing and cancellation stay here; destination naming,
+//! staging, no-replace finalization, and rollback are delegated to
+//! `transfer_files`.
+
 use crate::{
+    config::{MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES, PROTOCOL_VERSION, TRANSFER_CHUNK_SIZE},
     connectivity::{
         connect_and_identify, ConnectivityError, IdentifiedConnection, IDENTIFICATION_TIMEOUT,
         MAX_ROUTE_ATTEMPTS, ROUTE_CONNECT_TIMEOUT, ROUTE_STAGGER,
     },
-    diagnostics::{LogCategory, LogLevel, SupportLogger},
-    models::{
-        AppState, Cancellation, DeviceIdentity, Endpoint, IncomingTransfer, Peer,
-        RuntimeDiagnostics, TransferFile, TransferLifecycle, TransferPhase, TransferSnapshot,
-        MAX_FILENAME_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES,
-    },
-    platform,
+    diagnostics::{LogCategory, LogLevel},
+    models::{AppState, Cancellation, IncomingTransfer, TransferFile, TransferPhase},
+    peer::{same_device_id, DeviceIdentity, Endpoint, Peer},
     protocol::{
         portable_file_name, read_frame, read_identification, validate_transfer_request,
         write_control, write_data, write_identification, ControlMessage, Frame, ProtocolError,
@@ -24,7 +27,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use thiserror::Error;
 use tokio::{
     fs::{self, OpenOptions},
@@ -35,21 +38,28 @@ use tokio::{
     task::JoinSet,
     time::{sleep, sleep_until, timeout},
 };
-use uuid::Uuid;
+
+pub(crate) use crate::transfer_events::{EventSink, TauriEventSink, TransferTracker};
+pub(crate) use crate::transfer_files::{
+    available_destination_path, cleanup_staged, destination_error, finalize_staged_file, path_key,
+    rollback_finalized, temporary_staging_path, StagedFile,
+};
+#[cfg(test)]
+pub(crate) use crate::{
+    config::MAX_FILENAME_BYTES,
+    transfer_files::{collision_name, MAX_COLLISION_ATTEMPTS},
+};
 
 #[cfg(any(test, feature = "integration-tests"))]
 use crate::models::FaultPoint;
 
-const CHUNK_SIZE: usize = 96 * 1024;
 const DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(45);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(45);
 const CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
-const MAX_COLLISION_ATTEMPTS: u32 = 100_000;
 
 #[derive(Debug, Clone, Error)]
-enum TransferError {
+pub(crate) enum TransferError {
     #[error("transfer cancelled locally")]
     Canceled,
     #[error("transfer cancelled by the other device")]
@@ -87,7 +97,7 @@ enum TransferError {
 }
 
 impl TransferError {
-    fn user_message(&self) -> String {
+    pub(crate) fn user_message(&self) -> String {
         match self {
             Self::Canceled | Self::RemoteCanceled => "Transfer was cancelled.".to_string(),
             Self::ShuttingDown => "Drop is closing.".to_string(),
@@ -115,7 +125,7 @@ impl TransferError {
         }
     }
 
-    fn diagnostic_message(&self) -> String {
+    pub(crate) fn diagnostic_message(&self) -> String {
         match self {
             Self::Canceled => "transfer cancelled locally".to_string(),
             Self::RemoteCanceled => "transfer cancelled by peer".to_string(),
@@ -136,7 +146,7 @@ impl TransferError {
         }
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         matches!(
             self,
             Self::Canceled | Self::RemoteCanceled | Self::ShuttingDown
@@ -153,218 +163,6 @@ struct PreparedCandidate {
     source: PathBuf,
     name: String,
     size: u64,
-}
-
-struct StagedFile {
-    name: String,
-    temporary: PathBuf,
-    final_path: PathBuf,
-}
-
-pub(crate) trait EventSink: Send + Sync {
-    fn emit_transfer_update(&self, snapshot: &TransferSnapshot) -> Result<(), String>;
-    fn emit_incoming_transfer(&self, transfer: &IncomingTransfer) -> Result<(), String>;
-
-    fn record_log(
-        &self,
-        _level: LogLevel,
-        _category: LogCategory,
-        _event: &str,
-        _detail: Option<&str>,
-    ) {
-    }
-
-    fn emit_connectivity_diagnostics(
-        &self,
-        _diagnostics: &RuntimeDiagnostics,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-struct TauriEventSink {
-    app: AppHandle,
-    logger: Arc<SupportLogger>,
-}
-
-impl EventSink for TauriEventSink {
-    fn emit_transfer_update(&self, snapshot: &TransferSnapshot) -> Result<(), String> {
-        let result = self
-            .app
-            .emit("transfer-update", snapshot)
-            .map_err(|error| error.to_string());
-        if let Err(error) = &result {
-            self.record_log(
-                LogLevel::Warn,
-                LogCategory::Errors,
-                "transfer_update_emit_failed",
-                Some(error),
-            );
-        }
-        result
-    }
-
-    fn emit_incoming_transfer(&self, transfer: &IncomingTransfer) -> Result<(), String> {
-        let result = self
-            .app
-            .emit("incoming-transfer", transfer)
-            .map_err(|error| error.to_string());
-        if let Err(error) = &result {
-            self.record_log(
-                LogLevel::Warn,
-                LogCategory::Errors,
-                "incoming_update_emit_failed",
-                Some(error),
-            );
-        }
-        result
-    }
-
-    fn record_log(
-        &self,
-        level: LogLevel,
-        category: LogCategory,
-        event: &str,
-        detail: Option<&str>,
-    ) {
-        self.logger.record(level, category, event, detail);
-    }
-
-    fn emit_connectivity_diagnostics(
-        &self,
-        diagnostics: &RuntimeDiagnostics,
-    ) -> Result<(), String> {
-        let result = self
-            .app
-            .emit("connectivity-diagnostics", diagnostics)
-            .map_err(|error| error.to_string());
-        if let Err(error) = &result {
-            self.record_log(
-                LogLevel::Warn,
-                LogCategory::Errors,
-                "diagnostics_update_emit_failed",
-                Some(error),
-            );
-        }
-        result
-    }
-}
-
-struct TransferTracker {
-    events: Arc<dyn EventSink>,
-    lifecycle: TransferLifecycle,
-    snapshot: TransferSnapshot,
-    last_progress_emit: Option<Instant>,
-}
-
-impl TransferTracker {
-    fn new(
-        events: Arc<dyn EventSink>,
-        id: &str,
-        direction: &str,
-        phase: TransferPhase,
-        device_name: &str,
-    ) -> Self {
-        Self {
-            events,
-            lifecycle: TransferLifecycle::new(phase),
-            snapshot: TransferSnapshot {
-                id: id.to_string(),
-                direction: direction.to_string(),
-                phase,
-                device_name: device_name.to_string(),
-                files: Vec::new(),
-                total_bytes: 0,
-                transferred_bytes: 0,
-                bytes_per_second: 0,
-                eta_seconds: None,
-                message: None,
-            },
-            last_progress_emit: None,
-        }
-    }
-
-    fn emit(&self) {
-        if let Err(error) = self.events.emit_transfer_update(&self.snapshot) {
-            self.events.record_log(
-                LogLevel::Warn,
-                LogCategory::Errors,
-                "transfer_update_failed",
-                Some(&error),
-            );
-        }
-    }
-
-    fn set_files(&mut self, files: Vec<TransferFile>, total_bytes: u64) {
-        self.snapshot.files = files;
-        self.snapshot.total_bytes = total_bytes;
-    }
-
-    fn transition(&mut self, next: TransferPhase, message: Option<String>) {
-        if self.lifecycle.phase() == next {
-            self.snapshot.message = message;
-            self.emit();
-            return;
-        }
-        if let Err(previous) = self.lifecycle.transition(next) {
-            self.events.record_log(
-                LogLevel::Warn,
-                LogCategory::Errors,
-                "invalid_transfer_transition",
-                Some(&format!("from={previous:?} to={next:?}")),
-            );
-            return;
-        }
-        self.snapshot.phase = next;
-        self.snapshot.message = message;
-        self.emit();
-    }
-
-    fn progress(&mut self, transferred_bytes: u64, started_at: Instant, force: bool) {
-        let now = Instant::now();
-        if !force
-            && self
-                .last_progress_emit
-                .map(|last| now.saturating_duration_since(last) < PROGRESS_INTERVAL)
-                .unwrap_or(false)
-        {
-            return;
-        }
-        let transferred_bytes = self
-            .snapshot
-            .transferred_bytes
-            .max(transferred_bytes)
-            .min(self.snapshot.total_bytes);
-        let bytes_per_second = speed_for(transferred_bytes, started_at);
-        let eta_seconds = if bytes_per_second > 0 && self.snapshot.total_bytes > transferred_bytes {
-            Some((self.snapshot.total_bytes - transferred_bytes).div_ceil(bytes_per_second))
-        } else {
-            None
-        };
-        if force
-            && self.snapshot.transferred_bytes == transferred_bytes
-            && self.snapshot.eta_seconds == eta_seconds
-        {
-            return;
-        }
-        self.snapshot.transferred_bytes = transferred_bytes;
-        self.snapshot.bytes_per_second = bytes_per_second;
-        self.snapshot.eta_seconds = eta_seconds;
-        self.last_progress_emit = Some(now);
-        self.emit();
-    }
-
-    fn finish_error(&mut self, error: &TransferError) {
-        if self.lifecycle.phase().is_terminal() {
-            return;
-        }
-        let phase = if error.is_cancelled() {
-            TransferPhase::Canceled
-        } else {
-            TransferPhase::Failed
-        };
-        self.transition(phase, Some(error.user_message()));
-    }
 }
 
 pub fn start_listener(std_listener: StdTcpListener, state: Arc<AppState>, app: AppHandle) {
@@ -701,7 +499,7 @@ async fn send_files(
                     name: file.wire.name.clone(),
                     detail: error.to_string(),
                 })?;
-            let mut buffer = vec![0_u8; CHUNK_SIZE];
+            let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
             loop {
                 check_cancelled(cancellation, shutdown)?;
                 #[cfg(any(test, feature = "integration-tests"))]
@@ -851,7 +649,7 @@ async fn handle_incoming(
         ControlMessage::Hello {
             protocol_version,
             device,
-        } if protocol_version == crate::models::PROTOCOL_VERSION => device,
+        } if protocol_version == PROTOCOL_VERSION => device,
         ControlMessage::Hello { .. } => {
             send_protocol_error(&mut writer, "Incompatible Drop version.").await;
             return Err(TransferError::IncompatibleVersion);
@@ -881,11 +679,7 @@ async fn handle_incoming(
         LogLevel::Info,
         LogCategory::Connection,
         "protocol_negotiated",
-        Some(&format!(
-            "version={} peer={}",
-            crate::models::PROTOCOL_VERSION,
-            sender.id
-        )),
+        Some(&format!("version={} peer={}", PROTOCOL_VERSION, sender.id)),
     );
     let request = match read_control_with_timeout(
         &mut reader,
@@ -1501,7 +1295,7 @@ fn checksum_file(
         detail: error.to_string(),
     })?;
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; CHUNK_SIZE];
+    let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
     loop {
         if cancellation.is_cancelled() {
             return Err(TransferError::Canceled);
@@ -1528,208 +1322,6 @@ fn checksum_file(
 
 fn digest_matches(expected: &str, actual: &str) -> bool {
     expected.eq_ignore_ascii_case(actual)
-}
-
-fn temporary_staging_path(directory: &Path, transfer_id: &str, index: usize) -> PathBuf {
-    let transfer_component = Uuid::parse_str(transfer_id)
-        .map(|id| id.to_string())
-        .unwrap_or_else(|_| "invalid".to_string());
-    directory.join(format!(".dead-drop-{transfer_component}-{index}.part"))
-}
-
-fn available_destination_path(
-    directory: &Path,
-    name: &str,
-    used_names: &mut HashSet<String>,
-) -> Result<PathBuf, TransferError> {
-    let source = Path::new(name);
-    let stem = source
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or(name);
-    let extension = source.extension().and_then(|value| value.to_str());
-    for index in 0..=MAX_COLLISION_ATTEMPTS {
-        let candidate_name = match (index, extension) {
-            (0, _) => name.to_string(),
-            (_, Some(extension)) => collision_name(stem, extension, index),
-            (_, None) => collision_name(stem, "", index),
-        };
-        let candidate = directory.join(candidate_name);
-        let key = path_key(&candidate);
-        if !candidate.exists() && used_names.insert(key) {
-            return Ok(candidate);
-        }
-    }
-    Err(TransferError::Destination {
-        detail: "too many duplicate file names".to_string(),
-    })
-}
-
-fn collision_name(stem: &str, extension: &str, index: u32) -> String {
-    let suffix = format!(" ({index})");
-    let extension = extension.strip_prefix('.').unwrap_or(extension);
-    if extension.is_empty() {
-        let mut truncated_stem = stem.to_string();
-        truncate_utf8(
-            &mut truncated_stem,
-            MAX_FILENAME_BYTES.saturating_sub(suffix.len()),
-        );
-        return format!("{truncated_stem}{suffix}");
-    }
-
-    let extension_budget = MAX_FILENAME_BYTES
-        .saturating_sub(suffix.len())
-        .saturating_sub(1);
-    let extension = truncate_utf8_copy(extension, extension_budget);
-    if extension.is_empty() {
-        let mut truncated_stem = stem.to_string();
-        truncate_utf8(
-            &mut truncated_stem,
-            MAX_FILENAME_BYTES.saturating_sub(suffix.len()),
-        );
-        return format!("{truncated_stem}{suffix}");
-    }
-    let stem_budget = MAX_FILENAME_BYTES
-        .saturating_sub(suffix.len())
-        .saturating_sub(extension.len())
-        .saturating_sub(1);
-    let mut truncated_stem = stem.to_string();
-    truncate_utf8(&mut truncated_stem, stem_budget);
-    format!("{truncated_stem}{suffix}.{extension}")
-}
-
-fn truncate_utf8(value: &mut String, maximum_bytes: usize) {
-    while value.len() > maximum_bytes {
-        value.pop();
-    }
-}
-
-fn truncate_utf8_copy(value: &str, maximum_bytes: usize) -> String {
-    let mut copy = value.to_string();
-    truncate_utf8(&mut copy, maximum_bytes);
-    copy
-}
-
-fn path_key(path: &Path) -> String {
-    use unicode_normalization::UnicodeNormalization;
-
-    let value: String = path.to_string_lossy().nfc().collect();
-    if platform::default_case_insensitive_filesystem() {
-        value.to_lowercase()
-    } else {
-        value
-    }
-}
-
-async fn finalize_staged_file(
-    staged: &mut StagedFile,
-    directory: &Path,
-    used_names: &mut HashSet<String>,
-) -> Result<(), TransferError> {
-    let mut final_path = staged.final_path.clone();
-    for index in 0..=MAX_COLLISION_ATTEMPTS {
-        match move_staged_file(&staged.temporary, &final_path).await {
-            Ok(()) => {
-                staged.final_path = final_path;
-                return Ok(());
-            }
-            Err(error) if is_already_exists(&error) => {
-                if index == MAX_COLLISION_ATTEMPTS {
-                    break;
-                }
-                final_path = available_destination_path(directory, &staged.name, used_names)?;
-            }
-            Err(error) => return Err(destination_error(error)),
-        }
-    }
-    Err(TransferError::Destination {
-        detail: "could not reserve a unique destination name".to_string(),
-    })
-}
-
-async fn move_staged_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    match platform::move_file_without_overwrite(source, destination) {
-        Ok(()) => Ok(()),
-        Err(error) if can_fallback_to_hard_link(&error) => {
-            fs::hard_link(source, destination).await?;
-            if let Err(remove_error) = fs::remove_file(source).await {
-                // Do not report a successful finalization while the staging
-                // file still exists. The destination was created by this
-                // operation, so remove it before returning the failure and
-                // let the batch rollback path handle any remaining files.
-                if let Err(cleanup_error) = fs::remove_file(destination).await {
-                    // The caller logs the bounded destination failure. Do not
-                    // include paths or raw filesystem text in the transfer UI.
-                    let _ = cleanup_error;
-                }
-                return Err(remove_error);
-            }
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn is_already_exists(error: &std::io::Error) -> bool {
-    error.kind() == ErrorKind::AlreadyExists
-        || matches!(error.raw_os_error(), Some(17) | Some(80) | Some(183))
-}
-
-fn can_fallback_to_hard_link(error: &std::io::Error) -> bool {
-    error.kind() == ErrorKind::Unsupported
-        || matches!(
-            error.raw_os_error(),
-            Some(1) | Some(22) | Some(38) | Some(45) | Some(50) | Some(87) | Some(95) | Some(524)
-        )
-}
-
-async fn cleanup_staged(staged: &[StagedFile], state: &AppState) {
-    #[cfg(not(any(test, feature = "integration-tests")))]
-    let _ = state;
-    for file in staged {
-        for attempt in 0..3 {
-            let result = {
-                #[cfg(any(test, feature = "integration-tests"))]
-                if let Some(error) = state.take_fault(FaultPoint::Cleanup) {
-                    Err(error)
-                } else {
-                    fs::remove_file(&file.temporary).await
-                }
-                #[cfg(not(any(test, feature = "integration-tests")))]
-                {
-                    fs::remove_file(&file.temporary).await
-                }
-            };
-            match result {
-                Ok(()) => break,
-                Err(error) if error.kind() == ErrorKind::NotFound => break,
-                Err(error) if attempt == 2 => {
-                    state.log(
-                        LogLevel::Warn,
-                        LogCategory::Filesystem,
-                        "staged_file_cleanup_failed",
-                        Some(&error.to_string()),
-                    );
-                }
-                Err(_) => tokio::task::yield_now().await,
-            }
-        }
-    }
-}
-
-async fn rollback_finalized(finalized: &[PathBuf], state: &AppState) {
-    for path in finalized.iter().rev() {
-        if let Err(error) = fs::remove_file(path).await {
-            if error.kind() != ErrorKind::NotFound {
-                state.log(
-                    LogLevel::Warn,
-                    LogCategory::Filesystem,
-                    "finalized_file_rollback_failed",
-                    Some(&error.to_string()),
-                );
-            }
-        }
-    }
 }
 
 async fn finish_incoming_error(
@@ -2322,32 +1914,13 @@ fn rejection_message(reason: Option<&str>) -> String {
     }
 }
 
-fn same_device_id(left: &str, right: &str) -> bool {
-    Uuid::parse_str(left).ok() == Uuid::parse_str(right).ok()
-}
-
-fn destination_error(error: std::io::Error) -> TransferError {
-    if matches!(error.raw_os_error(), Some(28) | Some(39) | Some(112)) {
-        TransferError::DiskFull
-    } else {
-        TransferError::Destination {
-            detail: error.to_string(),
-        }
-    }
-}
-
-fn speed_for(transferred: u64, started_at: Instant) -> u64 {
-    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
-    (transferred as f64 / elapsed) as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        models::PROTOCOL_VERSION,
         peer::{Endpoint, EndpointSource, RouteClass},
         test_support::{state_for_tests, RecordingEventSink},
+        PROTOCOL_VERSION,
     };
     use proptest::prelude::*;
     use std::{io::Write, net::Ipv4Addr};

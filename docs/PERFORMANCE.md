@@ -1,5 +1,8 @@
 # Drop performance benchmark
 
+The command/test-layer map is in [`TESTING.md`](TESTING.md); this document
+defines benchmark cases, controls, and interpretation.
+
 `npm run perf` is the local comparison command for transfer and peer-registry
 performance. It builds the feature-gated `performance_peer` helper in the
 optimized Rust profile, creates all inputs at runtime, and removes them when

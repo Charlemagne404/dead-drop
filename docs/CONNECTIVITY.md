@@ -1,5 +1,9 @@
 # Drop connectivity architecture
 
+For the complete startup and subsystem map, see
+[`ARCHITECTURE.md`](ARCHITECTURE.md). This document stays focused on endpoint
+discovery, reachability, and firewall behavior.
+
 Drop has one product concept: a reachable Drop device. The user chooses the
 device and files; the networking layer chooses an endpoint.
 

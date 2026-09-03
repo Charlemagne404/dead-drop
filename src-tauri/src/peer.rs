@@ -1,4 +1,10 @@
-use crate::routing;
+//! Stable peer identity, source-scoped endpoints, and registry reconciliation.
+//!
+//! A `Peer` is the logical device model. Discovery sources contribute endpoint
+//! observations; routing ranks the reconciled endpoints without changing the
+//! identity model.
+
+use crate::{config::PROTOCOL_VERSION, routing};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -17,6 +23,11 @@ pub struct DeviceIdentity {
     pub name: String,
     pub os: String,
     pub protocol_version: u16,
+}
+
+/// Compare UUID identities without treating textual formatting as identity.
+pub(crate) fn same_device_id(left: &str, right: &str) -> bool {
+    Uuid::parse_str(left).ok() == Uuid::parse_str(right).ok()
 }
 
 /// Route classes describe how an endpoint was learned without becoming a
@@ -387,7 +398,7 @@ impl PeerRegistry {
                 name: peer.name.clone(),
                 os: peer.os.clone(),
                 protocol_version: peer.protocol_version,
-                protocol_compatible: peer.protocol_version == crate::models::PROTOCOL_VERSION,
+                protocol_compatible: peer.protocol_version == PROTOCOL_VERSION,
                 selected_route: routing::preferred_endpoint(&peer.endpoints)
                     .map(|endpoint| endpoint.address.to_string()),
                 endpoints: peer

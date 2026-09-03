@@ -1,6 +1,8 @@
+mod config;
 mod connectivity;
 mod diagnostics;
 mod discovery;
+mod events;
 mod models;
 mod peer;
 mod platform;
@@ -9,9 +11,13 @@ mod routing;
 #[cfg(any(test, feature = "integration-tests"))]
 pub mod test_support;
 mod transfer;
+mod transfer_events;
+mod transfer_files;
 
+use config::{DROP_SERVICE_PORT, MAX_TRANSFER_FILES, PROTOCOL_VERSION};
 use diagnostics::{LogCategory, LogLevel, SupportLogger};
-use models::{AppState, PeerSnapshot, Preferences, PreferencesDraft, StartupSnapshot};
+use models::{AppState, Cancellation, Preferences, PreferencesDraft, StartupSnapshot};
+use peer::PeerSnapshot;
 use std::{error::Error, net::TcpListener as StdTcpListener, sync::Arc};
 use tauri::{Emitter, State};
 
@@ -55,16 +61,16 @@ async fn send_files(
     if !peer.is_online() {
         return Err("Device went offline.".to_string());
     }
-    if peer.protocol_version != models::PROTOCOL_VERSION {
+    if peer.protocol_version != PROTOCOL_VERSION {
         return Err("That device uses a different Drop protocol version.".to_string());
     }
     if paths.is_empty() {
         return Err("Choose at least one file to send.".to_string());
     }
-    if paths.len() > models::MAX_TRANSFER_FILES {
+    if paths.len() > MAX_TRANSFER_FILES {
         return Err(format!(
             "Choose no more than {} files at a time.",
-            models::MAX_TRANSFER_FILES
+            MAX_TRANSFER_FILES
         ));
     }
     let transfer_id = uuid::Uuid::new_v4().to_string();
@@ -101,7 +107,7 @@ async fn connect_by_address(
     };
     let local = state.device();
     let shutdown = state.shutdown_token();
-    let cancellation = models::Cancellation::new();
+    let cancellation = Cancellation::new();
     let mut last_error = None;
     for endpoint in endpoints {
         match connectivity::connect_and_identify(
@@ -134,8 +140,11 @@ async fn connect_by_address(
                     .into_iter()
                     .find(|peer| peer.id == peer_id)
                     .ok_or_else(|| "Couldn't add that device.".to_string())?;
-                let _ = app.emit("peers-updated", state.peers());
-                let _ = app.emit("connectivity-diagnostics", state.runtime_diagnostics());
+                let _ = app.emit(events::PEERS_UPDATED, state.peers());
+                let _ = app.emit(
+                    events::CONNECTIVITY_DIAGNOSTICS,
+                    state.runtime_diagnostics(),
+                );
                 return Ok(peer);
             }
             Err(error) => {
@@ -177,7 +186,7 @@ pub fn run() {
 }
 
 fn run_inner() -> Result<(), Box<dyn Error>> {
-    let std_listener = StdTcpListener::bind(("0.0.0.0", connectivity::DROP_SERVICE_PORT))?;
+    let std_listener = StdTcpListener::bind(("0.0.0.0", DROP_SERVICE_PORT))?;
     std_listener.set_nonblocking(true)?;
     let listener_port = std_listener.local_addr()?.port();
     let state = Arc::new(AppState::load(listener_port));

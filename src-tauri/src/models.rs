@@ -1,9 +1,16 @@
-pub use crate::peer::{
-    DeviceIdentity, DiscoveryObservation, Endpoint, EndpointSource, Peer, PeerDiagnosticsSnapshot,
-    PeerRegistry, PeerSnapshot,
-};
+//! Application state, transfer DTOs, and persisted preferences.
+//!
+//! Peer identity/endpoint reconciliation lives in `peer`; this module owns the
+//! aggregate `AppState` and the data that crosses persistence or the Tauri
+//! command/event boundary.
+
 use crate::{
+    config::PROTOCOL_VERSION,
     diagnostics::{self, LogCategory, LogLevel, SupportLogger},
+    peer::{
+        DeviceIdentity, DiscoveryObservation, EndpointSource, Peer, PeerDiagnosticsSnapshot,
+        PeerRegistry, PeerSnapshot,
+    },
     platform,
 };
 use parking_lot::{Mutex, RwLock};
@@ -23,10 +30,6 @@ use std::{
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
-pub const MAX_TRANSFER_FILES: usize = 256;
-pub const MAX_FILENAME_BYTES: usize = 255;
-pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 const MAX_PERSISTED_SETTINGS_BYTES: u64 = 64 * 1024;
 const MAX_REMEMBERED_PEERS: usize = 64;
 const MAX_REMEMBERED_ENDPOINTS: usize = 8;

@@ -1,5 +1,12 @@
+//! Bounded TCP connection and identification operations.
+//!
+//! This module validates an endpoint before the transfer engine uses it. It
+//! does not own discovery, peer merging, file I/O, or UI state.
+
 use crate::{
-    models::{Cancellation, DeviceIdentity, PROTOCOL_VERSION},
+    config::{DROP_SERVICE_PORT, PROTOCOL_VERSION},
+    models::Cancellation,
+    peer::{same_device_id, DeviceIdentity},
     protocol::{
         read_identification, validate_device, write_identification, ControlMessage, ProtocolError,
     },
@@ -16,12 +23,10 @@ use tokio::{
     net::{lookup_host, TcpStream},
     time::timeout,
 };
-use uuid::Uuid;
 
 /// One predictable TCP service port is shared by discovery identification and
 /// transfer negotiation. The same numeric port is also used by the optional
 /// local UDP discovery fallback.
-pub const DROP_SERVICE_PORT: u16 = 39_821;
 pub const IDENTIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
 pub const ROUTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 pub const ROUTE_STAGGER: Duration = Duration::from_millis(150);
@@ -216,10 +221,6 @@ fn protocol_error(error: ProtocolError) -> ConnectivityError {
         ProtocolError::Io(error) => ConnectivityError::Connection(error.to_string()),
         other => ConnectivityError::Protocol(other.to_string()),
     }
-}
-
-fn same_device_id(left: &str, right: &str) -> bool {
-    Uuid::parse_str(left).ok() == Uuid::parse_str(right).ok()
 }
 
 /// Parse the unobtrusive Settings/Diagnostics address field. A missing port

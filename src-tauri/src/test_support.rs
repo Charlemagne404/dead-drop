@@ -1,4 +1,6 @@
-use crate::{models::AppState, transfer::EventSink};
+use crate::{
+    config::PROTOCOL_VERSION as CURRENT_PROTOCOL_VERSION, models::AppState, transfer::EventSink,
+};
 use parking_lot::{Condvar, Mutex};
 use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
@@ -20,14 +22,16 @@ use uuid::Uuid;
 
 pub use crate::{
     models::{
-        DeviceIdentity, FaultPlan, FaultPoint, IncomingTransfer, InjectedFailure, Peer,
-        Preferences, TransferFile, TransferPhase, TransferSnapshot, PROTOCOL_VERSION,
+        FaultPlan, FaultPoint, IncomingTransfer, InjectedFailure, Preferences, TransferFile,
+        TransferPhase, TransferSnapshot,
     },
     peer::{
-        DiscoveryObservation, Endpoint, EndpointReachability, EndpointSource, PeerRegistry,
-        RouteClass,
+        DeviceIdentity, DiscoveryObservation, Endpoint, EndpointReachability, EndpointSource, Peer,
+        PeerRegistry, RouteClass,
     },
 };
+
+pub const PROTOCOL_VERSION: u16 = CURRENT_PROTOCOL_VERSION;
 
 /// In-memory event sink for protocol and transfer tests. It keeps test runs
 /// independent of a Tauri window while exercising the real listener paths.
@@ -799,6 +803,7 @@ impl Drop for TestPeer {
 mod tests {
     use super::*;
     use crate::{
+        config::PROTOCOL_VERSION,
         models::{Cancellation, TransferPhase},
         protocol::{read_frame, ControlMessage, Frame},
         transfer,
@@ -910,8 +915,8 @@ mod tests {
         let events = Arc::new(RecordingEventSink::default());
         let id = "22222222-2222-4222-8222-222222222222";
         assert!(state.try_begin_transfer(id).is_ok());
-        let peer = crate::models::Peer::new(
-            crate::models::DeviceIdentity {
+        let peer = crate::peer::Peer::new(
+            crate::peer::DeviceIdentity {
                 id: "33333333-3333-4333-8333-333333333333".to_string(),
                 name: "Test peer".to_string(),
                 os: "Test OS".to_string(),
@@ -919,7 +924,7 @@ mod tests {
             },
             vec![crate::peer::Endpoint::new(
                 "127.0.0.1:1".parse().unwrap(),
-                crate::models::EndpointSource::new("test", "ipv4", "test"),
+                crate::peer::EndpointSource::new("test", "ipv4", "test"),
                 crate::peer::RouteClass::DirectLocal,
                 std::time::Instant::now(),
             )],

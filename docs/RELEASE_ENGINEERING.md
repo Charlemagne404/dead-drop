@@ -4,6 +4,9 @@ This document is the repeatable release path for Drop. It deliberately stops at
 artifact preparation: no command in this repository creates or publishes a
 public GitHub release.
 
+For the developer-facing validation matrix that feeds this path, see
+[`TESTING.md`](TESTING.md).
+
 ## Version source and metadata
 
 `package.json` is the authoritative application version. Tauri, npm's lockfile,
