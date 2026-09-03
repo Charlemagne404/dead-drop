@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Direct local file transfer"
 authors = ["Continental"]
 edition = "2021"
+default-run = "dead-drop"
 
 [lib]
 name = "dead_drop_lib"

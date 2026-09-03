@@ -39,10 +39,11 @@ const PEER_STALE_AFTER: Duration = Duration::from_secs(75);
 const DISCOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 const LOCAL_FALLBACK_INTERVAL: Duration = Duration::from_secs(20);
 const LOCAL_FALLBACK_RESPONSE_WINDOW: Duration = Duration::from_millis(750);
-const LOCAL_FALLBACK_READ_TIMEOUT: Duration = Duration::from_millis(100);
+const LOCAL_FALLBACK_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_LOCAL_FALLBACK_RESPONSES: usize = 64;
 const MAX_MDNS_ENDPOINTS: usize = 16;
 const TAILSCALE_POLL_INTERVAL: Duration = Duration::from_secs(20);
+const TAILSCALE_NOT_INSTALLED_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_TAILSCALE_STATUS_BYTES: usize = 1024 * 1024;
 const MAX_TAILSCALE_CANDIDATES: usize = 256;
 const MAX_COMMAND_WAIT: Duration = Duration::from_secs(2);
@@ -200,7 +201,7 @@ fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
             Ok(event) => match event {
                 ServiceEvent::ServiceResolved(service) => {
                     if let Some(observation) = source.observe(&service, &local_id) {
-                        if state.apply_discovery_observation(observation) {
+                        if state.apply_discovery_observation_visible(observation) {
                             emit_state(app, state);
                         }
                     }
@@ -271,7 +272,10 @@ fn wait_for_retry(state: &AppState) -> bool {
         if state.is_shutting_down() {
             return false;
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(
+            Duration::from_millis(500)
+                .min(DISCOVERY_RETRY_DELAY.saturating_sub(retry_started.elapsed())),
+        );
     }
     true
 }
@@ -470,8 +474,9 @@ async fn probe_candidates(
 fn apply_probe_successes(
     state: &Arc<AppState>,
     successes: Vec<ProbeSuccess>,
-) -> HashSet<EndpointSource> {
+) -> (HashSet<EndpointSource>, bool) {
     let mut sources = HashSet::new();
+    let mut visible_change = false;
     for success in successes {
         let ProbeSuccess {
             candidate,
@@ -486,11 +491,12 @@ fn apply_probe_successes(
         );
         endpoint.reachability = EndpointReachability::Reachable;
         sources.insert(source.clone());
-        if state.apply_discovery_observation(DiscoveryObservation {
+        if state.apply_discovery_observation_visible(DiscoveryObservation {
             identity: identity.clone(),
             source,
             endpoints: vec![endpoint],
         }) {
+            visible_change = true;
             eprintln!(
                 "[dead-drop][discovery] peer endpoint added via {} UUID {} Endpoint {}",
                 candidate.route_class.label(),
@@ -499,7 +505,7 @@ fn apply_probe_successes(
             );
         }
     }
-    sources
+    (sources, visible_change)
 }
 
 fn remove_old_sources(
@@ -626,9 +632,9 @@ fn run_local_fallback(state: Arc<AppState>, app: AppHandle) {
                 })
                 .collect::<Vec<_>>();
             let successes = runtime.block_on(probe_candidates(&state, candidates));
-            let current_sources = apply_probe_successes(&state, successes);
+            let (current_sources, visible_change) = apply_probe_successes(&state, successes);
             let removed = remove_old_sources(&state, &previous_sources, &current_sources);
-            if removed || !current_sources.is_empty() {
+            if removed || visible_change {
                 emit_state(&app, &state);
             }
             previous_sources = current_sources;
@@ -738,10 +744,10 @@ fn run_tailscale(state: Arc<AppState>, app: AppHandle) {
                     Vec::new()
                 };
                 let successes = runtime.block_on(probe_candidates(&state, candidates));
-                let current_sources = apply_probe_successes(&state, successes);
+                let (current_sources, visible_change) = apply_probe_successes(&state, successes);
                 let removed = remove_old_sources(&state, &previous_sources, &current_sources);
                 if removed
-                    || !current_sources.is_empty()
+                    || visible_change
                     || state.set_discovery_status(
                         TAILSCALE_SOURCE_ID,
                         status,
@@ -790,7 +796,12 @@ fn run_tailscale(state: Arc<AppState>, app: AppHandle) {
                 previous_sources.clear();
             }
         }
-        if !wait_for_interval(&state, TAILSCALE_POLL_INTERVAL) {
+        let interval = if last_status == "not-installed" {
+            TAILSCALE_NOT_INSTALLED_INTERVAL
+        } else {
+            TAILSCALE_POLL_INTERVAL
+        };
+        if !wait_for_interval(&state, interval) {
             return;
         }
     }
@@ -1040,9 +1051,9 @@ fn run_remembered(state: Arc<AppState>, app: AppHandle) {
         for success in &successes {
             state.remember_peer(&success.identity, success.candidate.address);
         }
-        let current_sources = apply_probe_successes(&state, successes);
+        let (current_sources, visible_change) = apply_probe_successes(&state, successes);
         let removed = remove_old_sources(&state, &previous_sources, &current_sources);
-        if removed || !current_sources.is_empty() {
+        if removed || visible_change {
             emit_state(&app, &state);
         }
         previous_sources = current_sources;
@@ -1071,7 +1082,7 @@ fn wait_for_interval(state: &AppState, duration: Duration) -> bool {
         if state.is_shutting_down() {
             return false;
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(500).min(duration.saturating_sub(started.elapsed())));
     }
     true
 }

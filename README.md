@@ -178,6 +178,24 @@ cargo test --manifest-path src-tauri/Cargo.toml \
 The randomized pass prints and preserves seed `0xd05eed20260903` for
 reproduction.
 
+## Performance benchmark
+
+The repeatable transfer and registry benchmark generates temporary fixtures and
+launches separate sender and receiver processes, so large-file memory remains
+bounded and role-specific CPU/RSS samples can be compared across revisions:
+
+```sh
+npm run perf
+```
+
+The default run uses an optimized Rust build and covers zero bytes, 1 byte,
+4 KiB, 1 MiB, 100 MiB, a generated 256 MiB file, 64 generated 4 KiB files,
+and 10,000 synthetic peers. Use `npm run perf -- --json` for machine-readable
+output. `DROP_PERF_LARGE_BYTES`, `DROP_PERF_SMALL_FILE_COUNT`,
+`DROP_PERF_SMALL_FILE_BYTES`, `DROP_PERF_PEER_COUNT`, and
+`DROP_PERF_PROFILE=debug` are available for controlled comparisons. See
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md) for metric definitions and limits.
+
 ## Validate
 
 ```sh

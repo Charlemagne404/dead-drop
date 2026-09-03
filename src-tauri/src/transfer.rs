@@ -127,6 +127,12 @@ struct PreparedFile {
     wire: TransferFile,
 }
 
+struct PreparedCandidate {
+    source: PathBuf,
+    name: String,
+    size: u64,
+}
+
 struct StagedFile {
     name: String,
     temporary: PathBuf,
@@ -248,22 +254,26 @@ impl TransferTracker {
         {
             return;
         }
-        self.snapshot.transferred_bytes = self
+        let transferred_bytes = self
             .snapshot
             .transferred_bytes
             .max(transferred_bytes)
             .min(self.snapshot.total_bytes);
-        self.snapshot.bytes_per_second = speed_for(self.snapshot.transferred_bytes, started_at);
-        self.snapshot.eta_seconds = if self.snapshot.bytes_per_second > 0
-            && self.snapshot.total_bytes > self.snapshot.transferred_bytes
-        {
-            Some(
-                (self.snapshot.total_bytes - self.snapshot.transferred_bytes)
-                    .div_ceil(self.snapshot.bytes_per_second),
-            )
+        let bytes_per_second = speed_for(transferred_bytes, started_at);
+        let eta_seconds = if bytes_per_second > 0 && self.snapshot.total_bytes > transferred_bytes {
+            Some((self.snapshot.total_bytes - transferred_bytes).div_ceil(bytes_per_second))
         } else {
             None
         };
+        if force
+            && self.snapshot.transferred_bytes == transferred_bytes
+            && self.snapshot.eta_seconds == eta_seconds
+        {
+            return;
+        }
+        self.snapshot.transferred_bytes = transferred_bytes;
+        self.snapshot.bytes_per_second = bytes_per_second;
+        self.snapshot.eta_seconds = eta_seconds;
         self.last_progress_emit = Some(now);
         self.emit();
     }
@@ -1230,7 +1240,7 @@ async fn prepare_files(
     cancellation: Arc<Cancellation>,
     shutdown: Arc<Cancellation>,
 ) -> Result<Vec<PreparedFile>, TransferError> {
-    let mut prepared = Vec::with_capacity(paths.len());
+    let mut candidates = Vec::with_capacity(paths.len());
     let mut total_bytes = 0_u64;
     for raw_path in paths {
         check_cancelled(cancellation.as_ref(), shutdown.as_ref())?;
@@ -1261,34 +1271,42 @@ async fn prepare_files(
                 detail: "transfer exceeds the size limit".to_string(),
             });
         }
-        let source_for_hash = source.clone();
-        let cancellation_for_hash = cancellation.clone();
-        let shutdown_for_hash = shutdown.clone();
-        let sha256 = tokio::task::spawn_blocking(move || {
-            checksum_file(
-                &source_for_hash,
-                cancellation_for_hash.as_ref(),
-                shutdown_for_hash.as_ref(),
-            )
-        })
-        .await
-        .map_err(|error| TransferError::Prepare {
-            detail: error.to_string(),
-        })??;
-        eprintln!(
-            "[dead-drop][transfer] prepared {name} ({} bytes)",
-            metadata.len()
-        );
-        prepared.push(PreparedFile {
+        candidates.push(PreparedCandidate {
             source,
-            wire: TransferFile {
-                name,
-                size: metadata.len(),
-                sha256,
-            },
+            name,
+            size: metadata.len(),
         });
     }
-    Ok(prepared)
+    let cancellation_for_hash = cancellation.clone();
+    let shutdown_for_hash = shutdown.clone();
+    tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .map(|candidate| {
+                let sha256 = checksum_file(
+                    &candidate.source,
+                    cancellation_for_hash.as_ref(),
+                    shutdown_for_hash.as_ref(),
+                )?;
+                eprintln!(
+                    "[dead-drop][transfer] prepared {} ({} bytes)",
+                    candidate.name, candidate.size
+                );
+                Ok(PreparedFile {
+                    source: candidate.source,
+                    wire: TransferFile {
+                        name: candidate.name,
+                        size: candidate.size,
+                        sha256,
+                    },
+                })
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| TransferError::Prepare {
+        detail: error.to_string(),
+    })?
 }
 
 fn checksum_file(

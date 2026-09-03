@@ -673,6 +673,13 @@ impl AppState {
         self.peers.write().apply_observation(observation)
     }
 
+    pub(crate) fn apply_discovery_observation_visible(
+        &self,
+        observation: DiscoveryObservation,
+    ) -> bool {
+        self.peers.write().apply_observation_visible(observation)
+    }
+
     pub fn mark_endpoint_reachability(
         &self,
         peer_id: &str,
@@ -734,6 +741,7 @@ impl AppState {
             return;
         }
         let now = unix_now();
+        let durable_change;
         {
             let mut remembered = self.remembered_peers.write();
             let id = Uuid::parse_str(&identity.id)
@@ -741,9 +749,11 @@ impl AppState {
                 .to_string();
             let peer = remembered.iter_mut().find(|peer| peer.identity.id == id);
             if let Some(peer) = peer {
+                let identity_changed = peer.identity != *identity;
+                let endpoint_changed = !peer.endpoints.contains(&address);
                 peer.identity = identity.clone();
                 peer.last_successful_at = now;
-                if !peer.endpoints.contains(&address) {
+                if endpoint_changed {
                     peer.endpoints.push(address);
                 }
                 peer.endpoints.sort();
@@ -755,12 +765,14 @@ impl AppState {
                         .unwrap_or(0);
                     peer.endpoints.remove(remove_index);
                 }
+                durable_change = identity_changed || endpoint_changed;
             } else {
                 remembered.push(RememberedPeer {
                     identity: identity.clone(),
                     endpoints: vec![address],
                     last_successful_at: now,
                 });
+                durable_change = true;
                 remembered.sort_by(|left, right| {
                     right
                         .last_successful_at
@@ -770,8 +782,10 @@ impl AppState {
                 remembered.truncate(MAX_REMEMBERED_PEERS);
             }
         }
-        if let Err(error) = self.persist() {
-            eprintln!("[dead-drop][settings] could not remember peer: {error}");
+        if durable_change {
+            if let Err(error) = self.persist() {
+                eprintln!("[dead-drop][settings] could not remember peer: {error}");
+            }
         }
     }
 
