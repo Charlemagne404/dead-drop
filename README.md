@@ -161,6 +161,21 @@ cargo test --manifest-path src-tauri/Cargo.toml \
   -- --ignored --test-threads=1
 ```
 
+The deterministic chaos suite adds reusable fault plans, protocol-aware TCP
+shaping, lifecycle barriers, registry-source simulation, and an opt-in seeded
+randomized pass:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml \
+  --features integration-tests --test chaos_integration -- --test-threads=1
+cargo test --manifest-path src-tauri/Cargo.toml \
+  --features integration-tests --test chaos_integration \
+  -- --ignored --test-threads=1
+```
+
+The randomized pass prints and preserves seed `0xd05eed20260903` for
+reproduction.
+
 ## Validate
 
 ```sh

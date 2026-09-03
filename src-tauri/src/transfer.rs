@@ -36,6 +36,9 @@ use tokio::{
 };
 use uuid::Uuid;
 
+#[cfg(any(test, feature = "integration-tests"))]
+use crate::models::FaultPoint;
+
 const CHUNK_SIZE: usize = 96 * 1024;
 const DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(45);
@@ -544,6 +547,13 @@ async fn send_files(
                 &mut remote_receiver,
             )
             .await?;
+            #[cfg(any(test, feature = "integration-tests"))]
+            if let Some(error) = state.take_fault(FaultPoint::SourceOpen) {
+                return Err(TransferError::FileRead {
+                    name: file.wire.name.clone(),
+                    detail: error.to_string(),
+                });
+            }
             let mut source = OpenOptions::new()
                 .read(true)
                 .open(&file.source)
@@ -555,6 +565,13 @@ async fn send_files(
             let mut buffer = vec![0_u8; CHUNK_SIZE];
             loop {
                 check_cancelled(cancellation, shutdown)?;
+                #[cfg(any(test, feature = "integration-tests"))]
+                if let Some(error) = state.take_fault(FaultPoint::SourceRead) {
+                    return Err(TransferError::FileRead {
+                        name: file.wire.name.clone(),
+                        detail: error.to_string(),
+                    });
+                }
                 let count = tokio::select! {
                     result = timeout(FRAME_TIMEOUT, source.read(&mut buffer)) => {
                         match result {
@@ -890,19 +907,40 @@ async fn receive_incoming(
         let error = TransferError::Destination {
             detail: "configured destination is not absolute".to_string(),
         };
-        return finish_incoming_error(writer, &mut tracker, &transfer_id, &error, &mut Vec::new())
-            .await;
+        return finish_incoming_error(
+            state,
+            writer,
+            &mut tracker,
+            &transfer_id,
+            &error,
+            &mut Vec::new(),
+            &[],
+        )
+        .await;
     }
-    let directory_available = fs::metadata(&directory)
-        .await
-        .map(|metadata| metadata.is_dir())
-        .unwrap_or(false);
+    #[cfg(any(test, feature = "integration-tests"))]
+    let destination_fault = state.take_fault(FaultPoint::DestinationMetadata);
+    #[cfg(not(any(test, feature = "integration-tests")))]
+    let destination_fault: Option<std::io::Error> = None;
+    let directory_available = destination_fault.is_none()
+        && fs::metadata(&directory)
+            .await
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
     if !directory_available {
         let error = TransferError::Destination {
             detail: "configured destination folder is unavailable".to_string(),
         };
-        return finish_incoming_error(writer, &mut tracker, &transfer_id, &error, &mut Vec::new())
-            .await;
+        return finish_incoming_error(
+            state,
+            writer,
+            &mut tracker,
+            &transfer_id,
+            &error,
+            &mut Vec::new(),
+            &[],
+        )
+        .await;
     }
     let mut staged = Vec::new();
     let received = receive_files(
@@ -913,39 +951,108 @@ async fn receive_incoming(
         total_bytes,
         &directory,
         &mut staged,
+        state,
         cancellation.as_ref(),
         shutdown.as_ref(),
     )
     .await;
     if let Err(error) = received {
-        return finish_incoming_error(writer, &mut tracker, &transfer_id, &error, &mut staged)
-            .await;
+        return finish_incoming_error(
+            state,
+            writer,
+            &mut tracker,
+            &transfer_id,
+            &error,
+            &mut staged,
+            &[],
+        )
+        .await;
     }
     if let Err(error) = check_cancelled(cancellation.as_ref(), shutdown.as_ref()) {
-        return finish_incoming_error(writer, &mut tracker, &transfer_id, &error, &mut staged)
-            .await;
+        return finish_incoming_error(
+            state,
+            writer,
+            &mut tracker,
+            &transfer_id,
+            &error,
+            &mut staged,
+            &[],
+        )
+        .await;
     }
     tracker.transition(TransferPhase::Verifying, None);
     let mut used_names: HashSet<String> = staged
         .iter()
         .map(|staged_file| path_key(&staged_file.final_path))
         .collect();
+    let mut finalized = Vec::with_capacity(staged.len());
     for index in 0..staged.len() {
         if let Err(error) = check_cancelled(cancellation.as_ref(), shutdown.as_ref()) {
-            return finish_incoming_error(writer, &mut tracker, &transfer_id, &error, &mut staged)
-                .await;
+            return finish_incoming_error(
+                state,
+                writer,
+                &mut tracker,
+                &transfer_id,
+                &error,
+                &mut staged,
+                &finalized,
+            )
+            .await;
+        }
+        #[cfg(any(test, feature = "integration-tests"))]
+        if let Some(error) = state.take_fault(FaultPoint::Finalize) {
+            let error = destination_error(error);
+            return finish_incoming_error(
+                state,
+                writer,
+                &mut tracker,
+                &transfer_id,
+                &error,
+                &mut staged,
+                &finalized,
+            )
+            .await;
         }
         let result = finalize_staged_file(&mut staged[index], &directory, &mut used_names).await;
         if let Err(error) = result {
-            return finish_incoming_error(writer, &mut tracker, &transfer_id, &error, &mut staged)
-                .await;
+            return finish_incoming_error(
+                state,
+                writer,
+                &mut tracker,
+                &transfer_id,
+                &error,
+                &mut staged,
+                &finalized,
+            )
+            .await;
         }
+        finalized.push(staged[index].final_path.clone());
     }
     if let Err(error) = check_cancelled(cancellation.as_ref(), shutdown.as_ref()) {
-        return finish_incoming_error(writer, &mut tracker, &transfer_id, &error, &mut staged)
-            .await;
+        return finish_incoming_error(
+            state,
+            writer,
+            &mut tracker,
+            &transfer_id,
+            &error,
+            &mut staged,
+            &finalized,
+        )
+        .await;
     }
     tracker.transition(TransferPhase::Completing, None);
+    if let Err(error) = check_cancelled(cancellation.as_ref(), shutdown.as_ref()) {
+        return finish_incoming_error(
+            state,
+            writer,
+            &mut tracker,
+            &transfer_id,
+            &error,
+            &mut staged,
+            &finalized,
+        )
+        .await;
+    }
     if !send_control_bounded(
         writer,
         &ControlMessage::TransferResult {
@@ -974,9 +1081,12 @@ async fn receive_files(
     total_bytes: u64,
     directory: &Path,
     staged: &mut Vec<StagedFile>,
+    state: &AppState,
     cancellation: &Cancellation,
     shutdown: &Cancellation,
 ) -> Result<(), TransferError> {
+    #[cfg(not(any(test, feature = "integration-tests")))]
+    let _ = state;
     let started_at = Instant::now();
     let mut transferred = 0_u64;
     let mut used_names = HashSet::new();
@@ -1004,6 +1114,10 @@ async fn receive_files(
         }
         let final_path = available_destination_path(directory, &expected.name, &mut used_names)?;
         let temporary = temporary_staging_path(directory, transfer_id, index);
+        #[cfg(any(test, feature = "integration-tests"))]
+        if let Some(error) = state.take_fault(FaultPoint::StageCreate) {
+            return Err(destination_error(error));
+        }
         let mut destination = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1031,8 +1145,15 @@ async fn receive_files(
                             "file exceeded its advertised size".to_string(),
                         ));
                     }
-                    let write_result =
-                        write_file_chunk(&mut destination, &data, cancellation, shutdown).await;
+                    #[cfg(any(test, feature = "integration-tests"))]
+                    let injected_write = state.take_fault(FaultPoint::StageWrite);
+                    #[cfg(not(any(test, feature = "integration-tests")))]
+                    let injected_write: Option<std::io::Error> = None;
+                    let write_result = if let Some(error) = injected_write {
+                        Err(error)
+                    } else {
+                        write_file_chunk(&mut destination, &data, cancellation, shutdown).await
+                    };
                     if write_result.is_err() {
                         if shutdown.is_cancelled() {
                             return Err(TransferError::ShuttingDown);
@@ -1061,6 +1182,10 @@ async fn receive_files(
                     ))
                 }
             }
+        }
+        #[cfg(any(test, feature = "integration-tests"))]
+        if let Some(error) = state.take_fault(FaultPoint::StageFlush) {
+            return Err(destination_error(error));
         }
         flush_file(&mut destination, cancellation, shutdown).await?;
         if received != expected.size {
@@ -1332,9 +1457,16 @@ async fn move_staged_file(source: &Path, destination: &Path) -> std::io::Result<
         Err(error) if can_fallback_to_hard_link(&error) => {
             fs::hard_link(source, destination).await?;
             if let Err(remove_error) = fs::remove_file(source).await {
-                eprintln!(
-                    "[dead-drop][file] could not remove temporary file after hard-link finalization: {remove_error}"
-                );
+                // Do not report a successful finalization while the staging
+                // file still exists. The destination was created by this
+                // operation, so remove it before returning the failure and
+                // let the batch rollback path handle any remaining files.
+                if let Err(cleanup_error) = fs::remove_file(destination).await {
+                    eprintln!(
+                        "[dead-drop][file] could not roll back hard-link destination: {cleanup_error}"
+                    );
+                }
+                return Err(remove_error);
             }
             Ok(())
         }
@@ -1355,24 +1487,56 @@ fn can_fallback_to_hard_link(error: &std::io::Error) -> bool {
         )
 }
 
-async fn cleanup_staged(staged: &[StagedFile]) {
+async fn cleanup_staged(staged: &[StagedFile], state: &AppState) {
+    #[cfg(not(any(test, feature = "integration-tests")))]
+    let _ = state;
     for file in staged {
-        if let Err(error) = fs::remove_file(&file.temporary).await {
+        for attempt in 0..3 {
+            let result = {
+                #[cfg(any(test, feature = "integration-tests"))]
+                if let Some(error) = state.take_fault(FaultPoint::Cleanup) {
+                    Err(error)
+                } else {
+                    fs::remove_file(&file.temporary).await
+                }
+                #[cfg(not(any(test, feature = "integration-tests")))]
+                {
+                    fs::remove_file(&file.temporary).await
+                }
+            };
+            match result {
+                Ok(()) => break,
+                Err(error) if error.kind() == ErrorKind::NotFound => break,
+                Err(error) if attempt == 2 => {
+                    eprintln!("[dead-drop][file] could not remove temporary receive file: {error}");
+                }
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+    }
+}
+
+async fn rollback_finalized(finalized: &[PathBuf]) {
+    for path in finalized.iter().rev() {
+        if let Err(error) = fs::remove_file(path).await {
             if error.kind() != ErrorKind::NotFound {
-                eprintln!("[dead-drop][file] could not remove temporary receive file: {error}");
+                eprintln!("[dead-drop][file] could not roll back finalized file: {error}");
             }
         }
     }
 }
 
 async fn finish_incoming_error(
+    state: &AppState,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     tracker: &mut TransferTracker,
     transfer_id: &str,
     error: &TransferError,
     staged: &mut [StagedFile],
+    finalized: &[PathBuf],
 ) -> Result<(), TransferError> {
-    cleanup_staged(staged).await;
+    cleanup_staged(staged, state).await;
+    rollback_finalized(finalized).await;
     if matches!(error, TransferError::Canceled) {
         send_cancel(writer, transfer_id).await;
     }

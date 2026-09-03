@@ -3,18 +3,30 @@ use parking_lot::{Condvar, Mutex};
 use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
-use tokio::{sync::Notify, task::JoinHandle, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::Notify,
+    task::{JoinHandle, JoinSet},
+    time::{sleep, timeout},
+};
 use uuid::Uuid;
 
 pub use crate::{
     models::{
-        DeviceIdentity, IncomingTransfer, Peer, Preferences, TransferFile, TransferPhase,
-        TransferSnapshot, PROTOCOL_VERSION,
+        DeviceIdentity, FaultPlan, FaultPoint, IncomingTransfer, InjectedFailure, Peer,
+        Preferences, TransferFile, TransferPhase, TransferSnapshot, PROTOCOL_VERSION,
     },
-    peer::{Endpoint, EndpointSource, RouteClass},
+    peer::{
+        DiscoveryObservation, Endpoint, EndpointReachability, EndpointSource, PeerRegistry,
+        RouteClass,
+    },
 };
 
 /// In-memory event sink for protocol and transfer tests. It keeps test runs
@@ -67,18 +79,24 @@ pub fn state_for_tests(destination: &Path) -> Arc<AppState> {
 enum PauseCondition {
     FirstDataProgress,
     FinalDataProgress,
+    Phase(TransferPhase),
 }
 
 impl PauseCondition {
     fn matches(self, snapshot: &TransferSnapshot) -> bool {
-        if snapshot.phase != TransferPhase::Transferring || snapshot.total_bytes == 0 {
-            return false;
-        }
         match self {
             Self::FirstDataProgress => {
-                snapshot.transferred_bytes > 0 && snapshot.transferred_bytes < snapshot.total_bytes
+                snapshot.phase == TransferPhase::Transferring
+                    && snapshot.total_bytes > 0
+                    && snapshot.transferred_bytes > 0
+                    && snapshot.transferred_bytes < snapshot.total_bytes
             }
-            Self::FinalDataProgress => snapshot.transferred_bytes == snapshot.total_bytes,
+            Self::FinalDataProgress => {
+                snapshot.phase == TransferPhase::Transferring
+                    && snapshot.total_bytes > 0
+                    && snapshot.transferred_bytes == snapshot.total_bytes
+            }
+            Self::Phase(phase) => snapshot.phase == phase,
         }
     }
 }
@@ -134,6 +152,8 @@ impl TestEventSink {
     ) -> TransferSnapshot {
         loop {
             let notified = self.updates_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(snapshot) = self
                 .updates
                 .lock()
@@ -150,6 +170,8 @@ impl TestEventSink {
     pub async fn wait_for_terminal(&self, transfer_id: &str) -> TransferSnapshot {
         loop {
             let notified = self.updates_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(snapshot) = self
                 .updates
                 .lock()
@@ -166,6 +188,8 @@ impl TestEventSink {
     pub async fn wait_for_incoming(&self, transfer_id: &str) -> IncomingTransfer {
         loop {
             let notified = self.incoming_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(transfer) = self
                 .incoming
                 .lock()
@@ -187,6 +211,13 @@ impl TestEventSink {
         self.arm_pause(PauseCondition::FinalDataProgress);
     }
 
+    /// Pause the transfer task immediately after a lifecycle event is
+    /// recorded. The caller can cancel, shut down, or otherwise inspect the
+    /// state before releasing the task, without relying on a scheduler race.
+    pub fn pause_on_phase(&self, phase: TransferPhase) {
+        self.arm_pause(PauseCondition::Phase(phase));
+    }
+
     fn arm_pause(&self, condition: PauseCondition) {
         let mut pause = self.pause.lock();
         pause.condition = Some(condition);
@@ -197,6 +228,8 @@ impl TestEventSink {
     pub async fn wait_until_paused(&self) {
         loop {
             let notified = self.pause_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.pause.lock().paused {
                 return;
             }
@@ -240,6 +273,280 @@ impl EventSink for TestEventSink {
         self.incoming.lock().push(transfer.clone());
         self.incoming_changed.notify_waiters();
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxyDirection {
+    ClientToPeer,
+    PeerToClient,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxyDisconnectMode {
+    Graceful,
+    Abrupt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxyDisconnectTrigger {
+    AfterBytes(usize),
+    AfterFrames(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProxyDisconnect {
+    pub direction: ProxyDirection,
+    pub trigger: ProxyDisconnectTrigger,
+    pub mode: ProxyDisconnectMode,
+}
+
+/// Raw TCP shaping for integration tests. The proxy only transports bytes; it
+/// never parses or substitutes Drop messages, so the production protocol and
+/// transfer implementations remain on both sides of the fault boundary.
+#[derive(Clone, Copy, Debug)]
+pub struct FaultProxyConfig {
+    pub read_chunk_size: usize,
+    pub write_chunk_size: usize,
+    pub delayed_direction: Option<ProxyDirection>,
+    pub delay: Duration,
+    pub disconnect: Option<ProxyDisconnect>,
+}
+
+impl Default for FaultProxyConfig {
+    fn default() -> Self {
+        Self {
+            read_chunk_size: 96 * 1024,
+            write_chunk_size: 96 * 1024,
+            delayed_direction: None,
+            delay: Duration::ZERO,
+            disconnect: None,
+        }
+    }
+}
+
+/// A one-connection loopback proxy used to inject transport faults into real
+/// peer-to-peer transfers.
+pub struct FaultProxy {
+    address: SocketAddr,
+    accepted: Arc<AtomicUsize>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl FaultProxy {
+    pub async fn bind(target: SocketAddr, config: FaultProxyConfig) -> Self {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("fault proxy should bind a loopback listener");
+        let address = listener
+            .local_addr()
+            .expect("fault proxy address should be available");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_for_task = accepted.clone();
+        let task = tokio::spawn(async move {
+            let Ok((client, _)) = listener.accept().await else {
+                return;
+            };
+            accepted_for_task.fetch_add(1, Ordering::Relaxed);
+            let Ok(peer) = TcpStream::connect(target).await else {
+                return;
+            };
+            let (client_reader, client_writer) = client.into_split();
+            let (peer_reader, peer_writer) = peer.into_split();
+            let mut directions = JoinSet::new();
+            directions.spawn(forward_bytes(
+                client_reader,
+                peer_writer,
+                config,
+                ProxyDirection::ClientToPeer,
+            ));
+            directions.spawn(forward_bytes(
+                peer_reader,
+                client_writer,
+                config,
+                ProxyDirection::PeerToClient,
+            ));
+            let _ = directions.join_next().await;
+            directions.abort_all();
+            while directions.join_next().await.is_some() {}
+        });
+        Self {
+            address,
+            accepted,
+            task: Some(task),
+        }
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn connection_count(&self) -> usize {
+        self.accepted.load(Ordering::Relaxed)
+    }
+
+    pub async fn wait_for_connection(&self) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if self.connection_count() > 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fault proxy should accept a connection");
+    }
+
+    pub async fn stop(&mut self) {
+        let Some(mut task) = self.task.take() else {
+            return;
+        };
+        if timeout(Duration::from_secs(2), &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for FaultProxy {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+struct ProxyFrameProgress {
+    bytes: usize,
+    frames: usize,
+    header: Vec<u8>,
+    payload_remaining: usize,
+}
+
+impl ProxyFrameProgress {
+    fn new() -> Self {
+        Self {
+            bytes: 0,
+            frames: 0,
+            header: Vec::with_capacity(5),
+            payload_remaining: 0,
+        }
+    }
+
+    fn take_limit(&mut self, data: &[u8], trigger: ProxyDisconnectTrigger) -> usize {
+        match trigger {
+            ProxyDisconnectTrigger::AfterBytes(limit) => {
+                if self.bytes >= limit {
+                    return 0;
+                }
+                let count = data.len().min(limit - self.bytes);
+                self.bytes += count;
+                count
+            }
+            ProxyDisconnectTrigger::AfterFrames(limit) => {
+                if self.frames >= limit {
+                    return 0;
+                }
+                let mut consumed = 0;
+                while consumed < data.len() && self.frames < limit {
+                    if self.payload_remaining > 0 {
+                        let count = (data.len() - consumed).min(self.payload_remaining);
+                        self.payload_remaining -= count;
+                        consumed += count;
+                        if self.payload_remaining == 0 {
+                            self.frames += 1;
+                        }
+                    } else {
+                        let count = (data.len() - consumed).min(5 - self.header.len());
+                        self.header
+                            .extend_from_slice(&data[consumed..consumed + count]);
+                        consumed += count;
+                        if self.header.len() == 5 {
+                            let payload_length = u32::from_be_bytes([
+                                self.header[1],
+                                self.header[2],
+                                self.header[3],
+                                self.header[4],
+                            ]) as usize;
+                            self.header.clear();
+                            self.payload_remaining = payload_length;
+                            if payload_length == 0 {
+                                self.frames += 1;
+                            }
+                        }
+                    }
+                }
+                self.bytes += consumed;
+                consumed
+            }
+        }
+    }
+
+    fn reached(&self, trigger: ProxyDisconnectTrigger) -> bool {
+        match trigger {
+            ProxyDisconnectTrigger::AfterBytes(limit) => self.bytes >= limit,
+            ProxyDisconnectTrigger::AfterFrames(limit) => self.frames >= limit,
+        }
+    }
+}
+
+async fn forward_bytes<R, W>(
+    mut reader: R,
+    mut writer: W,
+    config: FaultProxyConfig,
+    direction: ProxyDirection,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let read_chunk_size = config.read_chunk_size.max(1);
+    let write_chunk_size = config.write_chunk_size.max(1);
+    let mut buffer = vec![0_u8; read_chunk_size];
+    let mut progress = ProxyFrameProgress::new();
+    let trigger = config
+        .disconnect
+        .filter(|disconnect| disconnect.direction == direction)
+        .map(|disconnect| (disconnect.trigger, disconnect.mode));
+
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            writer.shutdown().await?;
+            return Ok(());
+        }
+        let mut offset = 0;
+        while offset < count {
+            let chunk_end = (offset + write_chunk_size).min(count);
+            let chunk = &buffer[offset..chunk_end];
+            let allowed = trigger
+                .map(|(trigger, _)| progress.take_limit(chunk, trigger))
+                .unwrap_or(chunk.len());
+            if allowed == 0 {
+                if matches!(trigger, Some((_, ProxyDisconnectMode::Graceful))) {
+                    writer.shutdown().await?;
+                }
+                return Ok(());
+            }
+            if config.delayed_direction == Some(direction) && !config.delay.is_zero() {
+                sleep(config.delay).await;
+            }
+            writer.write_all(&chunk[..allowed]).await?;
+            offset += allowed;
+            if trigger.is_some_and(|(trigger, _)| progress.reached(trigger)) {
+                if matches!(trigger, Some((_, ProxyDisconnectMode::Graceful))) {
+                    writer.shutdown().await?;
+                }
+                return Ok(());
+            }
+            if allowed < chunk.len() {
+                if matches!(trigger, Some((_, ProxyDisconnectMode::Graceful))) {
+                    writer.shutdown().await?;
+                }
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -296,6 +603,7 @@ impl Drop for TransferRun {
 pub struct TestPeer {
     state: Arc<AppState>,
     pub events: Arc<TestEventSink>,
+    pub faults: Arc<FaultPlan>,
     root: PeerTempDir,
     address: SocketAddr,
     identity: DeviceIdentity,
@@ -304,6 +612,10 @@ pub struct TestPeer {
 
 impl TestPeer {
     pub fn new(label: &str) -> Self {
+        Self::new_with_faults(label, Arc::new(FaultPlan::new()))
+    }
+
+    pub fn new_with_faults(label: &str, faults: Arc<FaultPlan>) -> Self {
         let root = PeerTempDir::new();
         let source = root.path().join("source");
         let destination = root.path().join("received");
@@ -323,13 +635,14 @@ impl TestPeer {
             os: crate::platform::platform_name(),
             protocol_version: PROTOCOL_VERSION,
         };
-        let state = Arc::new(AppState::new(
+        let state = Arc::new(AppState::new_with_faults(
             identity.clone(),
             Preferences {
                 device_name: label.to_string(),
                 destination: destination.to_string_lossy().into_owned(),
             },
             address.port(),
+            faults.clone(),
         ));
         let events = Arc::new(TestEventSink::new());
         let listener_task =
@@ -337,6 +650,7 @@ impl TestPeer {
         Self {
             state,
             events,
+            faults,
             root,
             address,
             identity,
@@ -346,6 +660,10 @@ impl TestPeer {
 
     pub fn identity(&self) -> DeviceIdentity {
         self.identity.clone()
+    }
+
+    pub fn state(&self) -> Arc<AppState> {
+        self.state.clone()
     }
 
     pub fn device_id(&self) -> &str {
