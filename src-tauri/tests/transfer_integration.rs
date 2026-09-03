@@ -1,23 +1,20 @@
 use dead_drop_lib::test_support::{
-    DeviceIdentity, Endpoint, EndpointSource, IncomingTransfer, Peer, RouteClass, TestEventSink,
-    TestPeer, TransferPhase, TransferRun, TransferSnapshot, PROTOCOL_VERSION,
+    IncomingTransfer, TestEventSink, TestPeer, TransferPhase, TransferRun, TransferSnapshot,
 };
 use sha2::{Digest, Sha256};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     fs::{self, File},
     io::{Read, Write},
-    net::SocketAddr,
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     time::timeout,
 };
-use uuid::Uuid;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 struct MeasuringAllocator;
