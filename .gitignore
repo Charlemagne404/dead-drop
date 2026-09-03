@@ -7,3 +7,6 @@ release-output/
 .release-output-input/
 .DS_Store
 *.tsbuildinfo
+*.key
+*.key.pub
+*.private

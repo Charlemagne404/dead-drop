@@ -1,8 +1,8 @@
 # Drop architecture
 
 This document describes the architecture that is in the repository today. It
-is intentionally a map of the current v1 implementation, not a proposal for a
-new service or a public SaaS architecture.
+is intentionally a map of the current Drop v2 implementation, not a proposal
+for a new service or a public SaaS architecture.
 
 ## Runtime shape
 
@@ -19,7 +19,8 @@ flowchart LR
     Discovery --> Registry[PeerRegistry]
     Registry --> Routing[Route selection]
     Routing --> Connectivity[IPv4 TCP identification]
-    Connectivity --> Protocol[Protocol v1 framing]
+    Connectivity --> Secure[Noise XX secure session]
+    Secure --> Protocol[Protocol v2 framing]
     State --> Listener[Transfer listener]
     Listener --> Protocol
     Protocol --> Transfer[Transfer orchestration]
@@ -61,9 +62,9 @@ listener or any discovery worker.
 | Application state | `src-tauri/src/models.rs` | Owns `AppState`, transfer admission/cancellation, settings, persisted remembered peers, runtime DTOs, and cross-boundary transfer DTOs. |
 | Peer model | `src-tauri/src/peer.rs` | Owns stable device identity, source-scoped endpoint observations, reachability, route history, registry reconciliation, and snapshots. |
 | Discovery | `src-tauri/src/discovery.rs` | Runs mDNS, local IPv4 fallback, Tailscale status, and remembered-endpoint workers. It submits `DiscoveryObservation` values to `AppState`. |
-| Connectivity | `src-tauri/src/connectivity.rs` | Resolves/probes an IPv4 endpoint and performs the bounded Hello exchange. It validates the peer before a route is used. |
+| Connectivity | `src-tauri/src/connectivity.rs` | Resolves/probes an IPv4 endpoint, performs the bounded Noise XX handshake, and exchanges the encrypted Hello. It validates the peer before a route is used. |
 | Routing | `src-tauri/src/routing.rs` | Ranks the registry's endpoint candidates deterministically. It has no socket or filesystem behavior. |
-| Wire protocol | `src-tauri/src/protocol.rs` | Encodes/decodes v1 frames and control messages and validates protocol metadata. The normative contract is [`PROTOCOL_V1.md`](PROTOCOL_V1.md). |
+| Wire protocol | `src-tauri/src/protocol.rs` | Encodes/decodes bounded v2 logical frames and control messages inside the secure session and validates protocol metadata. The historical plaintext contract is [`PROTOCOL_V1.md`](PROTOCOL_V1.md); the current security boundary is [`SECURITY_DESIGN.md`](SECURITY_DESIGN.md). |
 | Transfer engine | `src-tauri/src/transfer.rs` | Admits one transfer, sequences request/decision/data/result messages, streams bytes, tracks lifecycle, and maps errors to UI/diagnostic forms. |
 | Destination filesystem | `src-tauri/src/transfer_files.rs` | Chooses collision-safe names, writes hidden staging files, finalizes without replacement, and rolls back/cleans up failed batches. |
 | OS adapters | `src-tauri/src/platform.rs` | Supplies application paths, settings/log locations, and platform-specific replace/no-replace moves. |
@@ -76,12 +77,14 @@ the old broad re-export from `models` is no longer part of the internal API.
 
 ## Identity, discovery, and routes
 
-The device identity is a stable UUID persisted with the device name and
-protocol version. An IP address is only an endpoint, never a device identity.
-Each discovery source contributes an `EndpointSource` and an observation. The
-registry merges observations by device UUID while retaining the source and
-route class for each endpoint. Source removal and staleness remove only that
-source's observation; another current endpoint can keep the logical peer
+The installation identity is a persisted X25519 static public key and its
+fingerprint. The existing stable UUID remains compatibility metadata bound to
+that key in the encrypted Hello. An IP address is only an endpoint, never a
+device identity. Each discovery source contributes an `EndpointSource` and an
+observation. The registry merges observations by stable UUID while retaining
+the source and route class for each endpoint, then secure identity validation
+authorizes the peer by fingerprint. Source removal and staleness remove only
+that source's observation; another current endpoint can keep the logical peer
 online.
 
 The current sources are:
@@ -92,10 +95,11 @@ The current sources are:
 - remembered endpoints revalidated on a timer; and
 - an explicit private/overlay IPv4 address entered in Settings diagnostics.
 
-Fallback, Tailscale, remembered, and manual candidates complete
-`connectivity::connect_and_identify` before entering the registry. The Hello
-exchange validates the protocol version, device metadata, self-connection, and
-an expected peer UUID where one is known.
+Fallback, Tailscale, remembered, and manual candidates complete the same
+`connectivity::connect_and_identify` Noise/Hello exchange before entering the
+registry. The encrypted Hello validates the protocol version, device metadata,
+self-connection, expected peer UUID where one is known, and the public-key
+fingerprint observed in the secure handshake.
 
 `routing::rank_endpoints` prefers reachable, recently verified direct-local
 paths, then overlay and remembered paths according to the route class and
@@ -108,10 +112,12 @@ kept in [`CONNECTIVITY.md`](CONNECTIVITY.md).
 
 ## Protocol and transfer state
 
-`protocol.rs` uses a five-byte frame header: one frame kind byte followed by a
-big-endian `u32` payload length. Control payloads are JSON; data payloads are
-bounded byte chunks. Hello, transfer request/decision, file start/end,
-complete, result, and cancel messages are the current v1 message set.
+`protocol.rs` uses a five-byte logical frame header: one frame kind byte
+followed by a big-endian `u32` payload length. Control payloads are JSON; data
+payloads are bounded byte chunks. The logical frames are fragmented into
+authenticated Noise transport records before they leave the process. The
+encrypted Hello, transfer request/decision, file start/end, complete, result,
+and cancel messages are the current v2 message set.
 
 The normal outgoing lifecycle is:
 
@@ -133,9 +139,10 @@ availability cases. Its `user_message` is intentionally safe and concise;
 level `ProtocolError` and `ConnectivityError` retain their subsystem context
 until this mapping is needed.
 
-See [`PROTOCOL_V1.md`](PROTOCOL_V1.md) for frame limits and compatibility
-requirements. It is the canonical wire document; this page only explains who
-uses it.
+See [`SECURITY_DESIGN.md`](SECURITY_DESIGN.md) for the current secure-session
+and trust contract. [`PROTOCOL_V1.md`](PROTOCOL_V1.md) records the frozen
+historical plaintext framing and compatibility fixtures; it is not a fallback
+path for current transfers.
 
 ## File staging and finalization
 
@@ -163,10 +170,13 @@ unavailable; the receiver reports a destination error rather than silently
 redirecting it.
 
 The Rust event boundary currently emits `peers-updated`, `transfer-update`,
-`incoming-transfer`, `discovery-status`, and `connectivity-diagnostics`.
-`src/lib/events.ts` is the frontend vocabulary for those names. The settings
-panel can request a redacted diagnostics report; file contents, filenames,
-full receive paths, credentials, and Tailscale keys are excluded.
+`incoming-transfer`, `trust-request`, `discovery-status`, and
+`connectivity-diagnostics`. `src/lib/events.ts` is the frontend vocabulary for
+those names. The settings panel can request a redacted diagnostics report;
+file contents, filenames, full receive paths, credentials, identity private
+keys, Noise session material, update signing secrets, and Tailscale keys are
+excluded. Trusted-device records are keyed by the cryptographic fingerprint,
+not by a route or discovery claim.
 
 ## Release and testing architecture
 
@@ -188,11 +198,12 @@ The command matrix and its limitations are documented in
 [`PERFORMANCE.md`](PERFORMANCE.md), and native packaging remains in
 [`RELEASE_ENGINEERING.md`](RELEASE_ENGINEERING.md).
 
-## Deliberate v1 limits
+## Deliberate current limits
 
-The current implementation is IPv4-only, has no Drop-level transport
-encryption or trusted-device authentication, supports one active transfer, and
-does not provide resume, relay, NAT traversal, public-internet exposure, or
-automatic updating. Those are product/security/release decisions outside this
-maintainability pass; the existing implementation and compatibility identifiers
-are left intact.
+The current implementation is IPv4-only, supports one active transfer, and
+does not provide resume, relay, NAT traversal, or public-internet exposure.
+The optional signed updater is separate from the transfer protocol and does
+not restart Drop during an active transfer or secure-session setup. The
+historical plaintext v1 contract is rejected by the current listener; there is
+no silent downgrade. Compatibility identifiers remain where they are needed
+for upgrades and discovery.

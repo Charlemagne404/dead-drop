@@ -80,7 +80,7 @@ Transfers support u64 byte counters, up to 256 regular files, and up to 4 TiB pe
 
 All native builds require a current Rust toolchain, Node.js/npm, and the Tauri CLI already declared in `package.json`.
 
-The repeatable versioning, native CI, packaging, checksum, release-note, and signing handoff process is documented in [docs/RELEASE_ENGINEERING.md](docs/RELEASE_ENGINEERING.md).
+The repeatable versioning, native CI, packaging, checksum, release-note, and signing handoff process is documented in [docs/RELEASE_ENGINEERING.md](docs/RELEASE_ENGINEERING.md). The signed in-app update contract and transfer-safe install behavior are documented in [docs/UPDATER.md](docs/UPDATER.md).
 
 ### Windows
 
@@ -150,7 +150,10 @@ versioned secure v2 contract described in [docs/SECURITY_DESIGN.md](docs/SECURIT
 - Only one transfer is admitted at a time. Additional requests are declined with a clear busy response instead of competing for shared UI or destination state.
 - A first-contact or changed-identity peer must be explicitly trusted; trust is tied to the public-key fingerprint, not an IP address, name, or UUID.
 
-Current v2 has Drop-level authenticated encryption, per-session forward secrecy from fresh ephemeral keys, and replay resistance within each Noise session. It has no public-internet/port-forwarding support, NAT traversal, relay, resume, clipboard sharing, folder sync, or automatic updating. A v1 peer is rejected; there is no silent downgrade to plaintext. Tailscale encryption remains useful, but it does not replace Drop-level identity and session protection.
+Current v2 has Drop-level authenticated encryption, per-session forward secrecy from fresh ephemeral keys, and replay resistance within each Noise session. It has no public-internet/port-forwarding support, NAT traversal, relay, resume, clipboard sharing, folder sync, or transfer-level automatic updating. A v1 peer is rejected; there is no silent downgrade to plaintext. Tailscale encryption remains useful, but it does not replace Drop-level identity and session protection.
+Drop's separate in-app updater uses the signed Tauri updater mechanism described
+in [docs/UPDATER.md](docs/UPDATER.md); it is optional and never participates in
+transfers.
 
 ## Plain identity and compatibility
 

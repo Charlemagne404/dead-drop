@@ -35,6 +35,11 @@ import {
   type NoDeviceState,
 } from "./components/TransferPanels";
 import { SettingsPanel } from "./components/SettingsPanel";
+import {
+  loadAutomaticUpdateChecks,
+  saveAutomaticUpdateChecks,
+  useUpdater,
+} from "./lib/updater";
 import "./styles.css";
 
 function App() {
@@ -48,6 +53,7 @@ function App() {
   const [activeTransfer, setActiveTransfer] = useState<Transfer | null>(null);
   const [incoming, setIncoming] = useState<IncomingTransfer | null>(null);
   const [trustRequest, setTrustRequest] = useState<TrustRequest | null>(null);
+  const [automaticUpdateChecks, setAutomaticUpdateChecks] = useState(loadAutomaticUpdateChecks);
   const [isDragging, setIsDragging] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [openDiagnostics, setOpenDiagnostics] = useState(false);
@@ -66,6 +72,11 @@ function App() {
   );
   const transferLocked = Boolean(activeTransfer || incoming);
   const viewLocked = Boolean(transferLocked || isSettingsOpen || trustRequest);
+  const updater = useUpdater({
+    native,
+    transferBusy: transferLocked || Boolean(trustRequest),
+    automaticChecksEnabled: automaticUpdateChecks,
+  });
   const hasAvailablePeer = peers.some((peer) => peer.online && peer.protocolVersion === CURRENT_PROTOCOL_VERSION);
   const allPeersNeedUpdate = peers.length > 0 && peers.every((peer) => peer.protocolVersion !== CURRENT_PROTOCOL_VERSION);
   const noDeviceState: NoDeviceState = hasAvailablePeer
@@ -406,6 +417,15 @@ function App() {
                   : current);
                 setNotice("Device forgotten. Drop will ask before trusting it again.");
               }}
+              updateState={updater.state}
+              automaticUpdateChecks={automaticUpdateChecks}
+              transferBusy={transferLocked || Boolean(trustRequest)}
+              onCheckForUpdates={updater.checkNow}
+              onStartUpdate={updater.startUpdate}
+              onAutomaticUpdateChecksChange={(enabled) => {
+                setAutomaticUpdateChecks(enabled);
+                saveAutomaticUpdateChecks(enabled);
+              }}
               onSave={async (draft) => {
                 if (!native) {
                   setPreferences({ deviceName: draft.deviceName.trim(), destination: draft.destination.trim() });
@@ -562,3 +582,4 @@ function TrustPanel({
 
 const root = document.getElementById("root");
 if (root) createRoot(root).render(<App />);
+
