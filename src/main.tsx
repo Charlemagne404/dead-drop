@@ -1,6 +1,5 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { createRoot } from "react-dom/client";
 import "@fontsource/inter/400.css";
@@ -101,6 +100,8 @@ function shouldAcceptTransferUpdate(current: Transfer | null, next: Transfer) {
   return phaseOrder[next.phase] >= phaseOrder[current.phase];
 }
 
+type NoDeviceState = "searching" | "unreachable" | "outdated" | "select";
+
 function App() {
   const native = isNativeRuntime();
   const [peers, setPeers] = useState<Peer[]>(native ? [] : previewPeers);
@@ -113,6 +114,7 @@ function App() {
   const [incoming, setIncoming] = useState<IncomingTransfer | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [openDiagnostics, setOpenDiagnostics] = useState(false);
   const [notice, setNotice] = useState<string | null>(
     native ? null : "Preview only. Transfers run in the installed app.",
   );
@@ -120,14 +122,34 @@ function App() {
   const selectedPeerRef = useRef<Peer | null>(null);
   const lockedRef = useRef(false);
   const startTransferRef = useRef<(paths: string[]) => Promise<void>>(async () => undefined);
+  const peerIdsRef = useRef<Set<string>>(new Set());
+  const [radarPingKey, setRadarPingKey] = useState(0);
   const selectedPeer = useMemo(
     () => peers.find((peer) => peer.id === selectedId) ?? null,
     [peers, selectedId],
   );
-  const viewLocked = Boolean(activeTransfer || incoming || isSettingsOpen);
+  const transferLocked = Boolean(activeTransfer || incoming);
+  const viewLocked = Boolean(transferLocked || isSettingsOpen);
   const hasAvailablePeer = peers.some((peer) => peer.online && peer.protocolVersion === 1);
+  const allPeersNeedUpdate = peers.length > 0 && peers.every((peer) => peer.protocolVersion !== 1);
+  const noDeviceState: NoDeviceState = hasAvailablePeer
+    ? "select"
+    : !peers.length
+      ? "searching"
+      : allPeersNeedUpdate
+        ? "outdated"
+        : "unreachable";
   selectedPeerRef.current = selectedPeer;
   lockedRef.current = viewLocked;
+
+  useEffect(() => {
+    const currentIds = new Set(peers.map((peer) => peer.id));
+    const foundNewPeer = [...currentIds].some((id) => !peerIdsRef.current.has(id));
+    if (foundNewPeer && !selectedPeerRef.current) {
+      setRadarPingKey((current) => current + 1);
+    }
+    peerIdsRef.current = currentIds;
+  }, [peers]);
 
   useEffect(() => {
     if (!native) return;
@@ -302,16 +324,6 @@ function App() {
     void startTransfer([...event.dataTransfer.files].map((file) => file.name));
   };
 
-  const titlebarAction = async (action: "minimize" | "toggleMaximize" | "close") => {
-    if (!native) return;
-    try {
-      const window = getCurrentWindow();
-      await window[action]();
-    } catch {
-      setNotice("Couldn't change the window.");
-    }
-  };
-
   const headerStatus = incoming
     ? "Incoming request"
     : activeTransfer
@@ -331,8 +343,7 @@ function App() {
       }}
     >
       <aside className="sidebar" aria-label="Drop navigation">
-        <div className="sidebar-drag" data-tauri-drag-region />
-        <div className="brand" data-tauri-drag-region aria-label="Drop">
+        <div className="brand" aria-label="Drop">
           <span>Drop</span>
         </div>
         <section className="device-section" aria-label="Devices">
@@ -368,22 +379,32 @@ function App() {
                 </button>
               );
             })}
-            {!peers.length && <p className="device-empty">Looking for devices.</p>}
+            {!peers.length && (
+              <p className="device-empty" aria-label="Looking for devices.">
+                Looking for devices<span className="device-empty-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+              </p>
+            )}
           </div>
         </section>
         <button
-          aria-disabled={viewLocked ? "true" : undefined}
-          className={`settings-link ${isSettingsOpen ? "is-active" : ""} ${viewLocked ? "is-locked" : ""}`}
+          aria-disabled={transferLocked ? "true" : undefined}
+          className={`settings-link ${isSettingsOpen ? "is-active" : ""} ${transferLocked ? "is-locked" : ""}`}
           type="button"
           onClick={() => {
-            if (lockedRef.current) {
+            if (isSettingsOpen) {
+              setOpenDiagnostics(false);
+              setIsSettingsOpen(false);
+              return;
+            }
+            if (transferLocked) {
               setNotice("Finish the current transfer first.");
               return;
             }
+            setOpenDiagnostics(false);
             setIsSettingsOpen(true);
           }}
         >
-          <GearIcon />
+          <SettingsIcon />
           Settings
         </button>
       </aside>
@@ -402,7 +423,6 @@ function App() {
         }}
         onDrop={handleBrowserDrop}
       >
-        <div className="content-drag" data-tauri-drag-region />
         <header className="content-header">
           <div aria-live="polite" className="quiet-notice">
             {notice}
@@ -410,11 +430,6 @@ function App() {
           <div aria-live="polite" className={`ready ${headerStatus === "Searching" ? "is-searching" : ""}`}>
             <span />
             {headerStatus}
-          </div>
-          <div className="window-controls" aria-label="Window controls">
-            <button onClick={() => void titlebarAction("minimize")} type="button" aria-label="Minimize"><MinusIcon /></button>
-            <button onClick={() => void titlebarAction("toggleMaximize")} type="button" aria-label="Maximize"><SquareIcon /></button>
-            <button onClick={() => void titlebarAction("close")} type="button" aria-label="Close"><CloseIcon /></button>
           </div>
         </header>
 
@@ -424,7 +439,11 @@ function App() {
               native={native}
               preferences={preferences}
               diagnostics={diagnostics}
-              onClose={() => setIsSettingsOpen(false)}
+              openDiagnostics={openDiagnostics}
+              onClose={() => {
+                setOpenDiagnostics(false);
+                setIsSettingsOpen(false);
+              }}
               onNotice={setNotice}
               onPeerConnected={(peer) => {
                 setPeers((current) => {
@@ -432,6 +451,7 @@ function App() {
                   return [...withoutPeer, peer];
                 });
                 setSelectedId(peer.id);
+                setOpenDiagnostics(false);
                 setIsSettingsOpen(false);
                 setNotice(`${peer.name} is ready.`);
               }}
@@ -491,7 +511,14 @@ function App() {
           ) : selectedPeer ? (
             <SendPanel peer={selectedPeer} onChoose={() => void chooseAndSend()} />
           ) : (
-            <NoDevicePanel />
+            <NoDevicePanel
+              state={noDeviceState}
+              pingKey={radarPingKey}
+              onOpenSettings={() => {
+                setOpenDiagnostics(true);
+                setIsSettingsOpen(true);
+              }}
+            />
           )}
         </div>
         {isDragging && (
@@ -545,13 +572,54 @@ function SendPanel({ peer, onChoose }: { peer: Peer; onChoose: () => void }) {
   );
 }
 
-function NoDevicePanel() {
+const noDeviceCopy: Record<NoDeviceState, { title: string; status: string; help: string }> = {
+  searching: {
+    title: "No devices yet.",
+    status: "Searching nearby…",
+    help: "Keep Drop open on another device on the same network.",
+  },
+  unreachable: {
+    title: "No reachable devices.",
+    status: "Check the other device.",
+    help: "Make sure Drop is open and both devices are on the same network.",
+  },
+  outdated: {
+    title: "Update Drop to connect.",
+    status: "A nearby device needs an update.",
+    help: "Install the latest version on the other device to send files.",
+  },
+  select: {
+    title: "Choose a device.",
+    status: "A device is ready.",
+    help: "Select a device from the list to send files.",
+  },
+};
+
+function NoDevicePanel({
+  state,
+  pingKey,
+  onOpenSettings,
+}: {
+  state: NoDeviceState;
+  pingKey: number;
+  onOpenSettings: () => void;
+}) {
+  const copy = noDeviceCopy[state];
+
   return (
-    <div className="no-device state-panel">
+    <div className={`no-device state-panel is-${state}`}>
       <div className="no-device-copy">
-        <RadarIcon />
-        <h1>No devices yet.</h1>
-        <p>Looking for devices.</p>
+        <div className="radar-stage">
+          <RadarIcon searching={state === "searching"} pingKey={pingKey} />
+        </div>
+        <h1>{copy.title}</h1>
+        <p className="no-device-status" role="status">{copy.status}</p>
+        <p className="no-device-help">{copy.help}</p>
+        {state !== "select" && (
+          <button className="text-button no-device-action" type="button" onClick={onOpenSettings}>
+            Open diagnostics
+          </button>
+        )}
       </div>
     </div>
   );
@@ -671,6 +739,7 @@ function SettingsPanel({
   native,
   preferences,
   diagnostics,
+  openDiagnostics,
   onClose,
   onNotice,
   onPeerConnected,
@@ -679,6 +748,7 @@ function SettingsPanel({
   native: boolean;
   preferences: Preferences;
   diagnostics: RuntimeDiagnostics | null;
+  openDiagnostics: boolean;
   onClose: () => void;
   onNotice: (message: string) => void;
   onPeerConnected: (peer: Peer) => void;
@@ -692,7 +762,18 @@ function SettingsPanel({
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [reportAction, setReportAction] = useState<"copy" | "export" | null>(null);
   const [reportError, setReportError] = useState<string | null>(null);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(openDiagnostics);
   useEffect(() => setDraft(preferences), [preferences]);
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented && !saving) {
+        event.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose, saving]);
   const save = async () => {
     if (saving) return;
     setSaving(true);
@@ -746,47 +827,68 @@ function SettingsPanel({
   };
   return (
     <div className="settings-panel state-panel">
+      <div className="settings-toolbar">
+        <div className="settings-title">
+          <p className="eyebrow">Preferences</p>
+          <h1>Settings</h1>
+        </div>
+        <button
+          aria-keyshortcuts="Escape"
+          aria-label="Close settings"
+          className="outline-button settings-close"
+          disabled={saving}
+          onClick={onClose}
+          title="Close settings"
+          type="button"
+        >
+          <SettingsCloseIcon />
+          <span>Close settings</span>
+        </button>
+      </div>
+      <p className="settings-intro">Name this device and choose where received files go.</p>
       <form
+        className="settings-form"
         noValidate
         onSubmit={(event) => {
           event.preventDefault();
           void save();
         }}
       >
-        <h1>Settings</h1>
-      <p className="settings-intro">Name this device and choose where received files go.</p>
-      <div className={`settings-health ${diagnostics?.local.receiveDirectoryAvailable === false ? "is-warning" : ""}`} role="status">
-        <span className="health-mark" aria-hidden="true" />
-        <span>
-          <strong>{diagnostics?.local.receiveDirectoryAvailable === false ? "Receive folder unavailable" : "Ready"}</strong>
-          <small>
-            {diagnostics?.local.transport ?? "IPv4"} · {diagnostics?.local.servicePort ? `TCP ${diagnostics.local.servicePort}` : "automatic service port"} · automatic discovery
-          </small>
-        </span>
-      </div>
-      <label htmlFor="device-name">Device name
-        <input id="device-name" value={draft.deviceName} maxLength={64} autoComplete="off" aria-invalid={Boolean(error)} aria-describedby={error ? "settings-error" : undefined} onChange={(event) => setDraft({ ...draft, deviceName: event.target.value })} />
-      </label>
-      <label htmlFor="received-folder">Received files folder
-        <span className="path-field">
-          <input id="received-folder" value={draft.destination} inputMode="text" autoComplete="off" spellCheck={false} aria-invalid={Boolean(error)} aria-describedby={error ? "settings-error" : undefined} onChange={(event) => setDraft({ ...draft, destination: event.target.value })} />
-          {native && <button type="button" className="outline-button path-button" onClick={async () => {
-            try {
-              const destination = await chooseDirectory();
-              if (destination) setDraft((current) => ({ ...current, destination }));
-            } catch (reason) {
-              setError(userFacingError(reason, "Couldn't open the folder picker."));
-            }
-          }}>Choose…</button>}
-        </span>
-      </label>
-      {error && <p id="settings-error" className="settings-error" role="alert">{error}</p>}
+        <div className={`settings-health ${diagnostics?.local.receiveDirectoryAvailable === false ? "is-warning" : ""}`} role="status">
+          <span className="health-mark" aria-hidden="true" />
+          <span>
+            <strong>{diagnostics?.local.receiveDirectoryAvailable === false ? "Receive folder unavailable" : "Ready"}</strong>
+            <small>
+              {diagnostics?.local.transport ?? "IPv4"} · {diagnostics?.local.servicePort ? `TCP ${diagnostics.local.servicePort}` : "automatic service port"} · automatic discovery
+            </small>
+          </span>
+        </div>
+        <label htmlFor="device-name">Device name
+          <input id="device-name" value={draft.deviceName} maxLength={64} autoComplete="off" aria-invalid={Boolean(error)} aria-describedby={error ? "settings-error" : undefined} onChange={(event) => setDraft({ ...draft, deviceName: event.target.value })} />
+        </label>
+        <label htmlFor="received-folder">Received files folder
+          <span className="path-field">
+            <input id="received-folder" value={draft.destination} inputMode="text" autoComplete="off" spellCheck={false} aria-invalid={Boolean(error)} aria-describedby={error ? "settings-error" : undefined} onChange={(event) => setDraft({ ...draft, destination: event.target.value })} />
+            {native && <button type="button" className="outline-button path-button" onClick={async () => {
+              try {
+                const destination = await chooseDirectory();
+                if (destination) setDraft((current) => ({ ...current, destination }));
+              } catch (reason) {
+                setError(userFacingError(reason, "Couldn't open the folder picker."));
+              }
+            }}>Choose…</button>}
+          </span>
+        </label>
+        {error && <p id="settings-error" className="settings-error" role="alert">{error}</p>}
         <div className="settings-actions">
           <button type="submit" className="primary-button" disabled={saving}>{saving ? "Saving…" : "Save"}</button>
-          <button type="button" className="text-button" onClick={onClose} disabled={saving}>Close</button>
         </div>
       </form>
-      <details className="diagnostics-disclosure">
+      <details
+        className="diagnostics-disclosure"
+        open={diagnosticsOpen}
+        onToggle={(event) => setDiagnosticsOpen((event.currentTarget as HTMLDetailsElement).open)}
+      >
         <summary>Connection diagnostics</summary>
         <div className="diagnostics-body">
           <div className="diagnostic-report">
@@ -1040,15 +1142,43 @@ function DeviceIcon({ os }: { os: string }) { return os.toLowerCase().includes("
 function FileIcon() { return <svg className="file-icon" viewBox="0 0 48 56" aria-hidden="true"><path d="M7 2h22l12 12v38a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Z"/><path d="M29 2v13h12"/></svg>; }
 function LaptopIcon() { return <svg className="device-icon" viewBox="0 0 32 32" aria-hidden="true"><rect x="6.25" y="7" width="19.5" height="15" rx="1"/><path d="M3.5 25h25M12 25h8"/></svg>; }
 function DesktopIcon() { return <svg className="device-icon" viewBox="0 0 32 32" aria-hidden="true"><rect x="5.5" y="6" width="21" height="15" rx="1"/><path d="M16 21v5M11.5 26h9"/></svg>; }
-function GearIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.6 3 .5 2.1a7 7 0 0 1 3.8 0l.5-2.1 2.2.9-.8 2a7 7 0 0 1 2.7 2.7l2-.8.9 2.2-2.1.5a7 7 0 0 1 0 3.8l2.1.5-.9 2.2-2-.8a7 7 0 0 1-2.7 2.7l.8 2-2.2.9-.5-2.1a7 7 0 0 1-3.8 0L9.6 21l-2.2-.9.8-2a7 7 0 0 1-2.7-2.7l-2 .8-.9-2.2 2.1-.5a7 7 0 0 1 0-3.8l-2.1-.5.9-2.2 2 .8a7 7 0 0 1 2.7-2.7l-.8-2L9.6 3Z"/><circle cx="12" cy="12" r="2.6"/></svg>; }
-function RadarIcon() { return <svg className="radar-icon" viewBox="0 0 68 68" aria-hidden="true"><circle cx="34" cy="34" r="26"/><circle cx="34" cy="34" r="14"/><path d="M34 34 53 16M34 8v4M60 34h-4M34 60v-4M8 34h4"/><circle cx="34" cy="34" r="2"/></svg>; }
+function SettingsIcon() {
+  return (
+    <svg className="settings-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.09a2 2 0 0 1 1 1.73v.5a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.73l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  );
+}
+function SettingsCloseIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>; }
+function RadarIcon({ searching = false, pingKey = 0 }: { searching?: boolean; pingKey?: number } = {}) {
+  const previousPingKeyRef = useRef(pingKey);
+  const [activePingKey, setActivePingKey] = useState<number | null>(null);
+  useEffect(() => {
+    if (pingKey > 0 && pingKey !== previousPingKeyRef.current) {
+      setActivePingKey(pingKey);
+    }
+    previousPingKeyRef.current = pingKey;
+  }, [pingKey]);
+
+  return (
+    <svg className={`radar-icon ${searching ? "is-searching" : ""} ${activePingKey !== null ? "has-ping" : ""}`} viewBox="0 0 68 68" aria-hidden="true">
+      <circle className="radar-ring radar-ring-outer" cx="34" cy="34" r="26" />
+      <circle className="radar-ring radar-ring-inner" cx="34" cy="34" r="14" />
+      <g className="radar-sweep">
+        <path className="radar-sweep-trail" d="M34 34 60 34A26 26 0 0 0 42.9 9.3Z" />
+        <path className="radar-sweep-mid" d="M34 34 60 34A26 26 0 0 0 53.9 17.3Z" />
+        <path className="radar-sweep-near" d="M34 34 60 34A26 26 0 0 0 58.7 26Z" />
+        <path className="radar-sweep-beam" d="M34 34 60 34" />
+      </g>
+      <circle className="radar-ping" key={activePingKey ?? "idle"} cx="34" cy="34" r="4" />
+      <circle className="radar-center" cx="34" cy="34" r="2" />
+    </svg>
+  );
+}
 function TransferIcon() { return <svg className="transfer-icon" viewBox="0 0 48 48" aria-hidden="true"><path d="M10 15h22M26 8l7 7-7 7M38 33H16M22 26l-7 7 7 7"/></svg>; }
 function CheckIcon() { return <svg className="check-icon" viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="17"/><path d="m16 24 5 5 11-11"/></svg>; }
 function ArrowIcon() { return <svg viewBox="0 0 18 18" aria-hidden="true"><path d="M3 9h11M10 4l5 5-5 5"/></svg>; }
-function MinusIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10"/></svg>; }
-function SquareIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="4" width="8" height="8"/></svg>; }
-function CloseIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>; }
-
 function fileNameFromPath(path: string) {
   return path.split(/[/\\]/).at(-1) || "File";
 }

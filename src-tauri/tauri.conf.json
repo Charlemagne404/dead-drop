@@ -19,7 +19,9 @@
         "minWidth": 780,
         "minHeight": 560,
         "resizable": true,
-        "decorations": false
+        "decorations": true,
+        "theme": "Dark",
+        "titleBarStyle": "Visible"
       }
     ],
     "security": {
