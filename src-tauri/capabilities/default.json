@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Drop desktop capability set",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": ["core:default", "dialog:default", "process:allow-restart", "updater:default"]
 }

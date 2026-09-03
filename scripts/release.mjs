@@ -31,9 +31,17 @@ const TARGETS = [
   "x86_64-apple-darwin",
   "x86_64-unknown-linux-gnu",
 ];
+const UPDATER_PLATFORM_KEYS = {
+  "x86_64-pc-windows-msvc": "windows-x86_64",
+  "aarch64-apple-darwin": "darwin-aarch64",
+  "x86_64-apple-darwin": "darwin-x86_64",
+  "x86_64-unknown-linux-gnu": "linux-x86_64",
+};
+const UPDATER_RELEASE_BASE = "https://github.com/Charlemagne404/dead-drop/releases/download";
 const VERSION_PATTERN =
   /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const PACKAGE_EXTENSIONS = new Set([".exe", ".msi", ".dmg", ".deb", ".appimage"]);
+const AUDITABLE_ARTIFACT_KINDS = new Set(["app", "exe", "msi", "dmg", "deb", "appimage"]);
 
 function fail(message) {
   throw new Error(message);
@@ -248,6 +256,7 @@ function configProblems() {
   const tauriConfig = readJson(TAURI_CONFIG_PATH);
   const cargoToml = readFileSync(CARGO_TOML_PATH, "utf8");
   const bundle = tauriConfig.bundle ?? {};
+  const updater = tauriConfig.plugins?.updater ?? {};
   const problems = [];
   const expect = (condition, message) => {
     if (!condition) problems.push(message);
@@ -261,6 +270,20 @@ function configProblems() {
   expect(tauriConfig.build?.frontendDist === "../dist", "Tauri frontendDist must remain ../dist.");
   expect(tauriConfig.app?.windows?.[0]?.title === PRODUCT_NAME, 'The main window title must be "Drop".');
   expect(bundle.active === true, "Tauri bundling must be enabled.");
+  expect(bundle.createUpdaterArtifacts === true, "Tauri updater artifact generation must be enabled.");
+  expect(typeof updater.pubkey === "string" && updater.pubkey.trim().length >= 80, "Tauri updater public key is missing.");
+  const updaterEndpoints = Array.isArray(updater.endpoints) ? updater.endpoints : [];
+  expect(updaterEndpoints.length > 0, "Tauri updater endpoints are missing.");
+  for (const endpoint of updaterEndpoints) {
+    let parsed;
+    try {
+      parsed = new URL(endpoint);
+    } catch {
+      parsed = null;
+    }
+    expect(parsed?.protocol === "https:", `Tauri updater endpoint must use HTTPS: ${endpoint}`);
+  }
+  expect(updater.dangerousInsecureTransportProtocol !== true, "Insecure Tauri updater transport must remain disabled.");
 
   const configuredTargets = new Set(bundle.targets ?? []);
   for (const target of ["app", "dmg", "deb", "appimage", "nsis", "msi"]) {
@@ -441,6 +464,89 @@ function inspectAppImage(candidate, problems) {
   }
 }
 
+function updaterArtifactPair(target, candidates) {
+  const targetCandidates = candidates.filter((candidate) => candidate.target === target || !candidate.target);
+  let artifact = null;
+  if (target === "x86_64-pc-windows-msvc") {
+    artifact = targetCandidates.find(
+      (candidate) => candidate.kind === "exe" && /setup/i.test(basename(artifactPath(candidate))),
+    ) ?? null;
+  } else if (target === "aarch64-apple-darwin" || target === "x86_64-apple-darwin") {
+    artifact = targetCandidates.find((candidate) => candidate.kind === "updater-archive") ?? null;
+  } else if (target === "x86_64-unknown-linux-gnu") {
+    artifact = targetCandidates.find((candidate) => candidate.kind === "appimage") ?? null;
+  }
+  if (!artifact) return { artifact: null, signature: null };
+  const signature = targetCandidates.find(
+    (candidate) => candidate.kind === "signature" && artifactPath(candidate) === `${artifactPath(artifact)}.sig`,
+  ) ?? null;
+  return { artifact, signature };
+}
+
+function artifactPath(candidate) {
+  return candidate.path ?? candidate.source;
+}
+
+function updaterArtifactProblems(target, candidates) {
+  const pair = updaterArtifactPair(target, candidates);
+  const problems = [];
+  if (!pair.artifact) {
+    problems.push(`No Tauri updater artifact was found for ${target}.`);
+  } else if (!pair.signature) {
+    problems.push(`${basename(artifactPath(pair.artifact))} is missing its adjacent .sig file.`);
+  } else if (!readFileSync(artifactPath(pair.signature), "utf8").trim()) {
+    problems.push(`${basename(artifactPath(pair.signature))} is empty.`);
+  }
+  return problems;
+}
+
+function auditUpdaterBundle(target, root) {
+  if (!existsSync(root)) fail(`Bundle directory does not exist: ${root}`);
+  const candidates = artifactFiles(root, { includeUpdaterArtifacts: true });
+  const problems = updaterArtifactProblems(target, candidates);
+  if (problems.length > 0) {
+    fail(`Updater artifact audit failed for ${target}:\n${problems.map((problem) => `- ${problem}`).join("\n")}`);
+  }
+  const pair = updaterArtifactPair(target, candidates);
+  console.log(`Updater artifact audit OK: ${target}`);
+  console.log(`- artifact: ${relative(ROOT, artifactPath(pair.artifact))}`);
+  console.log(`- signature: ${relative(ROOT, artifactPath(pair.signature))}`);
+  return pair;
+}
+
+function updaterManifestForArtifacts(copiedArtifacts, version, releaseBase = UPDATER_RELEASE_BASE) {
+  const platforms = {};
+  const missing = [];
+  for (const target of TARGETS) {
+    const pair = updaterArtifactPair(target, copiedArtifacts);
+    if (!pair.artifact || !pair.signature) {
+      missing.push(...updaterArtifactProblems(target, copiedArtifacts));
+      continue;
+    }
+    const signature = readFileSync(artifactPath(pair.signature), "utf8").trim();
+    if (!signature) {
+      missing.push(`${basename(artifactPath(pair.signature))} is empty.`);
+      continue;
+    }
+    platforms[UPDATER_PLATFORM_KEYS[target]] = {
+      url: `${releaseBase}/v${version}/${encodeURIComponent(basename(artifactPath(pair.artifact)))}`,
+      signature,
+    };
+  }
+  if (missing.length > 0 || Object.keys(platforms).length !== TARGETS.length) {
+    return { manifest: null, missing: [...new Set(missing)] };
+  }
+  return {
+    manifest: {
+      version,
+      notes: `Drop ${version}`,
+      pub_date: new Date().toISOString(),
+      platforms,
+    },
+    missing: [],
+  };
+}
+
 function auditBundle(target, root = bundleRoot(target)) {
   const version = currentVersion();
   if (!existsSync(root)) fail(`Bundle directory does not exist: ${root}`);
@@ -465,16 +571,47 @@ function auditBundle(target, root = bundleRoot(target)) {
   return candidates;
 }
 
-function artifactFiles(directory) {
+function artifactKind(fileName, includeUpdaterArtifacts) {
+  const lowerName = fileName.toLowerCase();
+  const extension = extname(fileName).toLowerCase();
+  if (PACKAGE_EXTENSIONS.has(extension)) return extension.slice(1).toLowerCase();
+  if (!includeUpdaterArtifacts) return null;
+  if (lowerName.endsWith(".sig")) return "signature";
+  if (lowerName.endsWith(".app.tar.gz") || lowerName.endsWith(".appimage.tar.gz")) return "updater-archive";
+  if (lowerName.endsWith(".nsis.zip") || lowerName.endsWith(".msi.zip")) return "updater-archive";
+  return null;
+}
+
+function updaterArtifactOutputName(candidate, updaterArtifactPaths) {
+  const originalPath = candidate.path ?? candidate.source;
+  const originalName = basename(originalPath);
+  const isSignature = originalName.toLowerCase().endsWith(".sig");
+  const artifactPath = isSignature ? originalPath.slice(0, -4) : originalPath;
+  const isUpdaterArtifact = updaterArtifactPaths.has(artifactPath);
+  if (!isUpdaterArtifact) return originalName;
+
+  const artifactName = basename(artifactPath);
+  const archiveExtension = [".app.tar.gz", ".appimage.tar.gz", ".nsis.zip", ".msi.zip"].find((extension) =>
+    artifactName.toLowerCase().endsWith(extension),
+  );
+  const extension = archiveExtension ?? extname(artifactName);
+  const renamed = extension
+    ? `${artifactName.slice(0, -extension.length)}-${candidate.target}${extension}`
+    : `${artifactName}-${candidate.target}`;
+  return isSignature ? `${renamed}.sig` : renamed;
+}
+
+function artifactFiles(directory, { includeUpdaterArtifacts = false } = {}) {
   const files = [];
   if (!existsSync(directory)) return files;
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) {
       if (entry.name.toLowerCase().endsWith(".app")) files.push({ path, kind: "app" });
-      else files.push(...artifactFiles(path));
-    } else if (PACKAGE_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
-      files.push({ path, kind: extname(entry.name).slice(1).toLowerCase() });
+      else files.push(...artifactFiles(path, { includeUpdaterArtifacts }));
+    } else {
+      const kind = artifactKind(entry.name, includeUpdaterArtifacts);
+      if (kind) files.push({ path, kind });
     }
   }
   return files;
@@ -566,19 +703,32 @@ function writeArtifactOutputs(outputDirectory, copiedArtifacts, version) {
       });
     }
   }
+  const updater = updaterManifestForArtifacts(copiedArtifacts, version);
   writeFileSync(join(outputDirectory, "SHA256SUMS.txt"), `${sums.sort().join("\n")}\n`, "utf8");
-  writeFileSync(
-    join(outputDirectory, "UNSIGNED.txt"),
-    "These Drop artifacts were built with --no-sign and are not release-ready until platform signing and notarization are complete.\n",
-    "utf8",
-  );
+  if (updater.manifest) {
+    writeFileSync(join(outputDirectory, "latest.json"), `${JSON.stringify(updater.manifest, null, 2)}\n`, "utf8");
+  } else {
+    writeFileSync(
+      join(outputDirectory, "UNSIGNED.txt"),
+      "These Drop artifacts do not include a complete signed Tauri updater set and are not release-ready.\n",
+      "utf8",
+    );
+    writeFileSync(
+      join(outputDirectory, "UPDATER_NOT_READY.txt"),
+      `No signed Tauri updater manifest was generated for Drop ${version}.\n${updater.missing.map((problem) => `- ${problem}`).join("\n")}\n`,
+      "utf8",
+    );
+  }
   writeFileSync(
     join(outputDirectory, "ARTIFACT_MANIFEST.json"),
     `${JSON.stringify(
       {
         product: PRODUCT_NAME,
         version,
-        signing: "unsigned",
+        signing: updater.manifest ? "tauri-updater" : "unsigned",
+        updater: updater.manifest
+          ? { status: "signed", manifest: "latest.json", platforms: Object.keys(updater.manifest.platforms).sort() }
+          : { status: "unready", missing: updater.missing },
         commit: gitRevision(),
         generatedAt: new Date().toISOString(),
         artifacts: manifestArtifacts,
@@ -592,10 +742,18 @@ function writeArtifactOutputs(outputDirectory, copiedArtifacts, version) {
 
 function copyCandidates(candidates, outputDirectory, { targetDirectories = true } = {}) {
   const copiedArtifacts = [];
+  const updaterArtifactPaths = new Set(
+    candidates
+      .filter((candidate) => candidate.kind === "updater-archive" || candidate.kind === "signature")
+      .map((candidate) => {
+        const path = candidate.path ?? candidate.source;
+        return candidate.kind === "signature" ? path.slice(0, -4) : path;
+      }),
+  );
   for (const candidate of candidates) {
     const targetDirectory = targetDirectories ? join(outputDirectory, candidate.target) : outputDirectory;
     mkdirSync(targetDirectory, { recursive: true });
-    const destination = join(targetDirectory, basename(candidate.path));
+    const destination = join(targetDirectory, updaterArtifactOutputName(candidate, updaterArtifactPaths));
     if (existsSync(destination)) fail(`Artifact name collision while preparing output: ${destination}`);
     cpSync(candidate.path, destination, { recursive: candidate.kind === "app" });
     copiedArtifacts.push({ source: destination, target: candidate.target, kind: candidate.kind });
@@ -614,7 +772,9 @@ function auditCopiedArtifacts(copiedArtifacts, version) {
   for (const artifact of copiedArtifacts) {
     if (!byTarget.has(artifact.target)) byTarget.set(artifact.target, []);
     byTarget.get(artifact.target).push(artifact);
-    problems.push(...artifactNameProblems({ path: artifact.source, kind: artifact.kind }, artifact.target, version));
+    if (AUDITABLE_ARTIFACT_KINDS.has(artifact.kind)) {
+      problems.push(...artifactNameProblems({ path: artifact.source, kind: artifact.kind }, artifact.target, version));
+    }
   }
   for (const target of TARGETS) {
     const artifacts = byTarget.get(target) ?? [];
@@ -627,7 +787,7 @@ function auditCopiedArtifacts(copiedArtifacts, version) {
 
 function collectArtifacts(inputRoot, outputDirectory, version, force) {
   if (!existsSync(inputRoot)) fail(`Artifact input directory does not exist: ${inputRoot}`);
-  const discovered = artifactFiles(inputRoot).map((artifact) => ({
+  const discovered = artifactFiles(inputRoot, { includeUpdaterArtifacts: true }).map((artifact) => ({
     ...artifact,
     target: inferTarget(inputRoot, artifact.path),
   }));
@@ -694,7 +854,7 @@ function parseArgs(argv) {
       continue;
     }
     const key = value.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
-    if (["skipChecks", "skipPackage", "force", "smoke", "dryRun", "allowDirty"].includes(key)) {
+    if (["skipChecks", "skipPackage", "force", "smoke", "dryRun", "allowDirty", "updater"].includes(key)) {
       options[key] = true;
       continue;
     }
@@ -711,6 +871,7 @@ function runChecks(target) {
   run("npm", ["run", "check:workflows"]);
   run("npm", ["run", "check:licenses"]);
   run("npm", ["run", "test:release"]);
+  run("npm", ["run", "test:updater"]);
   run("npm", ["run", "build"]);
   run("cargo", ["fmt", "--manifest-path", "src-tauri/Cargo.toml", "--", "--check"]);
   const targetArgs = target ? ["--target", target] : [];
@@ -788,6 +949,7 @@ async function main(argv = process.argv.slice(2)) {
     const root = resolve(ROOT, options.path ?? bundleRoot(target));
     checkMetadata(target);
     auditBundle(target, root);
+    if (options.updater) auditUpdaterBundle(target, root);
     if (options.smoke) await launchSmoke(smokeExecutable(target, root), dirname(root));
     return;
   }

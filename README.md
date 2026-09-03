@@ -74,7 +74,7 @@ Transfers support u64 byte counters, up to 256 regular files, and up to 4 TiB pe
 
 All native builds require a current Rust toolchain, Node.js/npm, and the Tauri CLI already declared in `package.json`.
 
-The repeatable versioning, native CI, packaging, checksum, release-note, and signing handoff process is documented in [docs/RELEASE_ENGINEERING.md](docs/RELEASE_ENGINEERING.md).
+The repeatable versioning, native CI, packaging, checksum, release-note, and signing handoff process is documented in [docs/RELEASE_ENGINEERING.md](docs/RELEASE_ENGINEERING.md). The signed in-app update contract and transfer-safe install behavior are documented in [docs/UPDATER.md](docs/UPDATER.md).
 
 ### Windows
 
@@ -142,7 +142,7 @@ contract is documented in [docs/PROTOCOL_V1.md](docs/PROTOCOL_V1.md).
 - Transfers are limited to 256 regular files and 4 TiB per request.
 - Only one transfer is admitted at a time. Additional requests are declined with a clear busy response instead of competing for shared UI or destination state.
 
-There is no transport encryption, trusted-device authentication, replay protection, public-internet/port-forwarding support, NAT traversal, relay, resume, clipboard sharing, folder sync, or automatic updating in v1. Tailscale protects the network path according to its own overlay configuration, but it does not add Drop-level identity or encryption to the v1 protocol. Those protections must be designed before arbitrary remote-internet support is considered.
+There is no transport encryption, trusted-device authentication, replay protection, public-internet/port-forwarding support, NAT traversal, relay, resume, clipboard sharing, or folder sync in the v1 transfer protocol. Drop's separate in-app updater uses the signed Tauri updater mechanism described in [docs/UPDATER.md](docs/UPDATER.md); it is optional and never participates in transfers. Tailscale protects the network path according to its own overlay configuration, but it does not add Drop-level identity or encryption to the v1 protocol. Those protections must be designed before arbitrary remote-internet support is considered.
 
 ## Plain identity and compatibility
 

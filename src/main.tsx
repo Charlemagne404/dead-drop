@@ -17,6 +17,13 @@ import {
   type RuntimeDiagnostics,
   type Transfer,
 } from "./lib/desktop";
+import {
+  APP_VERSION,
+  loadAutomaticUpdateChecks,
+  saveAutomaticUpdateChecks,
+  useUpdater,
+} from "./lib/updater";
+import type { UpdaterState } from "./lib/updater-core";
 import "./styles.css";
 
 const previewPeers: Peer[] = [
@@ -112,6 +119,7 @@ function App() {
   );
   const [activeTransfer, setActiveTransfer] = useState<Transfer | null>(null);
   const [incoming, setIncoming] = useState<IncomingTransfer | null>(null);
+  const [automaticUpdateChecks, setAutomaticUpdateChecks] = useState(loadAutomaticUpdateChecks);
   const [isDragging, setIsDragging] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [openDiagnostics, setOpenDiagnostics] = useState(false);
@@ -130,6 +138,16 @@ function App() {
   );
   const transferLocked = Boolean(activeTransfer || incoming);
   const viewLocked = Boolean(transferLocked || isSettingsOpen);
+  const updater = useUpdater({
+    native,
+    transferBusy: transferLocked,
+    automaticChecksEnabled: automaticUpdateChecks,
+  });
+  const updateAvailable =
+    updater.state.kind === "available" ||
+    updater.state.kind === "downloading" ||
+    updater.state.kind === "ready" ||
+    (updater.state.kind === "failed" && Boolean(updater.state.update));
   const hasAvailablePeer = peers.some((peer) => peer.online && peer.protocolVersion === 1);
   const allPeersNeedUpdate = peers.length > 0 && peers.every((peer) => peer.protocolVersion !== 1);
   const noDeviceState: NoDeviceState = hasAvailablePeer
@@ -387,6 +405,7 @@ function App() {
           </div>
         </section>
         <button
+          aria-label={updateAvailable ? "Settings, update available" : "Settings"}
           aria-disabled={transferLocked ? "true" : undefined}
           className={`settings-link ${isSettingsOpen ? "is-active" : ""} ${transferLocked ? "is-locked" : ""}`}
           type="button"
@@ -405,7 +424,8 @@ function App() {
           }}
         >
           <SettingsIcon />
-          Settings
+          <span>Settings</span>
+          {updateAvailable && <span className="update-indicator" aria-label="Update available" />}
         </button>
       </aside>
 
@@ -439,12 +459,21 @@ function App() {
               native={native}
               preferences={preferences}
               diagnostics={diagnostics}
+              updateState={updater.state}
+              automaticUpdateChecks={automaticUpdateChecks}
+              transferBusy={transferLocked}
               openDiagnostics={openDiagnostics}
               onClose={() => {
                 setOpenDiagnostics(false);
                 setIsSettingsOpen(false);
               }}
               onNotice={setNotice}
+              onCheckForUpdates={() => updater.checkNow()}
+              onStartUpdate={() => updater.startUpdate()}
+              onAutomaticUpdateChecksChange={(enabled) => {
+                setAutomaticUpdateChecks(enabled);
+                saveAutomaticUpdateChecks(enabled);
+              }}
               onPeerConnected={(peer) => {
                 setPeers((current) => {
                   const withoutPeer = current.filter((candidate) => candidate.id !== peer.id);
@@ -739,18 +768,30 @@ function SettingsPanel({
   native,
   preferences,
   diagnostics,
+  updateState,
+  automaticUpdateChecks,
+  transferBusy,
   openDiagnostics,
   onClose,
   onNotice,
+  onCheckForUpdates,
+  onStartUpdate,
+  onAutomaticUpdateChecksChange,
   onPeerConnected,
   onSave,
 }: {
   native: boolean;
   preferences: Preferences;
   diagnostics: RuntimeDiagnostics | null;
+  updateState: UpdaterState;
+  automaticUpdateChecks: boolean;
+  transferBusy: boolean;
   openDiagnostics: boolean;
   onClose: () => void;
   onNotice: (message: string) => void;
+  onCheckForUpdates: () => Promise<UpdaterState>;
+  onStartUpdate: () => Promise<UpdaterState>;
+  onAutomaticUpdateChecksChange: (enabled: boolean) => void;
   onPeerConnected: (peer: Peer) => void;
   onSave: (draft: Preferences) => Promise<void>;
 }) {
@@ -884,6 +925,15 @@ function SettingsPanel({
           <button type="submit" className="primary-button" disabled={saving}>{saving ? "Saving…" : "Save"}</button>
         </div>
       </form>
+      <UpdatesSection
+        version={diagnostics?.application.version ?? APP_VERSION}
+        state={updateState}
+        automaticChecksEnabled={automaticUpdateChecks}
+        transferBusy={transferBusy}
+        onAutomaticChecksChange={onAutomaticUpdateChecksChange}
+        onCheckForUpdates={onCheckForUpdates}
+        onStartUpdate={onStartUpdate}
+      />
       <details
         className="diagnostics-disclosure"
         open={diagnosticsOpen}
@@ -1027,6 +1077,108 @@ function SettingsPanel({
       {!native && <p className="preview-caption">Preview only. Transfers run in the installed app.</p>}
     </div>
   );
+}
+
+function UpdatesSection({
+  version,
+  state,
+  automaticChecksEnabled,
+  transferBusy,
+  onAutomaticChecksChange,
+  onCheckForUpdates,
+  onStartUpdate,
+}: {
+  version: string;
+  state: UpdaterState;
+  automaticChecksEnabled: boolean;
+  transferBusy: boolean;
+  onAutomaticChecksChange: (enabled: boolean) => void;
+  onCheckForUpdates: () => Promise<UpdaterState>;
+  onStartUpdate: () => Promise<UpdaterState>;
+}) {
+  const hasUpdate =
+    state.kind === "available" ||
+    state.kind === "downloading" ||
+    state.kind === "ready" ||
+    (state.kind === "failed" && Boolean(state.update));
+  const canStartUpdate = state.kind === "available" || state.kind === "ready" || (state.kind === "failed" && Boolean(state.update));
+  const checkInProgress = state.kind === "checking" || state.kind === "downloading" || state.kind === "installing";
+  const status = updateStatusCopy(state, automaticChecksEnabled);
+  const progress = state.kind === "downloading" && state.contentLength
+    ? ` ${Math.round((state.downloadedBytes / state.contentLength) * 100)}%`
+    : "";
+
+  return (
+    <section className="updates-section" aria-labelledby="updates-heading">
+      <div className="settings-section-heading">
+        <h2 id="updates-heading">Updates</h2>
+      </div>
+      <label className="update-toggle" htmlFor="automatic-update-checks">
+        <span>Automatically check for updates</span>
+        <input
+          id="automatic-update-checks"
+          type="checkbox"
+          role="switch"
+          checked={automaticChecksEnabled}
+          onChange={(event) => onAutomaticChecksChange(event.currentTarget.checked)}
+        />
+      </label>
+      <div className={`updates-status ${hasUpdate ? "is-available" : ""}`} role="status" aria-live="polite">
+        <div>
+          <span className="updates-version">Version {version}</span>
+          <strong>{state.kind === "downloading" ? `Downloading…${progress}` : status.title}</strong>
+          {state.kind === "available" && <small>Version {state.update.version} available.</small>}
+          {state.kind === "ready" && <small>Version {state.update.version} is ready.</small>}
+          {state.kind === "failed" && state.update && <small>Version {state.update.version} is still available.</small>}
+        </div>
+        <div className="updates-actions">
+          <button
+            className="text-button"
+            type="button"
+            disabled={checkInProgress || state.kind === "unsupported"}
+            onClick={() => void onCheckForUpdates()}
+          >
+            {state.kind === "checking" ? "Checking…" : state.kind === "failed" && !state.update ? "Check again" : "Check for updates"}
+          </button>
+          {canStartUpdate && (
+            <button
+              className="primary-button update-action"
+              type="button"
+              disabled={transferBusy || checkInProgress}
+              onClick={() => void onStartUpdate()}
+            >
+              {state.kind === "ready" ? (transferBusy ? "Finish transfer first" : "Restart to finish") : state.kind === "failed" ? "Try again" : "Update"}
+            </button>
+          )}
+        </div>
+      </div>
+      {state.kind === "failed" && <p className="settings-error" role="alert">{state.message}</p>}
+      {state.kind === "ready" && transferBusy && <p className="updates-note">Drop will wait until the current transfer is finished.</p>}
+    </section>
+  );
+}
+
+function updateStatusCopy(state: UpdaterState, automaticChecksEnabled: boolean) {
+  switch (state.kind) {
+    case "checking":
+      return { title: "Checking…" };
+    case "up-to-date":
+      return { title: "Up to date." };
+    case "available":
+      return { title: "Update available." };
+    case "downloading":
+      return { title: "Downloading…" };
+    case "ready":
+      return { title: "Ready to restart." };
+    case "installing":
+      return { title: "Restarting…" };
+    case "unsupported":
+      return { title: state.message };
+    case "failed":
+      return { title: state.update ? "Update needs another try." : "Check failed." };
+    case "idle":
+      return { title: automaticChecksEnabled ? "Not checked yet." : "Automatic checks off." };
+  }
 }
 
 function DiagnosticValue({

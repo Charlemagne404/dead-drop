@@ -42,14 +42,19 @@ preparation run.
    suite, and the feature-gated transfer integration suite on the runner that
    matches the target OS and architecture.
 3. **Packaging** is only enabled for a manual dispatch with `package` checked
-   or for a pushed `v*` tag. It runs the Tauri CLI directly with `--no-sign`,
-   audits the generated output, and uploads an immutable short-lived
-   `drop-unsigned-bundles-*` Actions artifact. Pull requests do not build
+   or for a pushed `v*` tag. Tagged builds require the protected Tauri updater
+   signing secret and produce signed updater artifacts; manual packaging uses
+   `--no-sign` for controlled development output. Both paths audit the
+   generated output and upload an immutable short-lived
+   `drop-update-bundles-*` Actions artifact. Pull requests do not build
    installers.
 4. **Release-artifact preparation** downloads all platform bundles, creates
    release-note input, writes `SHA256SUMS.txt`, and writes
-   `ARTIFACT_MANIFEST.json`. It uploads a separate preparation artifact. It has
-   no release API call and no `contents: write` permission.
+   `ARTIFACT_MANIFEST.json`. For a complete signed input it also writes the
+   Tauri `latest.json` manifest; incomplete/unsigned input is marked with
+   `UPDATER_NOT_READY.txt` and cannot be consumed by the updater. It uploads a
+   separate preparation artifact. It has no release API call and no
+   `contents: write` permission.
 
 The matrix is intentionally native:
 
@@ -112,12 +117,16 @@ native build/package checks and structural audits; installed-app launch,
 firewall prompts, native drag/drop, sleep/wake, and cross-platform LAN transfer
 remain physical-device qualification work.
 
-## Unsigned artifacts and signing handoff
+## Updater signing and platform signing handoff
 
-All current package commands explicitly use `--no-sign`. These artifacts are
-for development, CI, and controlled pre-release testing and must be labeled
-unsigned when shared. No certificates, private keys, notarization passwords, or
-platform credentials belong in this repository.
+Local native preparation and manual CI packaging use `--no-sign`. Those
+artifacts are for development, CI, and controlled pre-release testing and are
+labeled unsigned; they do not produce a usable `latest.json`. Tagged CI builds
+omit `--no-sign` and require `TAURI_SIGNING_PRIVATE_KEY` (plus the optional
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) to generate the Tauri updater signatures.
+No updater private key, certificate, notarization password, or platform
+credential belongs in this repository. See [docs/UPDATER.md](UPDATER.md) for
+the manifest, trust, key-rotation, and local updater-testing details.
 
 Before a public v1 release, a maintainer must configure protected credentials
 and a separate approval path for:
@@ -133,17 +142,21 @@ and a separate approval path for:
   through a signed repository or download service.
 
 The pipeline is intentionally ready for those steps because metadata,
-architectures, and hardened runtime configuration are checked, but it does not
-guess certificate names or turn signing on without credentials.
+architectures, updater signatures, and hardened runtime configuration are
+checked, but it does not guess certificate names or turn platform signing on
+without credentials.
 
 ## Checksums, notes, and provenance
 
-`SHA256SUMS.txt` uses standard SHA-256 checksum lines for regular installer and
-package files. `.app` bundles are directories, so their complete per-file
-hashes are recorded in `ARTIFACT_MANIFEST.json`; the `.dmg` remains the normal
-macOS file checksum. `UNSIGNED.txt` and the manifest's `signing: "unsigned"`
-field make the current status explicit. `RELEASE_NOTES.md` is an editable
-changelog input seeded from commits since the latest tag when one exists.
+`SHA256SUMS.txt` uses standard SHA-256 checksum lines for regular installer,
+package, updater, and signature files. `.app` bundles are directories, so their
+complete per-file hashes are recorded in `ARTIFACT_MANIFEST.json`; the `.dmg`
+remains the normal macOS file checksum. Unsigned preparation writes
+`UNSIGNED.txt`, `UPDATER_NOT_READY.txt`, and `signing: "unsigned"`; signed
+preparation writes `latest.json` and `signing: "tauri-updater"`. Checksums and
+the manifest are integrity/provenance evidence only—the Tauri signature is the
+authorization to install. `RELEASE_NOTES.md` is an editable changelog input
+seeded from commits since the latest tag when one exists.
 
 The manual workflow's `attest` input optionally invokes GitHub's artifact
 attestation action for regular files listed in `SHA256SUMS.txt`. It is off by
@@ -156,10 +169,10 @@ CI; an attestation is not a substitute for signing or notarization.
 1. Update and commit the synchronized version.
 2. Run `npm run release:prepare` on each available native host, or push the
    matching `v<version>` tag after review and use the packaging workflow.
-3. Inspect every platform artifact, checksum file, manifest, and generated
-   release-note input.
-4. Complete platform signing/notarization and verify the signed artifacts on
-   clean machines.
+3. Inspect every platform artifact, checksum file, updater signature, complete
+   `latest.json`, manifest, and generated release-note input.
+4. Complete platform signing/notarization and verify the signed updater
+   artifacts on clean machines.
 5. Run the cross-platform transfer, firewall, file-picker, sleep/wake, and
    large-file test matrix with actual devices.
 6. Only after explicit human approval, publish through the chosen release
