@@ -48,6 +48,10 @@ pub fn settings_path() -> Option<PathBuf> {
     project_dirs(APPLICATION).map(|dirs| dirs.config_local_dir().join("settings.json"))
 }
 
+pub fn log_path() -> Option<PathBuf> {
+    project_dirs(APPLICATION).map(|dirs| dirs.data_local_dir().join("drop.log"))
+}
+
 /// The pre-Plain release stored settings in the application data directory.
 /// Keep this path readable during the display-name migration.
 pub fn legacy_settings_path() -> Option<PathBuf> {

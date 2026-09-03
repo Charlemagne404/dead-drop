@@ -61,6 +61,31 @@ export type DiscoverySourceDiagnostics = {
   detail: string | null;
 };
 
+export type ApplicationDiagnostics = {
+  version: string;
+  os: string;
+  architecture: string;
+  protocolVersion: number;
+};
+
+export type LocalDropDiagnostics = {
+  deviceId: string;
+  deviceName: string;
+  receiveDirectoryAvailable: boolean;
+  serviceStatus: string;
+  serviceDetail: string | null;
+  servicePort: number;
+  transport: string;
+  interfaceStatus: string;
+  transportLimitations: string[];
+};
+
+export type LoggingDiagnostics = {
+  storageStatus: string;
+  retention: string;
+  currentEntries: number;
+};
+
 export type EndpointDiagnostics = {
   address: string;
   addressFamily: string;
@@ -70,25 +95,42 @@ export type EndpointDiagnostics = {
   lastSeenSecondsAgo: number;
 };
 
+export type RouteFailureDiagnostics = {
+  endpoint: string;
+  routeClass: string;
+  reason: string;
+  secondsAgo: number;
+};
+
+export type RouteSuccessDiagnostics = {
+  endpoint: string;
+  routeClass: string;
+  secondsAgo: number;
+};
+
 export type PeerDiagnostics = {
   id: string;
   name: string;
   os: string;
   protocolVersion: number;
+  protocolCompatible: boolean;
   selectedRoute: string | null;
   endpoints: EndpointDiagnostics[];
+  lastSuccessfulRoute: RouteSuccessDiagnostics | null;
+  recentRouteFailures: RouteFailureDiagnostics[];
 };
 
 export type RuntimeDiagnostics = {
-  transport: string;
-  listenerPort: number;
-  receiveDirectoryAvailable: boolean;
+  application: ApplicationDiagnostics;
+  local: LocalDropDiagnostics;
   discovery: {
     mdns: DiscoverySourceDiagnostics;
     localFallback: DiscoverySourceDiagnostics;
     tailscale: DiscoverySourceDiagnostics;
     rememberedPeers: number;
   };
+  logicalPeerCount: number;
+  logging: LoggingDiagnostics;
   peers: PeerDiagnostics[];
 };
 
@@ -123,6 +165,7 @@ export async function chooseDirectory(): Promise<string | null> {
 
 export const command = {
   initialState: () => invoke<InitialState>("initial_state"),
+  diagnosticsReport: () => invoke<string>("diagnostics_report"),
   sendFiles: (peerId: string, paths: string[]) =>
     invoke<string>("send_files", { peerId, paths }),
   cancelTransfer: (transferId: string) =>

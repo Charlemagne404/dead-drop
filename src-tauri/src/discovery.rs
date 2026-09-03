@@ -3,6 +3,7 @@ use crate::{
         connect_and_identify, is_allowed_ipv4, ConnectivityError, DROP_SERVICE_PORT,
         MAX_DISCOVERY_PROBES,
     },
+    diagnostics::{LogCategory, LogLevel},
     models::{
         AppState, Cancellation, DeviceIdentity, RememberedEndpointCandidate, PROTOCOL_VERSION,
     },
@@ -116,7 +117,12 @@ fn start_worker<F>(
         .name(name.to_string())
         .spawn(move || worker(state, app))
     {
-        eprintln!("[dead-drop][discovery] could not start {source} worker: {error}");
+        failure_state.log(
+            LogLevel::Error,
+            LogCategory::Discovery,
+            "discovery_worker_start_failed",
+            Some(&format!("source={source} error={error}")),
+        );
         failure_state.set_discovery_status(source, "unavailable", Some("worker could not start"));
         emit_state(&failure_app, &failure_state);
     }
@@ -134,7 +140,7 @@ fn run_mdns(state: Arc<AppState>, app: AppHandle) {
                 if peers_changed || status_changed {
                     emit_state(&app, &state);
                 }
-                report_failure(&app, &error);
+                report_failure(&state, &app, &error);
                 if !wait_for_retry(&state) {
                     return;
                 }
@@ -174,7 +180,12 @@ fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
     };
     state.set_discovery_status(MDNS_SOURCE_ID, "running", None);
     emit_state(app, state);
-    eprintln!("[dead-drop][discovery] advertising and browsing for IPv4 peers");
+    state.log(
+        LogLevel::Info,
+        LogCategory::Discovery,
+        "mdns_started",
+        Some("advertising and browsing for IPv4 peers"),
+    );
     let source = MdnsDiscoverySource;
     let local_id = state.device().id;
     let mut advertised_name = state.device().name;
@@ -189,11 +200,21 @@ fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
                 .and_then(|service| daemon.register(service).map_err(|error| error.to_string()))
             {
                 Ok(()) => {
-                    eprintln!("[dead-drop][discovery] re-announced updated device name");
+                    state.log(
+                        LogLevel::Info,
+                        LogCategory::Discovery,
+                        "mdns_reannounced",
+                        Some("device metadata changed"),
+                    );
                     advertised_name = current_device.name;
                 }
                 Err(error) => {
-                    eprintln!("[dead-drop][discovery] could not re-announce device name: {error}");
+                    state.log(
+                        LogLevel::Warn,
+                        LogCategory::Discovery,
+                        "mdns_reannounce_failed",
+                        Some(&error.to_string()),
+                    );
                 }
             }
         }
@@ -226,17 +247,27 @@ fn run_session(state: &Arc<AppState>, app: &AppHandle) -> Result<(), String> {
                 Instant::now(),
                 PEER_STALE_AFTER,
             ) {
-                eprintln!("[dead-drop][discovery] removed stale peer(s)");
+                state.log(
+                    LogLevel::Info,
+                    LogCategory::PeerRegistry,
+                    "stale_peer_endpoints_removed",
+                    Some("source=mdns"),
+                );
                 emit_state(app, state);
             }
             last_purge = Instant::now();
         }
     };
     if let Err(error) = daemon.shutdown() {
-        eprintln!("[dead-drop][discovery] shutdown failed: {error}");
+        state.log(
+            LogLevel::Warn,
+            LogCategory::Shutdown,
+            "mdns_shutdown_failed",
+            Some(&error.to_string()),
+        );
     }
     if result.is_ok() {
-        eprintln!("[dead-drop][discovery] stopped");
+        state.log(LogLevel::Info, LogCategory::Shutdown, "mdns_stopped", None);
     }
     result
 }
@@ -312,7 +343,6 @@ fn observation_from_service(
         protocol_version,
     };
     if validate_device(&identity).is_err() {
-        eprintln!("[dead-drop][discovery] ignored peer with invalid identity");
         return None;
     }
     let discovery_source = MdnsDiscoverySource;
@@ -383,15 +413,30 @@ fn bounded_property(value: Option<&str>, fallback: &str, maximum: usize) -> Stri
 
 pub(crate) fn emit_state(app: &AppHandle, state: &AppState) {
     if let Err(error) = app.emit("peers-updated", state.peers()) {
-        eprintln!("[dead-drop][discovery] could not emit peer update: {error}");
+        state.log(
+            LogLevel::Warn,
+            LogCategory::Errors,
+            "peer_update_emit_failed",
+            Some(&error.to_string()),
+        );
     }
     if let Err(error) = app.emit("connectivity-diagnostics", state.runtime_diagnostics()) {
-        eprintln!("[dead-drop][discovery] could not emit diagnostics update: {error}");
+        state.log(
+            LogLevel::Warn,
+            LogCategory::Errors,
+            "diagnostics_update_emit_failed",
+            Some(&error.to_string()),
+        );
     }
 }
 
-fn report_failure(app: &AppHandle, detail: &str) {
-    eprintln!("[dead-drop][discovery] {detail}");
+fn report_failure(state: &AppState, app: &AppHandle, detail: &str) {
+    state.log(
+        LogLevel::Warn,
+        LogCategory::Discovery,
+        "discovery_failure",
+        Some(detail),
+    );
     let _ = app.emit(
         "discovery-status",
         "Nearby device discovery is unavailable. Check local network access and UDP port 5353.",
@@ -497,11 +542,15 @@ fn apply_probe_successes(
             endpoints: vec![endpoint],
         }) {
             visible_change = true;
-            eprintln!(
-                "[dead-drop][discovery] peer endpoint added via {} UUID {} Endpoint {}",
-                candidate.route_class.label(),
-                identity.id,
-                candidate.address
+            state.log(
+                LogLevel::Info,
+                LogCategory::PeerRegistry,
+                "peer_endpoint_added",
+                Some(&format!(
+                    "route={} endpoint={}",
+                    candidate.route_class.label(),
+                    candidate.address
+                )),
             );
         }
     }
@@ -529,16 +578,31 @@ fn run_local_fallback(state: Arc<AppState>, app: AppHandle) {
                 "unavailable",
                 Some("UDP service port could not be bound"),
             );
-            eprintln!("[dead-drop][discovery] local fallback could not bind UDP service: {error}");
+            state.log(
+                LogLevel::Warn,
+                LogCategory::Discovery,
+                "local_fallback_bind_failed",
+                Some(&error.to_string()),
+            );
             emit_state(&app, &state);
             return;
         }
     };
     if let Err(error) = socket.set_broadcast(true) {
-        eprintln!("[dead-drop][discovery] local fallback broadcast is unavailable: {error}");
+        state.log(
+            LogLevel::Warn,
+            LogCategory::Discovery,
+            "local_fallback_broadcast_unavailable",
+            Some(&error.to_string()),
+        );
     }
     if let Err(error) = socket.set_ttl(1) {
-        eprintln!("[dead-drop][discovery] local fallback TTL could not be set: {error}");
+        state.log(
+            LogLevel::Warn,
+            LogCategory::Discovery,
+            "local_fallback_ttl_failed",
+            Some(&error.to_string()),
+        );
     }
     if let Err(error) = socket.set_read_timeout(Some(LOCAL_FALLBACK_READ_TIMEOUT)) {
         state.set_discovery_status(
@@ -546,14 +610,22 @@ fn run_local_fallback(state: Arc<AppState>, app: AppHandle) {
             "unavailable",
             Some("UDP read timeout could not be configured"),
         );
-        eprintln!("[dead-drop][discovery] local fallback could not configure UDP reads: {error}");
+        state.log(
+            LogLevel::Warn,
+            LogCategory::Discovery,
+            "local_fallback_read_configuration_failed",
+            Some(&error.to_string()),
+        );
         emit_state(&app, &state);
         return;
     }
     state.set_discovery_status(LOCAL_FALLBACK_SOURCE_ID, "running", None);
     emit_state(&app, &state);
-    eprintln!(
-        "[dead-drop][discovery] local broadcast fallback listening on UDP {DROP_SERVICE_PORT}"
+    state.log(
+        LogLevel::Info,
+        LogCategory::Discovery,
+        "local_fallback_started",
+        Some(&format!("port={DROP_SERVICE_PORT}")),
     );
 
     let runtime = match Runtime::new() {
@@ -564,7 +636,12 @@ fn run_local_fallback(state: Arc<AppState>, app: AppHandle) {
                 "unavailable",
                 Some("probe runtime could not start"),
             );
-            eprintln!("[dead-drop][discovery] local fallback probe runtime failed: {error}");
+            state.log(
+                LogLevel::Error,
+                LogCategory::Discovery,
+                "local_fallback_runtime_failed",
+                Some(&error.to_string()),
+            );
             emit_state(&app, &state);
             return;
         }
@@ -584,7 +661,12 @@ fn run_local_fallback(state: Arc<AppState>, app: AppHandle) {
                 FALLBACK_REQUEST,
                 SocketAddr::from((Ipv4Addr::BROADCAST, DROP_SERVICE_PORT)),
             ) {
-                eprintln!("[dead-drop][discovery] local broadcast request failed: {error}");
+                state.log(
+                    LogLevel::Warn,
+                    LogCategory::Discovery,
+                    "local_fallback_broadcast_failed",
+                    Some(&error.to_string()),
+                );
             }
             pending.clear();
             cycle_deadline = now + LOCAL_FALLBACK_RESPONSE_WINDOW;
@@ -612,7 +694,12 @@ fn run_local_fallback(state: Arc<AppState>, app: AppHandle) {
                     io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
                 ) => {}
             Err(error) => {
-                eprintln!("[dead-drop][discovery] local fallback UDP read failed: {error}");
+                state.log(
+                    LogLevel::Warn,
+                    LogCategory::Discovery,
+                    "local_fallback_read_failed",
+                    Some(&error.to_string()),
+                );
                 thread::sleep(Duration::from_millis(250));
             }
         }
@@ -689,6 +776,17 @@ impl std::fmt::Display for TailscaleStatusError {
     }
 }
 
+impl TailscaleStatusError {
+    fn diagnostic_message(&self) -> &'static str {
+        match self {
+            Self::NotInstalled => "local client not installed",
+            Self::Unavailable(_) => "local client status unavailable",
+            Self::OutputTooLarge => "local client status exceeded the output limit",
+            Self::Invalid(_) => "local client status was invalid",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct TailscaleStatusDocument {
     #[serde(rename = "BackendState")]
@@ -714,7 +812,12 @@ fn run_tailscale(state: Arc<AppState>, app: AppHandle) {
                 "unavailable",
                 Some("probe runtime could not start"),
             );
-            eprintln!("[dead-drop][discovery] Tailscale probe runtime failed: {error}");
+            state.log(
+                LogLevel::Error,
+                LogCategory::Discovery,
+                "tailscale_runtime_failed",
+                Some(&error.to_string()),
+            );
             emit_state(&app, &state);
             return;
         }
@@ -735,7 +838,12 @@ fn run_tailscale(state: Arc<AppState>, app: AppHandle) {
                     "running"
                 };
                 if last_status != status {
-                    eprintln!("[dead-drop][discovery] local Tailscale status: {status}");
+                    state.log(
+                        LogLevel::Info,
+                        LogCategory::Discovery,
+                        "tailscale_status_changed",
+                        Some(status),
+                    );
                     last_status = status.to_string();
                 }
                 let candidates = if snapshot.running {
@@ -760,7 +868,12 @@ fn run_tailscale(state: Arc<AppState>, app: AppHandle) {
             }
             Err(TailscaleStatusError::NotInstalled) => {
                 if last_status != "not-installed" {
-                    eprintln!("[dead-drop][discovery] local Tailscale client not installed; continuing without it");
+                    state.log(
+                        LogLevel::Info,
+                        LogCategory::Discovery,
+                        "tailscale_not_installed",
+                        Some("continuing without overlay discovery"),
+                    );
                     last_status = "not-installed".to_string();
                 }
                 if state.set_discovery_status(TAILSCALE_SOURCE_ID, "not-installed", None) {
@@ -779,7 +892,12 @@ fn run_tailscale(state: Arc<AppState>, app: AppHandle) {
                     "not-running"
                 };
                 if last_status != status {
-                    eprintln!("[dead-drop][discovery] local Tailscale status unavailable: {error}");
+                    state.log(
+                        LogLevel::Warn,
+                        LogCategory::Discovery,
+                        "tailscale_status_unavailable",
+                        Some(error.diagnostic_message()),
+                    );
                     last_status = status.to_string();
                 }
                 if state.set_discovery_status(
@@ -1033,7 +1151,12 @@ fn run_remembered(state: Arc<AppState>, app: AppHandle) {
     let runtime = match Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("[dead-drop][discovery] remembered-peer probe runtime failed: {error}");
+            state.log(
+                LogLevel::Error,
+                LogCategory::Discovery,
+                "remembered_peer_runtime_failed",
+                Some(&error.to_string()),
+            );
             return;
         }
     };

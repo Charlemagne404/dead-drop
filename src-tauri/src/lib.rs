@@ -1,4 +1,5 @@
 mod connectivity;
+mod diagnostics;
 mod discovery;
 mod models;
 mod peer;
@@ -9,6 +10,7 @@ mod routing;
 pub mod test_support;
 mod transfer;
 
+use diagnostics::{LogCategory, LogLevel, SupportLogger};
 use models::{AppState, PeerSnapshot, Preferences, PreferencesDraft, StartupSnapshot};
 use std::{error::Error, net::TcpListener as StdTcpListener, sync::Arc};
 use tauri::{Emitter, State};
@@ -16,6 +18,11 @@ use tauri::{Emitter, State};
 #[tauri::command]
 fn initial_state(state: State<'_, Arc<AppState>>) -> StartupSnapshot {
     state.startup_snapshot()
+}
+
+#[tauri::command]
+fn diagnostics_report(state: State<'_, Arc<AppState>>) -> String {
+    state.diagnostics_report()
 }
 
 #[tauri::command]
@@ -80,7 +87,18 @@ async fn connect_by_address(
     state: State<'_, Arc<AppState>>,
     address: String,
 ) -> Result<PeerSnapshot, String> {
-    let endpoints = connectivity::resolve_manual_target(&address).await?;
+    let endpoints = match connectivity::resolve_manual_target(&address).await {
+        Ok(endpoints) => endpoints,
+        Err(error) => {
+            state.log(
+                LogLevel::Warn,
+                LogCategory::Connection,
+                "manual_target_rejected",
+                Some(&error),
+            );
+            return Err(error);
+        }
+    };
     let local = state.device();
     let shutdown = state.shutdown_token();
     let cancellation = models::Cancellation::new();
@@ -109,6 +127,7 @@ async fn connect_by_address(
                     source: discovered.source.clone(),
                     endpoints: vec![discovered],
                 });
+                state.record_route_success(&peer_id, endpoint);
                 state.remember_peer(&connection.identity, endpoint);
                 let peer = state
                     .peers()
@@ -119,15 +138,24 @@ async fn connect_by_address(
                 let _ = app.emit("connectivity-diagnostics", state.runtime_diagnostics());
                 return Ok(peer);
             }
-            Err(error) => last_error = Some(error.to_string()),
+            Err(error) => {
+                state.log(
+                    LogLevel::Warn,
+                    LogCategory::Connection,
+                    "manual_connection_failed",
+                    Some(&format!(
+                        "endpoint={} reason={}",
+                        endpoint,
+                        error.diagnostic_message()
+                    )),
+                );
+                last_error = Some(error);
+            }
         }
     }
-    Err(format!(
-        "Couldn't connect to that device{}.",
-        last_error
-            .map(|error| format!(" ({error})"))
-            .unwrap_or_default()
-    ))
+    Err(last_error
+        .map(|error| error.user_message().to_string())
+        .unwrap_or_else(|| "Couldn't connect to that device.".to_string()))
 }
 
 #[tauri::command]
@@ -137,7 +165,14 @@ fn cancel_transfer(state: State<'_, Arc<AppState>>, transfer_id: String) -> Resu
 
 pub fn run() {
     if let Err(error) = run_inner() {
-        eprintln!("[dead-drop] could not start: {error}");
+        let logger = SupportLogger::persistent(platform::log_path());
+        logger.record(
+            LogLevel::Error,
+            LogCategory::Startup,
+            "application_start_failed",
+            Some(&error.to_string()),
+        );
+        eprintln!("[dead-drop] Drop could not start.");
     }
 }
 
@@ -165,7 +200,8 @@ fn run_inner() -> Result<(), Box<dyn Error>> {
             respond_to_incoming,
             send_files,
             connect_by_address,
-            cancel_transfer
+            cancel_transfer,
+            diagnostics_report
         ])
         .build(tauri::generate_context!())?;
     app.run(move |_app_handle, event| {

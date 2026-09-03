@@ -1,13 +1,14 @@
 use crate::routing;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     time::{Duration, Instant},
 };
 use uuid::Uuid;
 
 const MAX_ENDPOINTS_PER_OBSERVATION: usize = 32;
+const MAX_ROUTE_FAILURES: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,6 +132,21 @@ impl SourceEndpointObservation {
 }
 
 #[derive(Clone, Debug)]
+struct RouteFailure {
+    address: SocketAddr,
+    route_class: RouteClass,
+    reason: String,
+    occurred_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct RouteSuccess {
+    address: SocketAddr,
+    route_class: RouteClass,
+    occurred_at: Instant,
+}
+
+#[derive(Clone, Debug)]
 pub struct Peer {
     pub id: String,
     pub name: String,
@@ -141,6 +157,8 @@ pub struct Peer {
     pub endpoints: Vec<Endpoint>,
     source_observations: HashMap<EndpointSource, Vec<SourceEndpointObservation>>,
     metadata_seen: Instant,
+    route_failures: VecDeque<RouteFailure>,
+    last_successful_route: Option<RouteSuccess>,
 }
 
 impl Peer {
@@ -166,6 +184,8 @@ impl Peer {
             endpoints,
             source_observations,
             metadata_seen,
+            route_failures: VecDeque::new(),
+            last_successful_route: None,
         };
         peer.reconcile_endpoints();
         peer
@@ -307,13 +327,33 @@ pub struct EndpointDiagnosticsSnapshot {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RouteFailureDiagnosticsSnapshot {
+    pub endpoint: String,
+    pub route_class: String,
+    pub reason: String,
+    pub seconds_ago: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteSuccessDiagnosticsSnapshot {
+    pub endpoint: String,
+    pub route_class: String,
+    pub seconds_ago: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PeerDiagnosticsSnapshot {
     pub id: String,
     pub name: String,
     pub os: String,
     pub protocol_version: u16,
+    pub protocol_compatible: bool,
     pub selected_route: Option<String>,
     pub endpoints: Vec<EndpointDiagnosticsSnapshot>,
+    pub last_successful_route: Option<RouteSuccessDiagnosticsSnapshot>,
+    pub recent_route_failures: Vec<RouteFailureDiagnosticsSnapshot>,
 }
 
 #[derive(Default)]
@@ -347,6 +387,7 @@ impl PeerRegistry {
                 name: peer.name.clone(),
                 os: peer.os.clone(),
                 protocol_version: peer.protocol_version,
+                protocol_compatible: peer.protocol_version == crate::models::PROTOCOL_VERSION,
                 selected_route: routing::preferred_endpoint(&peer.endpoints)
                     .map(|endpoint| endpoint.address.to_string()),
                 endpoints: peer
@@ -365,6 +406,23 @@ impl PeerRegistry {
                         last_seen_seconds_ago: now
                             .saturating_duration_since(endpoint.last_seen)
                             .as_secs(),
+                    })
+                    .collect(),
+                last_successful_route: peer.last_successful_route.as_ref().map(|route| {
+                    RouteSuccessDiagnosticsSnapshot {
+                        endpoint: route.address.to_string(),
+                        route_class: route_class_label(route.route_class).to_string(),
+                        seconds_ago: now.saturating_duration_since(route.occurred_at).as_secs(),
+                    }
+                }),
+                recent_route_failures: peer
+                    .route_failures
+                    .iter()
+                    .map(|failure| RouteFailureDiagnosticsSnapshot {
+                        endpoint: failure.address.to_string(),
+                        route_class: route_class_label(failure.route_class).to_string(),
+                        reason: failure.reason.clone(),
+                        seconds_ago: now.saturating_duration_since(failure.occurred_at).as_secs(),
                     })
                     .collect(),
             })
@@ -512,11 +570,34 @@ impl PeerRegistry {
         }
     }
 
-    pub fn mark_endpoint_reachability(
+    pub fn record_route_success(&mut self, peer_id: &str, address: SocketAddr) -> bool {
+        let Some(id) = canonical_device_id(peer_id) else {
+            return false;
+        };
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return false;
+        };
+        let Some(endpoint) = peer
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.address == address)
+        else {
+            return false;
+        };
+        endpoint.reachability = EndpointReachability::Reachable;
+        peer.last_successful_route = Some(RouteSuccess {
+            address,
+            route_class: endpoint.route_class,
+            occurred_at: Instant::now(),
+        });
+        true
+    }
+
+    pub fn record_route_failure(
         &mut self,
         peer_id: &str,
         address: SocketAddr,
-        reachability: EndpointReachability,
+        reason: &str,
     ) -> bool {
         let Some(id) = canonical_device_id(peer_id) else {
             return false;
@@ -531,10 +612,16 @@ impl PeerRegistry {
         else {
             return false;
         };
-        if endpoint.reachability == reachability {
-            return false;
+        endpoint.reachability = EndpointReachability::Unreachable;
+        peer.route_failures.push_front(RouteFailure {
+            address,
+            route_class: endpoint.route_class,
+            reason: crate::diagnostics::redact_text(reason),
+            occurred_at: Instant::now(),
+        });
+        while peer.route_failures.len() > MAX_ROUTE_FAILURES {
+            peer.route_failures.pop_back();
         }
-        endpoint.reachability = reachability;
         true
     }
 
@@ -966,6 +1053,43 @@ mod tests {
             &[10],
         )));
         assert_eq!(registry.peer(id).unwrap().endpoints.len(), 1);
+    }
+
+    #[test]
+    fn route_history_is_bounded_and_exposes_safe_failure_context() {
+        let id = "89898989-8989-4898-8898-898989898989";
+        let mut registry = PeerRegistry::new();
+        registry.apply_observation(observation(id, "Home Server", "Linux", "ethernet", &[10]));
+        let address = "192.168.1.10:4040".parse().unwrap();
+
+        for _ in 0..(MAX_ROUTE_FAILURES + 3) {
+            assert!(registry.record_route_failure(
+                id,
+                address,
+                "connection refused password=hunter2 /Users/alice/secret.txt",
+            ));
+        }
+        assert!(registry.record_route_success(id, address));
+
+        let diagnostics = registry.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        let peer = &diagnostics[0];
+        assert!(peer.protocol_compatible);
+        assert_eq!(
+            peer.last_successful_route
+                .as_ref()
+                .map(|route| route.endpoint.as_str()),
+            Some("192.168.1.10:4040")
+        );
+        assert_eq!(peer.recent_route_failures.len(), MAX_ROUTE_FAILURES);
+        assert!(peer
+            .recent_route_failures
+            .iter()
+            .all(|failure| !failure.reason.contains("hunter2")));
+        assert!(peer
+            .recent_route_failures
+            .iter()
+            .all(|failure| !failure.reason.contains("/Users/alice")));
     }
 
     #[test]
