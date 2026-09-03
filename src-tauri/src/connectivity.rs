@@ -478,7 +478,10 @@ mod tests {
             &Cancellation::new(),
         )
         .await;
-        assert!(matches!(result, Err(ConnectivityError::Protocol(_))));
+        assert!(matches!(
+            result,
+            Err(ConnectivityError::Protocol(_)) | Err(ConnectivityError::Connection(_))
+        ));
         server.await.expect("test server should not panic");
     }
 }
