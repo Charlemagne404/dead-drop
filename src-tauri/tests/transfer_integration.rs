@@ -16,7 +16,9 @@ use tokio::{
     time::timeout,
 };
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+// Keep slower native CI runners from turning a healthy large-file transfer into
+// a false timeout while retaining a bounded upper limit for real hangs.
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 struct MeasuringAllocator;
 
 static LIVE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);

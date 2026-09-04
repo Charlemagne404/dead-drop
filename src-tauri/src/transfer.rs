@@ -505,6 +505,7 @@ async fn send_files(
         state.shutdown_token(),
         remote_sender,
     ));
+    let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
 
     let result = async {
         for (index, file) in prepared.iter().enumerate() {
@@ -534,7 +535,6 @@ async fn send_files(
                     name: file.wire.name.clone(),
                     detail: error.to_string(),
                 })?;
-            let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
             loop {
                 check_cancelled(cancellation, shutdown)?;
                 #[cfg(any(test, feature = "integration-tests"))]
@@ -1325,18 +1325,16 @@ async fn prepare_files(
     let cancellation_for_hash = cancellation.clone();
     let shutdown_for_hash = shutdown.clone();
     tokio::task::spawn_blocking(move || {
+        let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
         candidates
             .into_iter()
             .map(|candidate| {
-                let sha256 = checksum_file(
+                let sha256 = checksum_file_with_buffer(
                     &candidate.source,
                     cancellation_for_hash.as_ref(),
                     shutdown_for_hash.as_ref(),
+                    &mut buffer,
                 )?;
-                eprintln!(
-                    "[dead-drop][transfer] prepared {} ({} bytes)",
-                    candidate.name, candidate.size
-                );
                 Ok(PreparedFile {
                     source: candidate.source,
                     wire: TransferFile {
@@ -1354,10 +1352,21 @@ async fn prepare_files(
     })?
 }
 
+#[cfg(test)]
 fn checksum_file(
     path: &Path,
     cancellation: &Cancellation,
     shutdown: &Cancellation,
+) -> Result<String, TransferError> {
+    let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+    checksum_file_with_buffer(path, cancellation, shutdown, &mut buffer)
+}
+
+fn checksum_file_with_buffer(
+    path: &Path,
+    cancellation: &Cancellation,
+    shutdown: &Cancellation,
+    buffer: &mut [u8],
 ) -> Result<String, TransferError> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).map_err(|error| TransferError::FileRead {
@@ -1368,7 +1377,6 @@ fn checksum_file(
         detail: error.to_string(),
     })?;
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
     loop {
         if cancellation.is_cancelled() {
             return Err(TransferError::Canceled);
@@ -1376,15 +1384,13 @@ fn checksum_file(
         if shutdown.is_cancelled() {
             return Err(TransferError::ShuttingDown);
         }
-        let count = file
-            .read(&mut buffer)
-            .map_err(|error| TransferError::FileRead {
-                name: path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "selected file".to_string()),
-                detail: error.to_string(),
-            })?;
+        let count = file.read(buffer).map_err(|error| TransferError::FileRead {
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "selected file".to_string()),
+            detail: error.to_string(),
+        })?;
         if count == 0 {
             break;
         }

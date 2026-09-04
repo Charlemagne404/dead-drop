@@ -25,6 +25,9 @@ const CARGO_LOCK_PATH = join(ROOT, "src-tauri", "Cargo.lock");
 const IDENTIFIER = "com.continental.deaddrop";
 const CARGO_PACKAGE_NAME = "dead-drop";
 const PRODUCT_NAME = "Drop";
+const REPOSITORY_URL = "https://github.com/Plainslash/Drop";
+const REPOSITORY_GIT_URL = `${REPOSITORY_URL}.git`;
+const UPDATER_ENDPOINT = `${REPOSITORY_URL}/releases/latest/download/latest.json`;
 const TARGETS = [
   "x86_64-pc-windows-msvc",
   "aarch64-apple-darwin",
@@ -37,7 +40,7 @@ const UPDATER_PLATFORM_KEYS = {
   "x86_64-apple-darwin": "darwin-x86_64",
   "x86_64-unknown-linux-gnu": "linux-x86_64",
 };
-const UPDATER_RELEASE_BASE = "https://github.com/Charlemagne404/dead-drop/releases/download";
+const UPDATER_RELEASE_BASE = `${REPOSITORY_URL}/releases/download`;
 const VERSION_PATTERN =
   /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const PACKAGE_EXTENSIONS = new Set([".exe", ".msi", ".dmg", ".deb", ".appimage"]);
@@ -261,9 +264,17 @@ function configProblems() {
   const expect = (condition, message) => {
     if (!condition) problems.push(message);
   };
+  const packageRepository =
+    typeof packageJson.repository === "string" ? packageJson.repository : packageJson.repository?.url;
 
   expect(packageJson.name === "drop", 'package.json name must be "drop".');
   expect(packageJson.private === true, "package.json must remain private; releases are not npm publications.");
+  expect(packageJson.homepage === REPOSITORY_URL, `package.json homepage must be ${REPOSITORY_URL}.`);
+  expect(packageRepository === REPOSITORY_GIT_URL, `package.json repository must be ${REPOSITORY_GIT_URL}.`);
+  expect(
+    packageJson.bugs?.url === `${REPOSITORY_URL}/issues`,
+    `package.json bugs URL must be ${REPOSITORY_URL}/issues.`,
+  );
   expect(cargoTomlPackageName(cargoToml) === CARGO_PACKAGE_NAME, `Cargo package name must remain ${CARGO_PACKAGE_NAME}.`);
   expect(tauriConfig.productName === PRODUCT_NAME, 'Tauri productName must be "Drop".');
   expect(tauriConfig.identifier === IDENTIFIER, `Tauri identifier must remain ${IDENTIFIER}.`);
@@ -274,6 +285,7 @@ function configProblems() {
   expect(typeof updater.pubkey === "string" && updater.pubkey.trim().length >= 80, "Tauri updater public key is missing.");
   const updaterEndpoints = Array.isArray(updater.endpoints) ? updater.endpoints : [];
   expect(updaterEndpoints.length > 0, "Tauri updater endpoints are missing.");
+  expect(updaterEndpoints.includes(UPDATER_ENDPOINT), `Tauri updater endpoint must include ${UPDATER_ENDPOINT}.`);
   for (const endpoint of updaterEndpoints) {
     let parsed;
     try {
@@ -977,6 +989,7 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
 }
 
 export {
+  REPOSITORY_URL,
   TARGETS,
   VERSION_PATTERN,
   checkMetadata,

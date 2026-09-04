@@ -1,10 +1,17 @@
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import {
+  lazy,
+  memo,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+} from "react";
 import { createRoot } from "react-dom/client";
-import "@fontsource/inter/400.css";
-import "@fontsource/inter/500.css";
-import "@fontsource/inter/600.css";
+import type { DropEventName } from "./lib/events";
 import {
   chooseFiles,
   command,
@@ -16,12 +23,10 @@ import {
   type TrustRequest,
   type Transfer,
 } from "./lib/desktop";
-import { CURRENT_PROTOCOL_VERSION } from "./lib/constants";
+import { CURRENT_PROTOCOL_VERSION, MAX_QUEUED_TRANSFERS } from "./lib/constants";
 import { initialPreferences, previewDiagnostics, previewPeers } from "./lib/preview";
-import { dropEvents, subscribeDropEvent, type DropEventName } from "./lib/events";
 import {
   fileNameFromPath,
-  isTerminalPhase,
   shouldAcceptTransferUpdate,
   transferStatus,
   userFacingError,
@@ -32,15 +37,24 @@ import {
   NoDevicePanel,
   SendPanel,
   TransferPanel,
+  type QueuedTransferSummary,
   type NoDeviceState,
 } from "./components/TransferPanels";
-import { SettingsPanel } from "./components/SettingsPanel";
 import {
   loadAutomaticUpdateChecks,
   saveAutomaticUpdateChecks,
   useUpdater,
 } from "./lib/updater";
 import "./styles.css";
+
+const SettingsPanel = lazy(() =>
+  import("./components/SettingsPanel").then(({ SettingsPanel: panel }) => ({ default: panel })),
+);
+
+type QueuedTransfer = QueuedTransferSummary & {
+  peerId: string;
+  paths: string[];
+};
 
 function App() {
   const native = isNativeRuntime();
@@ -53,6 +67,7 @@ function App() {
   const [activeTransfer, setActiveTransfer] = useState<Transfer | null>(null);
   const [incoming, setIncoming] = useState<IncomingTransfer | null>(null);
   const [trustRequest, setTrustRequest] = useState<TrustRequest | null>(null);
+  const [queuedTransfers, setQueuedTransfers] = useState<QueuedTransfer[]>([]);
   const [automaticUpdateChecks, setAutomaticUpdateChecks] = useState(loadAutomaticUpdateChecks);
   const [isDragging, setIsDragging] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -63,15 +78,17 @@ function App() {
   const dragDepth = useRef(0);
   const selectedPeerRef = useRef<Peer | null>(null);
   const lockedRef = useRef(false);
+  const queuedTransfersRef = useRef<QueuedTransfer[]>([]);
+  const diagnosticsRef = useRef<RuntimeDiagnostics | null>(native ? null : previewDiagnostics);
+  const settingsOpenRef = useRef(false);
   const startTransferRef = useRef<(paths: string[]) => Promise<void>>(async () => undefined);
-  const peerIdsRef = useRef<Set<string>>(new Set());
-  const [radarPingKey, setRadarPingKey] = useState(0);
   const selectedPeer = useMemo(
     () => peers.find((peer) => peer.id === selectedId) ?? null,
     [peers, selectedId],
   );
   const transferLocked = Boolean(activeTransfer || incoming);
-  const viewLocked = Boolean(transferLocked || isSettingsOpen || trustRequest);
+  const viewLocked = Boolean(transferLocked || trustRequest);
+  const canQueue = Boolean(activeTransfer?.direction === "outgoing" && !incoming && !trustRequest);
   const updater = useUpdater({
     native,
     transferBusy: transferLocked || Boolean(trustRequest),
@@ -88,34 +105,145 @@ function App() {
         : "unreachable";
   selectedPeerRef.current = selectedPeer;
   lockedRef.current = viewLocked;
+  queuedTransfersRef.current = queuedTransfers;
+  settingsOpenRef.current = isSettingsOpen;
 
-  useEffect(() => {
-    const currentIds = new Set(peers.map((peer) => peer.id));
-    const foundNewPeer = [...currentIds].some((id) => !peerIdsRef.current.has(id));
-    if (foundNewPeer && !selectedPeerRef.current) {
-      setRadarPingKey((current) => current + 1);
+  const updateDiagnostics = useCallback((nextDiagnostics: RuntimeDiagnostics) => {
+    diagnosticsRef.current = nextDiagnostics;
+    if (settingsOpenRef.current) setDiagnostics(nextDiagnostics);
+  }, []);
+
+  const handleSelectPeer = useCallback((peerId: string) => {
+    if (lockedRef.current) {
+      setNotice("Finish the current transfer first.");
+      return;
     }
-    peerIdsRef.current = currentIds;
-  }, [peers]);
+    setSelectedId(peerId);
+    setIsSettingsOpen(false);
+  }, []);
+
+  const handleToggleSettings = useCallback(() => {
+    if (isSettingsOpen) {
+      setOpenDiagnostics(false);
+      setIsSettingsOpen(false);
+      return;
+    }
+    if (transferLocked) {
+      setNotice("Finish the current transfer first.");
+      return;
+    }
+    setDiagnostics(diagnosticsRef.current);
+    setOpenDiagnostics(false);
+    setIsSettingsOpen(true);
+  }, [isSettingsOpen, transferLocked]);
+
+  const handleOpenDiagnostics = useCallback(() => {
+    setDiagnostics(diagnosticsRef.current);
+    setOpenDiagnostics(true);
+    setIsSettingsOpen(true);
+  }, []);
+
+  const addToQueue = (peer: Peer, paths: string[]) => {
+    if (queuedTransfersRef.current.length >= MAX_QUEUED_TRANSFERS) {
+      setNotice(`Queue is full. Drop up to ${MAX_QUEUED_TRANSFERS} batches.`);
+      return;
+    }
+    const queued: QueuedTransfer = {
+      id: `queued-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      peerId: peer.id,
+      deviceName: peer.name,
+      fileNames: paths.map(fileNameFromPath),
+      paths,
+    };
+    const nextQueue = [...queuedTransfersRef.current, queued];
+    queuedTransfersRef.current = nextQueue;
+    setQueuedTransfers(nextQueue);
+    setNotice(`${queued.fileNames.length === 1 ? queued.fileNames[0] : `${queued.fileNames.length} files`} added to queue.`);
+  };
+
+  const startQueuedTransfer = async (queued: QueuedTransfer, previousTransfer: Transfer) => {
+    const peer = peers.find((candidate) => candidate.id === queued.peerId);
+    if (!peer) {
+      setNotice(`${queued.deviceName} is no longer available. The transfer stays queued.`);
+      return;
+    }
+    if (!peer.online) {
+      setNotice(`${peer.name} is offline. The transfer stays queued.`);
+      return;
+    }
+    if (peer.protocolVersion !== CURRENT_PROTOCOL_VERSION) {
+      setNotice(`Update Drop on ${peer.name} before sending the queued transfer.`);
+      return;
+    }
+    const remainingQueue = queuedTransfersRef.current.filter((candidate) => candidate.id !== queued.id);
+    queuedTransfersRef.current = remainingQueue;
+    setQueuedTransfers(remainingQueue);
+    setActiveTransfer(null);
+    setIsSettingsOpen(false);
+    if (!native) {
+      setActiveTransfer({
+        id: `preview-transfer-${queued.id}`,
+        direction: "outgoing",
+        phase: "waiting_for_acceptance",
+        deviceName: peer.name,
+        files: queued.fileNames.map((name) => ({ name, size: 0, sha256: "" })),
+        totalBytes: 0,
+        transferredBytes: 0,
+        bytesPerSecond: 0,
+        etaSeconds: null,
+        message: "Preview only. Use the installed app to send files.",
+      });
+      return;
+    }
+    try {
+      await command.sendFiles(peer.id, queued.paths);
+    } catch (error) {
+      const restoredQueue = [queued, ...queuedTransfersRef.current.filter((candidate) => candidate.id !== queued.id)];
+      queuedTransfersRef.current = restoredQueue;
+      setQueuedTransfers(restoredQueue);
+      setActiveTransfer(previousTransfer);
+      setNotice(userFacingError(error, "Couldn't start the queued transfer."));
+    }
+  };
+
+  const finishTransfer = () => {
+    const previousTransfer = activeTransfer;
+    const next = queuedTransfersRef.current[0];
+    if (!previousTransfer || !next) {
+      setActiveTransfer(null);
+      return;
+    }
+    void startQueuedTransfer(next, previousTransfer);
+  };
+
+  const removeQueuedTransfer = (id: string) => {
+    const nextQueue = queuedTransfersRef.current.filter((queued) => queued.id !== id);
+    queuedTransfersRef.current = nextQueue;
+    setQueuedTransfers(nextQueue);
+    setNotice("Queued transfer removed.");
+  };
 
   useEffect(() => {
     if (!native) return;
     let mounted = true;
     const unlisteners: UnlistenFn[] = [];
-    const attach = <T,>(event: DropEventName, handler: (payload: T) => void) =>
-      subscribeDropEvent<T>(event, handler)
-        .then((unlisten) => {
-          if (mounted) unlisteners.push(unlisten);
-          else unlisten();
-        })
-        .catch(() => {
-          if (mounted) setNotice("Couldn't connect to the local service.");
-        });
 
     const start = async () => {
+      const { dropEvents, subscribeDropEvent } = await import("./lib/events");
+      if (!mounted) return;
+      const attach = <T,>(event: DropEventName, handler: (payload: T) => void) =>
+        subscribeDropEvent<T>(event, handler)
+          .then((unlisten) => {
+            if (mounted) unlisteners.push(unlisten);
+            else unlisten();
+          })
+          .catch(() => {
+            if (mounted) setNotice("Couldn't connect to the local service.");
+          });
+
       await Promise.all([
         attach<Peer[]>(dropEvents.peersUpdated, (nextPeers) => {
-          setPeers(nextPeers);
+          setPeers((current) => (samePeers(current, nextPeers) ? current : nextPeers));
           setSelectedId((current) =>
             current && !nextPeers.some((peer) => peer.id === current) ? null : current,
           );
@@ -140,7 +268,7 @@ function App() {
         }),
         attach<string>(dropEvents.discoveryStatus, (status) => setNotice(status)),
         attach<RuntimeDiagnostics>(dropEvents.connectivityDiagnostics, (nextDiagnostics) => {
-          setDiagnostics(nextDiagnostics);
+          updateDiagnostics(nextDiagnostics);
         }),
       ]);
       if (!mounted) return;
@@ -149,7 +277,7 @@ function App() {
         if (!mounted) return;
         setPeers(snapshot.peers);
         setPreferences(snapshot.preferences);
-        setDiagnostics(snapshot.diagnostics);
+        updateDiagnostics(snapshot.diagnostics);
         if (!snapshot.diagnostics.local.receiveDirectoryAvailable) {
           setNotice("Your receive folder is unavailable. Choose another folder in Settings.");
         }
@@ -158,6 +286,7 @@ function App() {
       }
       if (!mounted) return;
       try {
+        const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
         const unlistenDrag = await getCurrentWebviewWindow().onDragDropEvent((event) => {
           if (event.payload.type === "over") setIsDragging(true);
           if (event.payload.type === "leave") {
@@ -192,13 +321,22 @@ function App() {
   }, [notice]);
 
   const startTransfer = async (paths: string[]) => {
-    if (lockedRef.current) {
-      setNotice("Finish the current transfer first.");
+    const selectedPaths = paths.filter((path) => path.trim().length > 0);
+    if (!selectedPaths.length) {
+      setNotice("Choose files to send.");
       return;
     }
     const peer = selectedPeerRef.current;
     if (!peer) {
       setNotice("Choose a device first.");
+      return;
+    }
+    if (activeTransfer?.direction === "outgoing" && !incoming && !trustRequest) {
+      addToQueue(peer, selectedPaths);
+      return;
+    }
+    if (lockedRef.current) {
+      setNotice("Finish the current transfer first.");
       return;
     }
     if (!peer.online) {
@@ -209,11 +347,7 @@ function App() {
       setNotice("Update Drop on that device first.");
       return;
     }
-    const selectedPaths = paths.filter((path) => path.trim().length > 0);
-    if (!selectedPaths.length) {
-      setNotice("Choose files to send.");
-      return;
-    }
+    setIsSettingsOpen(false);
     if (!native) {
       const previewFiles = selectedPaths.map((path) => ({
         name: fileNameFromPath(path),
@@ -242,8 +376,9 @@ function App() {
   };
   startTransferRef.current = startTransfer;
 
-  const chooseAndSend = async () => {
-    if (lockedRef.current) {
+  const chooseAndSend = useCallback(async () => {
+    const queueing = Boolean(activeTransfer?.direction === "outgoing" && !incoming && !trustRequest);
+    if (lockedRef.current && !queueing) {
       setNotice("Finish the current transfer first.");
       return;
     }
@@ -257,11 +392,11 @@ function App() {
     }
     try {
       const paths = await chooseFiles();
-      if (paths.length) await startTransfer(paths);
+      if (paths.length) await startTransferRef.current(paths);
     } catch (error) {
       setNotice(userFacingError(error, "Couldn't open the file picker."));
     }
-  };
+  }, [activeTransfer, incoming, native, trustRequest]);
 
   const handleBrowserDrop = (event: DragEvent<HTMLElement>) => {
     event.preventDefault();
@@ -290,76 +425,19 @@ function App() {
       onDragOver={(event) => {
         event.preventDefault();
         if (event.dataTransfer.types.includes("Files")) {
-          event.dataTransfer.dropEffect = viewLocked ? "none" : "copy";
+          event.dataTransfer.dropEffect = viewLocked && !canQueue ? "none" : "copy";
         }
       }}
     >
-      <aside className="sidebar" aria-label="Drop navigation">
-        <div className="brand" aria-label="Drop">
-          <span>Drop</span>
-        </div>
-        <section className="device-section" aria-label="Devices">
-          <p className="eyebrow">Devices</p>
-          <div className="device-list">
-            {peers.map((peer) => {
-              const compatible = peer.protocolVersion === CURRENT_PROTOCOL_VERSION;
-              return (
-                <button
-                  aria-current={peer.id === selectedId ? "true" : undefined}
-                  aria-disabled={viewLocked ? "true" : undefined}
-                  className={`device-row ${peer.id === selectedId ? "is-selected" : ""} ${viewLocked ? "is-locked" : ""}`}
-                  key={peer.id}
-                  onClick={() => {
-                    if (lockedRef.current) {
-                      setNotice("Finish the current transfer first.");
-                      return;
-                    }
-                    setSelectedId(peer.id);
-                    setIsSettingsOpen(false);
-                  }}
-                  type="button"
-                >
-                  <DeviceIcon os={peer.os} />
-                  <span className="device-copy">
-                    <span title={peer.name}>{peer.name}</span>
-                    <small>{compatible ? peer.os : "Needs a Drop update"}</small>
-                  </span>
-                  <span
-                    className={`online-dot ${peer.online ? "" : "is-offline"}`}
-                    aria-label={peer.online ? "Online" : "Offline"}
-                  />
-                </button>
-              );
-            })}
-            {!peers.length && (
-              <p className="device-empty" aria-label="Looking for devices.">
-                Looking for devices<span className="device-empty-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
-              </p>
-            )}
-          </div>
-        </section>
-        <button
-          aria-disabled={transferLocked ? "true" : undefined}
-          className={`settings-link ${isSettingsOpen ? "is-active" : ""} ${transferLocked ? "is-locked" : ""}`}
-          type="button"
-          onClick={() => {
-            if (isSettingsOpen) {
-              setOpenDiagnostics(false);
-              setIsSettingsOpen(false);
-              return;
-            }
-            if (transferLocked) {
-              setNotice("Finish the current transfer first.");
-              return;
-            }
-            setOpenDiagnostics(false);
-            setIsSettingsOpen(true);
-          }}
-        >
-          <SettingsIcon />
-          Settings
-        </button>
-      </aside>
+      <DeviceSidebar
+        peers={peers}
+        selectedId={selectedId}
+        viewLocked={viewLocked}
+        transferLocked={transferLocked}
+        isSettingsOpen={isSettingsOpen}
+        onSelectPeer={handleSelectPeer}
+        onToggleSettings={handleToggleSettings}
+      />
 
       <section
         className="content"
@@ -376,75 +454,71 @@ function App() {
         onDrop={handleBrowserDrop}
       >
         <header className="content-header">
-          <div aria-live="polite" className="quiet-notice">
-            {notice}
-          </div>
-          <div aria-live="polite" className={`ready ${headerStatus === "Searching" ? "is-searching" : ""}`}>
-            <span />
-            {headerStatus}
-          </div>
+          <ContentHeader notice={notice} status={headerStatus} />
         </header>
 
         <div className="main-panel">
           {isSettingsOpen ? (
-            <SettingsPanel
-              native={native}
-              preferences={preferences}
-              diagnostics={diagnostics}
-              openDiagnostics={openDiagnostics}
-              onClose={() => {
-                setOpenDiagnostics(false);
-                setIsSettingsOpen(false);
-              }}
-              onNotice={setNotice}
-              onPeerConnected={(peer) => {
-                setPeers((current) => {
-                  const withoutPeer = current.filter((candidate) => candidate.id !== peer.id);
-                  return [...withoutPeer, peer];
-                });
-                setSelectedId(peer.id);
-                setOpenDiagnostics(false);
-                setIsSettingsOpen(false);
-                setNotice(`${peer.name} is ready.`);
-              }}
-              onForgetTrustedDevice={async (fingerprint) => {
-                if (native) await command.forgetTrustedDevice(fingerprint);
-                setDiagnostics((current) => current
-                  ? {
+            <Suspense fallback={<SettingsLoading />}>
+              <SettingsPanel
+                native={native}
+                preferences={preferences}
+                diagnostics={diagnostics}
+                openDiagnostics={openDiagnostics}
+                onClose={() => {
+                  setOpenDiagnostics(false);
+                  setIsSettingsOpen(false);
+                }}
+                onNotice={setNotice}
+                onPeerConnected={(peer) => {
+                  setPeers((current) => {
+                    const withoutPeer = current.filter((candidate) => candidate.id !== peer.id);
+                    return [...withoutPeer, peer];
+                  });
+                  setSelectedId(peer.id);
+                  setOpenDiagnostics(false);
+                  setIsSettingsOpen(false);
+                  setNotice(`${peer.name} is ready.`);
+                }}
+                onForgetTrustedDevice={async (fingerprint) => {
+                  if (native) await command.forgetTrustedDevice(fingerprint);
+                  const current = diagnosticsRef.current;
+                  if (current) {
+                    updateDiagnostics({
                       ...current,
                       trustedDevices: current.trustedDevices.filter((device) => device.fingerprint !== fingerprint),
-                    }
-                  : current);
-                setNotice("Device forgotten. Drop will ask before trusting it again.");
-              }}
-              updateState={updater.state}
-              automaticUpdateChecks={automaticUpdateChecks}
-              transferBusy={transferLocked || Boolean(trustRequest)}
-              onCheckForUpdates={updater.checkNow}
-              onStartUpdate={updater.startUpdate}
-              onAutomaticUpdateChecksChange={(enabled) => {
-                setAutomaticUpdateChecks(enabled);
-                saveAutomaticUpdateChecks(enabled);
-              }}
-              onSave={async (draft) => {
-                if (!native) {
-                  setPreferences({ deviceName: draft.deviceName.trim(), destination: draft.destination.trim() });
-                  setNotice("Saved in preview.");
-                  return;
-                }
-                const saved = await command.updatePreferences(draft);
-                setPreferences(saved);
-                setDiagnostics((current) =>
-                  current
-                    ? {
-                        ...current,
-                        local: { ...current.local, receiveDirectoryAvailable: true },
-                      }
-                    : current,
-                );
-                setNotice("Saved. Devices will refresh shortly.");
-              }}
-            />
+                    });
+                  }
+                  setNotice("Device forgotten. Drop will ask before trusting it again.");
+                }}
+                updateState={updater.state}
+                automaticUpdateChecks={automaticUpdateChecks}
+                transferBusy={transferLocked || Boolean(trustRequest)}
+                onCheckForUpdates={updater.checkNow}
+                onStartUpdate={updater.startUpdate}
+                onAutomaticUpdateChecksChange={(enabled) => {
+                  setAutomaticUpdateChecks(enabled);
+                  saveAutomaticUpdateChecks(enabled);
+                }}
+                onSave={async (draft) => {
+                  if (!native) {
+                    setPreferences({ deviceName: draft.deviceName.trim(), destination: draft.destination.trim() });
+                    setNotice("Saved in preview.");
+                    return;
+                  }
+                  const saved = await command.updatePreferences(draft);
+                  setPreferences(saved);
+                  const current = diagnosticsRef.current;
+                  if (current) {
+                    updateDiagnostics({
+                      ...current,
+                      local: { ...current.local, receiveDirectoryAvailable: true },
+                    });
+                  }
+                  setNotice("Saved. Devices will refresh shortly.");
+                }}
+              />
+            </Suspense>
           ) : trustRequest ? (
             <TrustPanel
               request={trustRequest}
@@ -459,6 +533,7 @@ function App() {
           ) : incoming ? (
             <IncomingPanel
               incoming={incoming}
+              destination={preferences.destination}
               onRespond={async (accepted) => {
                 if (!native) {
                   setIncoming(null);
@@ -476,9 +551,15 @@ function App() {
           ) : activeTransfer ? (
             <TransferPanel
               transfer={activeTransfer}
+              destination={activeTransfer.direction === "incoming" ? preferences.destination : undefined}
+              onChoose={activeTransfer.direction === "outgoing" ? chooseAndSend : undefined}
+              queuedTransfers={queuedTransfers}
+              onRemoveQueued={removeQueuedTransfer}
               onCancel={async () => {
                 if (!native) {
                   setActiveTransfer(null);
+                  queuedTransfersRef.current = [];
+                  setQueuedTransfers([]);
                   return;
                 }
                 try {
@@ -488,27 +569,23 @@ function App() {
                   throw error;
                 }
               }}
-              onDone={() => setActiveTransfer(null)}
+              onDone={finishTransfer}
             />
           ) : selectedPeer ? (
-            <SendPanel peer={selectedPeer} onChoose={() => void chooseAndSend()} />
+            <SendPanel peer={selectedPeer} onChoose={chooseAndSend} />
           ) : (
             <NoDevicePanel
               state={noDeviceState}
-              pingKey={radarPingKey}
-              onOpenSettings={() => {
-                setOpenDiagnostics(true);
-                setIsSettingsOpen(true);
-              }}
+              onOpenSettings={handleOpenDiagnostics}
             />
           )}
         </div>
         {isDragging && (
           <div className="drop-state" aria-live="polite">
-            <p>{trustRequest ? "Confirm this device" : incoming ? "Incoming request" : viewLocked ? "Transfer in progress" : selectedPeer ? "Drop to send" : "Choose a device first"}</p>
+            <p>{trustRequest ? "Confirm this device" : incoming ? "Incoming request" : canQueue ? "Add to queue" : viewLocked ? "Transfer in progress" : selectedPeer ? "Drop to send" : "Choose a device first"}</p>
             <span>
               <ArrowIcon />
-              {trustRequest ? trustRequest.device.name : incoming ? "Respond before sending" : viewLocked ? "Finish the current transfer" : selectedPeer ? selectedPeer.name : "Select a device"}
+              {trustRequest ? trustRequest.device.name : incoming ? "Respond before sending" : canQueue ? (queuedTransfers.length ? `${queuedTransfers.length} queued after this transfer` : "Drop files to send them next") : viewLocked ? "Finish the current transfer" : selectedPeer ? selectedPeer.name : "Select a device"}
             </span>
           </div>
         )}
@@ -528,6 +605,116 @@ function App() {
       />
     </main>
   );
+}
+
+const DeviceSidebar = memo(function DeviceSidebar({
+  peers,
+  selectedId,
+  viewLocked,
+  transferLocked,
+  isSettingsOpen,
+  onSelectPeer,
+  onToggleSettings,
+}: {
+  peers: Peer[];
+  selectedId: string | null;
+  viewLocked: boolean;
+  transferLocked: boolean;
+  isSettingsOpen: boolean;
+  onSelectPeer: (peerId: string) => void;
+  onToggleSettings: () => void;
+}) {
+  return (
+    <aside className="sidebar" aria-label="Drop navigation">
+      <div className="brand" aria-label="Drop">
+        <span>Drop</span>
+      </div>
+      <section className="device-section" aria-label="Devices">
+        <p className="eyebrow">Devices</p>
+        <div className="device-list">
+          {peers.map((peer) => {
+            const compatible = peer.protocolVersion === CURRENT_PROTOCOL_VERSION;
+            return (
+              <button
+                aria-current={peer.id === selectedId ? "true" : undefined}
+                aria-disabled={viewLocked ? "true" : undefined}
+                className={`device-row ${peer.id === selectedId ? "is-selected" : ""} ${viewLocked ? "is-locked" : ""}`}
+                key={peer.id}
+                onClick={() => onSelectPeer(peer.id)}
+                type="button"
+              >
+                <DeviceIcon os={peer.os} />
+                <span className="device-copy">
+                  <span title={peer.name}>{peer.name}</span>
+                  <small>{compatible ? peer.os : "Needs a Drop update"}</small>
+                </span>
+                <span
+                  className={`online-dot ${peer.online ? "" : "is-offline"}`}
+                  aria-label={peer.online ? "Online" : "Offline"}
+                />
+              </button>
+            );
+          })}
+          {!peers.length && (
+            <p className="device-empty" aria-label="Looking for devices.">
+              Looking for devices<span className="device-empty-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+            </p>
+          )}
+        </div>
+      </section>
+      <button
+        aria-disabled={transferLocked ? "true" : undefined}
+        className={`settings-link ${isSettingsOpen ? "is-active" : ""} ${transferLocked ? "is-locked" : ""}`}
+        type="button"
+        onClick={onToggleSettings}
+      >
+        <SettingsIcon />
+        Settings
+      </button>
+    </aside>
+  );
+});
+
+const ContentHeader = memo(function ContentHeader({
+  notice,
+  status,
+}: {
+  notice: string | null;
+  status: string;
+}) {
+  return (
+    <>
+      <div aria-live="polite" className="quiet-notice">
+        {notice}
+      </div>
+      <div aria-live="polite" className={`ready ${status === "Searching" ? "is-searching" : ""}`}>
+        <span />
+        {status}
+      </div>
+    </>
+  );
+});
+
+function SettingsLoading() {
+  return (
+    <div className="settings-loading state-panel" role="status" aria-live="polite">
+      Loading settings…
+    </div>
+  );
+}
+
+function samePeers(current: Peer[], next: Peer[]) {
+  if (current === next) return true;
+  if (current.length !== next.length) return false;
+  return current.every((peer, index) => {
+    const candidate = next[index];
+    return peer.id === candidate.id
+      && peer.name === candidate.name
+      && peer.os === candidate.os
+      && peer.protocolVersion === candidate.protocolVersion
+      && peer.fingerprint === candidate.fingerprint
+      && peer.online === candidate.online;
+  });
 }
 
 
@@ -582,4 +769,3 @@ function TrustPanel({
 
 const root = document.getElementById("root");
 if (root) createRoot(root).render(<App />);
-

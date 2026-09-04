@@ -46,7 +46,7 @@ There is no background restart path.
 the stable channel at:
 
 ```text
-https://github.com/Charlemagne404/dead-drop/releases/latest/download/latest.json
+https://github.com/Plainslash/Drop/releases/latest/download/latest.json
 ```
 
 The endpoint is a static Tauri manifest, not a custom update protocol. A signed

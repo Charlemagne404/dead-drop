@@ -1,6 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
-
 export type Device = {
   id: string;
   name: string;
@@ -165,7 +162,13 @@ export type InitialState = {
 export const isNativeRuntime = () =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+async function invokeCommand<T>(name: string, args?: Record<string, unknown>) {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return args === undefined ? invoke<T>(name) : invoke<T>(name, args);
+}
+
 export async function chooseFiles(): Promise<string[]> {
+  const { open } = await import("@tauri-apps/plugin-dialog");
   const picked = await open({
     title: "Choose files",
     multiple: true,
@@ -176,6 +179,7 @@ export async function chooseFiles(): Promise<string[]> {
 }
 
 export async function chooseDirectory(): Promise<string | null> {
+  const { open } = await import("@tauri-apps/plugin-dialog");
   const picked = await open({
     title: "Choose receive folder",
     multiple: false,
@@ -185,23 +189,23 @@ export async function chooseDirectory(): Promise<string | null> {
 }
 
 export const command = {
-  initialState: () => invoke<InitialState>("initial_state"),
-  diagnosticsReport: () => invoke<string>("diagnostics_report"),
+  initialState: () => invokeCommand<InitialState>("initial_state"),
   sendFiles: (peerId: string, paths: string[]) =>
-    invoke<string>("send_files", { peerId, paths }),
+    invokeCommand<string>("send_files", { peerId, paths }),
   cancelTransfer: (transferId: string) =>
-    invoke<void>("cancel_transfer", { transferId }),
+    invokeCommand<void>("cancel_transfer", { transferId }),
   respondToIncoming: (transferId: string, accepted: boolean) =>
-    invoke<void>("respond_to_incoming", { transferId, accepted }),
+    invokeCommand<void>("respond_to_incoming", { transferId, accepted }),
   respondToTrust: (requestId: string, accepted: boolean) =>
-    invoke<void>("respond_to_trust", { requestId, accepted }),
+    invokeCommand<void>("respond_to_trust", { requestId, accepted }),
   forgetTrustedDevice: (fingerprint: string) =>
-    invoke<void>("forget_trusted_device", { fingerprint }),
+    invokeCommand<void>("forget_trusted_device", { fingerprint }),
   connectByAddress: (address: string) =>
-    invoke<Peer>("connect_by_address", { address }),
-  beginUpdaterInstall: () => invoke<boolean>("begin_updater_install"),
-  endUpdaterInstall: () => invoke<void>("end_updater_install"),
-  updaterIsBusy: () => invoke<boolean>("updater_is_busy"),
+    invokeCommand<Peer>("connect_by_address", { address }),
+  diagnosticsReport: () => invokeCommand<string>("diagnostics_report"),
+  beginUpdaterInstall: () => invokeCommand<boolean>("begin_updater_install"),
+  endUpdaterInstall: () => invokeCommand<void>("end_updater_install"),
+  updaterIsBusy: () => invokeCommand<boolean>("updater_is_busy"),
   updatePreferences: (draft: Preferences) =>
-    invoke<Preferences>("update_preferences", { draft }),
+    invokeCommand<Preferences>("update_preferences", { draft }),
 };

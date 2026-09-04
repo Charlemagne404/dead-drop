@@ -21,6 +21,7 @@ const NOISE_TAG_SIZE: usize = 16;
 const MAX_NOISE_PLAINTEXT: usize = MAX_SECURE_RECORD_SIZE - NOISE_TAG_SIZE;
 const FRAGMENT_HEADER_SIZE: usize = 18;
 const MAX_FRAGMENT_PAYLOAD: usize = MAX_NOISE_PLAINTEXT - FRAGMENT_HEADER_SIZE;
+const RECORD_LENGTH_PREFIX_SIZE: usize = std::mem::size_of::<u32>();
 const FRAGMENT_VERSION: u8 = 1;
 const FIRST_FRAGMENT: u8 = 0x01;
 const LAST_FRAGMENT: u8 = 0x02;
@@ -75,6 +76,7 @@ pub struct SecureChannel {
     next_incoming_message: u64,
     read_ciphertext: Vec<u8>,
     read_plaintext: Vec<u8>,
+    logical: Vec<u8>,
     fragment: Vec<u8>,
     ciphertext: Vec<u8>,
 }
@@ -88,8 +90,9 @@ impl SecureChannel {
             next_incoming_message: 0,
             read_ciphertext: vec![0_u8; MAX_SECURE_RECORD_SIZE],
             read_plaintext: vec![0_u8; MAX_NOISE_PLAINTEXT],
+            logical: Vec::new(),
             fragment: Vec::with_capacity(FRAGMENT_HEADER_SIZE + MAX_FRAGMENT_PAYLOAD),
-            ciphertext: vec![0_u8; MAX_SECURE_RECORD_SIZE],
+            ciphertext: vec![0_u8; RECORD_LENGTH_PREFIX_SIZE + MAX_SECURE_RECORD_SIZE],
         }
     }
 
@@ -117,16 +120,17 @@ impl SecureChannel {
     }
 
     pub async fn read_frame(&mut self) -> Result<Frame, SecureError> {
-        let logical = read_logical(
+        read_logical(
             &mut self.stream,
             &self.transport,
             &mut self.next_incoming_message,
             &mut self.read_ciphertext,
             &mut self.read_plaintext,
+            &mut self.logical,
         )
         .await?;
-        let (frame, consumed) = protocol::decode_frame(&logical)?;
-        if consumed != logical.len() {
+        let (frame, consumed) = protocol::decode_frame(&self.logical)?;
+        if consumed != self.logical.len() {
             return Err(SecureError::Invalid(
                 "encrypted frame contained trailing bytes".to_string(),
             ));
@@ -157,6 +161,7 @@ impl SecureChannel {
                 next_incoming_message: self.next_incoming_message,
                 read_ciphertext: self.read_ciphertext,
                 read_plaintext: self.read_plaintext,
+                logical: self.logical,
             },
             SecureWriter {
                 writer,
@@ -175,20 +180,22 @@ pub struct SecureReader {
     next_incoming_message: u64,
     read_ciphertext: Vec<u8>,
     read_plaintext: Vec<u8>,
+    logical: Vec<u8>,
 }
 
 impl SecureReader {
     pub async fn read_frame(&mut self) -> Result<Frame, SecureError> {
-        let logical = read_logical(
+        read_logical(
             &mut self.reader,
             &self.transport,
             &mut self.next_incoming_message,
             &mut self.read_ciphertext,
             &mut self.read_plaintext,
+            &mut self.logical,
         )
         .await?;
-        let (frame, consumed) = protocol::decode_frame(&logical)?;
-        if consumed != logical.len() {
+        let (frame, consumed) = protocol::decode_frame(&self.logical)?;
+        if consumed != self.logical.len() {
             return Err(SecureError::Invalid(
                 "encrypted frame contained trailing bytes".to_string(),
             ));
@@ -359,7 +366,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     kind: u8,
     payload: &[u8],
     fragment: &mut Vec<u8>,
-    ciphertext: &mut Vec<u8>,
+    ciphertext: &mut [u8],
 ) -> Result<(), SecureError> {
     protocol::validate_frame_payload(kind, payload.len())?;
     let payload_length = u32::try_from(payload.len())
@@ -413,17 +420,15 @@ async fn write_frame<W: AsyncWrite + Unpin>(
         }
         let ciphertext_length = {
             let mut state = transport.lock().await;
-            state.write_message(fragment, ciphertext.as_mut_slice())?
+            state.write_message(fragment, &mut ciphertext[RECORD_LENGTH_PREFIX_SIZE..])?
         };
         if ciphertext_length == 0 || ciphertext_length > MAX_SECURE_RECORD_SIZE {
             return Err(SecureError::Crypto);
         }
+        ciphertext[..RECORD_LENGTH_PREFIX_SIZE]
+            .copy_from_slice(&(ciphertext_length as u32).to_be_bytes());
         writer
-            .write_u32(ciphertext_length as u32)
-            .await
-            .map_err(SecureError::Io)?;
-        writer
-            .write_all(&ciphertext[..ciphertext_length])
+            .write_all(&ciphertext[..RECORD_LENGTH_PREFIX_SIZE + ciphertext_length])
             .await
             .map_err(SecureError::Io)?;
         offset += count;
@@ -437,9 +442,11 @@ async fn read_logical<R: AsyncRead + Unpin>(
     next_message: &mut u64,
     read_ciphertext: &mut Vec<u8>,
     read_plaintext: &mut Vec<u8>,
-) -> Result<Vec<u8>, SecureError> {
+    logical: &mut Vec<u8>,
+) -> Result<(), SecureError> {
     let expected_message = *next_message;
-    let mut logical = None;
+    logical.clear();
+    let mut active = None;
     loop {
         let fragment_length =
             read_secure_record(reader, transport, read_ciphertext, read_plaintext).await?;
@@ -480,22 +487,18 @@ async fn read_logical<R: AsyncRead + Unpin>(
                 "encrypted fragment payload was invalid".to_string(),
             ));
         }
-        if logical.is_none() {
+        if active.is_none() {
             if message_id != expected_message || offset != 0 || fragment[1] & FIRST_FRAGMENT == 0 {
                 return Err(SecureError::Invalid(
                     "encrypted fragments arrived out of order".to_string(),
                 ));
             }
-            logical = Some((
-                message_id,
-                total_length,
-                0_usize,
-                Vec::with_capacity(total_length),
-            ));
+            logical.reserve(total_length);
+            active = Some((message_id, total_length, 0_usize));
         }
-        let (active_id, active_total, active_offset, bytes) = logical
+        let (active_id, active_total, active_offset) = active
             .as_mut()
-            .expect("logical frame was initialized above");
+            .expect("logical frame metadata was initialized above");
         if message_id != *active_id
             || total_length != *active_total
             || offset != *active_offset
@@ -514,13 +517,13 @@ async fn read_logical<R: AsyncRead + Unpin>(
                 "encrypted fragment termination was invalid".to_string(),
             ));
         }
-        bytes.extend_from_slice(data);
+        logical.extend_from_slice(data);
         *active_offset = end;
         if end == total_length {
             *next_message = next_message.checked_add(1).ok_or_else(|| {
                 SecureError::Invalid("encrypted message counter exhausted".to_string())
             })?;
-            return Ok(logical.take().expect("logical frame exists").3);
+            return Ok(());
         }
         if last {
             return Err(SecureError::Invalid(

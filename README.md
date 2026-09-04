@@ -147,7 +147,7 @@ versioned secure v2 contract described in [docs/SECURITY_DESIGN.md](docs/SECURIT
 - Received files remain unique `.part` files until every file is received and integrity-checked. They are finalized only after the sender completes the batch.
 - Cancellation, rejection, timeouts, invalid metadata, checksum mismatch, and protocol-version mismatches fail safely.
 - Transfers are limited to 256 regular files and 4 TiB per request.
-- Only one transfer is admitted at a time. Additional requests are declined with a clear busy response instead of competing for shared UI or destination state.
+- Only one transfer is admitted at a time. Additional incoming requests are declined with a clear busy response instead of competing for shared UI or destination state. The sender UI can hold up to eight additional outgoing batches in a small in-memory queue and lets you start them one at a time after the current transfer; queued source paths are not persisted or copied, so a path that disappears before its turn will fail normally.
 - A first-contact or changed-identity peer must be explicitly trusted; trust is tied to the public-key fingerprint, not an IP address, name, or UUID.
 
 Current v2 has Drop-level authenticated encryption, per-session forward secrecy from fresh ephemeral keys, and replay resistance within each Noise session. It has no public-internet/port-forwarding support, NAT traversal, relay, resume, clipboard sharing, folder sync, or transfer-level automatic updating. A v1 peer is rejected; there is no silent downgrade to plaintext. Tailscale encryption remains useful, but it does not replace Drop-level identity and session protection.

@@ -1,8 +1,7 @@
-import { useState } from "react";
-import type { IncomingTransfer, Peer, Transfer } from "../lib/desktop";
+import { memo, useState } from "react";
+import type { IncomingTransfer, Peer, Transfer, TransferFile } from "../lib/desktop";
 import { CURRENT_PROTOCOL_VERSION } from "../lib/constants";
 import {
-  fileNameFromPath,
   formatBytes,
   isTerminalPhase,
   phaseLabel,
@@ -13,11 +12,95 @@ import {
   CheckIcon,
   DeviceIcon,
   FileIcon,
-  RadarIcon,
   TransferIcon,
 } from "./Icons";
 
-export function SendPanel({ peer, onChoose }: { peer: Peer; onChoose: () => void }) {
+export type QueuedTransferSummary = {
+  id: string;
+  deviceName: string;
+  fileNames: string[];
+};
+
+function FileManifest({ files, totalBytes }: { files: TransferFile[]; totalBytes: number }) {
+  const [open, setOpen] = useState(files.length > 1);
+  const firstFile = files[0];
+  const title = files.length > 1 ? `${files.length} files` : firstFile?.name ?? "Preparing files";
+  const size = files.length > 1 ? `${formatBytes(totalBytes)} total` : formatBytes(totalBytes);
+  return (
+    <details
+      className="file-manifest"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <FileIcon />
+        <span className="file-manifest-summary">
+          <strong title={files.length === 1 ? firstFile?.name : undefined}>{title}</strong>
+          <small>{size}</small>
+        </span>
+        <span className="file-manifest-toggle">View files</span>
+      </summary>
+      <ul className="file-manifest-list" aria-label="Files in transfer">
+        {files.length ? files.map((file, index) => (
+          <li key={`${file.name}-${index}`}>
+            <span title={file.name}>{file.name}</span>
+            <small>{formatBytes(file.size)}</small>
+          </li>
+        )) : (
+          <li><span>Preparing files</span></li>
+        )}
+      </ul>
+    </details>
+  );
+}
+
+function ReceiveDestination({ destination }: { destination: string }) {
+  return (
+    <div className="receive-destination">
+      <p>Save to</p>
+      <strong title={destination}>{destination || "Configured receive folder"}</strong>
+      <small>Existing files are never overwritten. Duplicate names receive a number suffix.</small>
+    </div>
+  );
+}
+
+function TransferQueue({
+  transfers,
+  onRemove,
+}: {
+  transfers: QueuedTransferSummary[];
+  onRemove: (id: string) => void;
+}) {
+  if (!transfers.length) return null;
+  return (
+    <section className="transfer-queue" aria-labelledby="transfer-queue-heading">
+      <div className="transfer-queue-heading">
+        <strong id="transfer-queue-heading">Up next</strong>
+        <small>{transfers.length} queued</small>
+      </div>
+      <ol>
+        {transfers.map((queued) => (
+          <li key={queued.id}>
+            <span>
+              <strong title={queued.deviceName}>{queued.deviceName}</strong>
+              <small>{queued.fileNames.length === 1 ? queued.fileNames[0] : `${queued.fileNames.length} files`}</small>
+            </span>
+            <button
+              className="text-button"
+              type="button"
+              aria-label={`Remove ${queued.fileNames.length === 1 ? queued.fileNames[0] : "queued files"}`}
+              onClick={() => onRemove(queued.id)}
+            >
+              Remove
+            </button>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+export const SendPanel = memo(function SendPanel({ peer, onChoose }: { peer: Peer; onChoose: () => void }) {
   const compatible = peer.online && peer.protocolVersion === CURRENT_PROTOCOL_VERSION;
   const targetStatus = !peer.online ? "Offline" : compatible ? peer.os : "Needs a Drop update";
   const promptTitle = !peer.online ? "Device went offline." : compatible ? "Drop files anywhere" : "Update Drop to send";
@@ -30,7 +113,7 @@ export function SendPanel({ peer, onChoose }: { peer: Peer; onChoose: () => void
         <p>{targetStatus}</p>
       </div>
       <div className="drop-prompt">
-        {compatible ? <FileIcon /> : <RadarIcon />}
+        {compatible ? <FileIcon /> : <DeviceIcon os={peer.os} />}
         <h2>{promptTitle}</h2>
         <p>{promptCopy}</p>
         <button className="outline-button" type="button" onClick={onChoose} disabled={!compatible}>
@@ -39,7 +122,7 @@ export function SendPanel({ peer, onChoose }: { peer: Peer; onChoose: () => void
       </div>
     </div>
   );
-}
+});
 
 export type NoDeviceState = "searching" | "unreachable" | "outdated" | "select";
 
@@ -66,13 +149,11 @@ const noDeviceCopy: Record<NoDeviceState, { title: string; status: string; help:
   },
 };
 
-export function NoDevicePanel({
+export const NoDevicePanel = memo(function NoDevicePanel({
   state,
-  pingKey,
   onOpenSettings,
 }: {
   state: NoDeviceState;
-  pingKey: number;
   onOpenSettings: () => void;
 }) {
   const copy = noDeviceCopy[state];
@@ -80,9 +161,6 @@ export function NoDevicePanel({
   return (
     <div className={`no-device state-panel is-${state}`}>
       <div className="no-device-copy">
-        <div className="radar-stage">
-          <RadarIcon searching={state === "searching"} pingKey={pingKey} />
-        </div>
         <h1>{copy.title}</h1>
         <p className="no-device-status" role="status">{copy.status}</p>
         <p className="no-device-help">{copy.help}</p>
@@ -94,16 +172,24 @@ export function NoDevicePanel({
       </div>
     </div>
   );
-}
+});
 
 export function TransferPanel({
   transfer,
   onCancel,
   onDone,
+  onChoose,
+  queuedTransfers = [],
+  onRemoveQueued,
+  destination,
 }: {
   transfer: Transfer;
   onCancel: () => Promise<void>;
   onDone: () => void;
+  onChoose?: () => void;
+  queuedTransfers?: QueuedTransferSummary[];
+  onRemoveQueued?: (id: string) => void;
+  destination?: string;
 }) {
   const complete = transfer.phase === "completed";
   const terminal = isTerminalPhase(transfer.phase);
@@ -111,7 +197,6 @@ export function TransferPanel({
   const percentage = transfer.totalBytes
     ? Math.min(100, (transfer.transferredBytes / transfer.totalBytes) * 100)
     : 0;
-  const primaryFile = transfer.files[0];
   const status = transferStatus(transfer.phase, transfer.direction);
   const cancel = async () => {
     if (cancelling) return;
@@ -129,20 +214,20 @@ export function TransferPanel({
         <p aria-live="polite" className="eyebrow">{status}</p>
         <h1 title={transfer.deviceName}>{transfer.deviceName}</h1>
       </div>
-      <div className="transfer-card">
-        <FileIcon />
-        <div>
-          <strong title={primaryFile?.name}>{primaryFile?.name ?? "Preparing files"}</strong>
-          <small>
-            {transfer.files.length > 1 ? `${transfer.files.length} files · ` : ""}
-            {formatBytes(transfer.totalBytes)}
-          </small>
-        </div>
-      </div>
+      <FileManifest files={transfer.files} totalBytes={transfer.totalBytes} />
+      {transfer.direction === "incoming" && destination && <ReceiveDestination destination={destination} />}
+      {transfer.direction === "outgoing" && onChoose && (
+        <button className="outline-button queue-add-button" type="button" onClick={onChoose}>
+          Add files to queue
+        </button>
+      )}
+      {transfer.direction === "outgoing" && onRemoveQueued && (
+        <TransferQueue transfers={queuedTransfers} onRemove={onRemoveQueued} />
+      )}
       {terminal ? (
         <div className="terminal-copy" aria-live="polite">
           <p>{complete ? (transfer.direction === "incoming" ? "Received." : "Sent.") : transfer.message ?? phaseLabel(transfer.phase)}</p>
-          <button type="button" className="text-button" onClick={onDone}>Done</button>
+          <button type="button" className="text-button" onClick={onDone}>{queuedTransfers.length ? "Send next" : "Done"}</button>
         </div>
       ) : (
         <>
@@ -170,9 +255,16 @@ export function TransferPanel({
   );
 }
 
-export function IncomingPanel({ incoming, onRespond }: { incoming: IncomingTransfer; onRespond: (accepted: boolean) => Promise<void> }) {
+export function IncomingPanel({
+  incoming,
+  destination,
+  onRespond,
+}: {
+  incoming: IncomingTransfer;
+  destination: string;
+  onRespond: (accepted: boolean) => Promise<void>;
+}) {
   const [responding, setResponding] = useState(false);
-  const file = incoming.files[0];
   const respond = async (accepted: boolean) => {
     if (responding) return;
     setResponding(true);
@@ -190,13 +282,8 @@ export function IncomingPanel({ incoming, onRespond }: { incoming: IncomingTrans
       <div className="incoming-device"><DeviceIcon os={incoming.from.os} /></div>
       <p className="eyebrow">Incoming from</p>
       <h1 title={incoming.from.name}>{incoming.from.name}</h1>
-      <div className="incoming-file">
-        <FileIcon />
-        <div>
-          <strong title={file?.name}>{file?.name ?? "Incoming files"}</strong>
-          <small>{incoming.files.length > 1 ? `${incoming.files.length} files · ` : ""}{formatBytes(incoming.totalBytes)}</small>
-        </div>
-      </div>
+      <FileManifest files={incoming.files} totalBytes={incoming.totalBytes} />
+      <ReceiveDestination destination={destination} />
       <div className="incoming-actions">
         <button className="primary-button" type="button" onClick={() => void respond(true)} disabled={responding}>Accept</button>
         <button className="outline-button" type="button" onClick={() => void respond(false)} disabled={responding}>Decline</button>

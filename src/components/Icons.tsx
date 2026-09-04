@@ -1,5 +1,3 @@
-import { useEffect, useRef, useState } from "react";
-
 export function DeviceIcon({ os }: { os: string }) {
   return os.toLowerCase().includes("linux") || os.toLowerCase().includes("desktop") ? <DesktopIcon /> : <LaptopIcon />;
 }
@@ -27,32 +25,6 @@ export function SettingsIcon() {
 
 export function SettingsCloseIcon() {
   return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>;
-}
-
-export function RadarIcon({ searching = false, pingKey = 0 }: { searching?: boolean; pingKey?: number } = {}) {
-  const previousPingKeyRef = useRef(pingKey);
-  const [activePingKey, setActivePingKey] = useState<number | null>(null);
-  useEffect(() => {
-    if (pingKey > 0 && pingKey !== previousPingKeyRef.current) {
-      setActivePingKey(pingKey);
-    }
-    previousPingKeyRef.current = pingKey;
-  }, [pingKey]);
-
-  return (
-    <svg className={`radar-icon ${searching ? "is-searching" : ""} ${activePingKey !== null ? "has-ping" : ""}`} viewBox="0 0 68 68" aria-hidden="true">
-      <circle className="radar-ring radar-ring-outer" cx="34" cy="34" r="26" />
-      <circle className="radar-ring radar-ring-inner" cx="34" cy="34" r="14" />
-      <g className="radar-sweep">
-        <path className="radar-sweep-trail" d="M34 34 60 34A26 26 0 0 0 42.9 9.3Z" />
-        <path className="radar-sweep-mid" d="M34 34 60 34A26 26 0 0 0 53.9 17.3Z" />
-        <path className="radar-sweep-near" d="M34 34 60 34A26 26 0 0 0 58.7 26Z" />
-        <path className="radar-sweep-beam" d="M34 34 60 34" />
-      </g>
-      <circle className="radar-ping" key={activePingKey ?? "idle"} cx="34" cy="34" r="4" />
-      <circle className="radar-center" cx="34" cy="34" r="2" />
-    </svg>
-  );
 }
 
 export function TransferIcon() {

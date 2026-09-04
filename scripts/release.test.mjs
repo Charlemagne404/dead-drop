@@ -4,7 +4,17 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
-import { TARGETS, VERSION_PATTERN, currentVersion, main, updateVersion } from "./release.mjs";
+import {
+  REPOSITORY_URL,
+  TARGETS,
+  VERSION_PATTERN,
+  currentVersion,
+  main,
+  updateVersion,
+} from "./release.mjs";
+
+const VERSION = currentVersion();
+const TEST_VERSION = VERSION === "99.99.99" ? "99.99.98" : "99.99.99";
 
 function writeFixtureFile(directory, name, contents = "fixture") {
   const filePath = join(directory, name);
@@ -28,7 +38,7 @@ function writeMacApp(directory) {
 }
 
 test("release metadata has a supported synchronized version", () => {
-  assert.equal(currentVersion(), "0.1.0");
+  assert.equal(currentVersion(), VERSION);
   assert.ok(VERSION_PATTERN.test(currentVersion()));
   assert.deepEqual(TARGETS, [
     "x86_64-pc-windows-msvc",
@@ -40,12 +50,12 @@ test("release metadata has a supported synchronized version", () => {
 
 test("version synchronization updates every managed copy", () => {
   try {
-    updateVersion("0.1.1", { allowDirty: true });
-    assert.equal(currentVersion(), "0.1.1");
+    updateVersion(TEST_VERSION, { allowDirty: true });
+    assert.equal(currentVersion(), TEST_VERSION);
   } finally {
-    updateVersion("0.1.0", { allowDirty: true });
+    updateVersion(VERSION, { allowDirty: true });
   }
-  assert.equal(currentVersion(), "0.1.0");
+  assert.equal(currentVersion(), VERSION);
 });
 
 test("release artifact preparation collects every native target and writes integrity metadata", async () => {
@@ -56,14 +66,14 @@ test("release artifact preparation collects every native target and writes integ
   try {
     const fixtures = {
       "x86_64-pc-windows-msvc": [
-        "Drop_0.1.0_x64-setup.exe",
-        "Drop_0.1.0_x64_en-US.msi",
+        `Drop_${VERSION}_x64-setup.exe`,
+        `Drop_${VERSION}_x64_en-US.msi`,
       ],
-      "aarch64-apple-darwin": ["Drop_0.1.0_aarch64.dmg"],
-      "x86_64-apple-darwin": ["Drop_0.1.0_x64.dmg"],
+      "aarch64-apple-darwin": [`Drop_${VERSION}_aarch64.dmg`],
+      "x86_64-apple-darwin": [`Drop_${VERSION}_x64.dmg`],
       "x86_64-unknown-linux-gnu": [
-        "drop_0.1.0_amd64.deb",
-        "drop_0.1.0_amd64.AppImage",
+        `drop_${VERSION}_amd64.deb`,
+        `drop_${VERSION}_amd64.AppImage`,
       ],
     };
     for (const [target, names] of Object.entries(fixtures)) {
@@ -73,7 +83,7 @@ test("release artifact preparation collects every native target and writes integ
     }
     writeMacApp(join(input, `drop-bundles-aarch64-apple-darwin`));
     writeMacApp(join(input, `drop-bundles-x86_64-apple-darwin`));
-    chmodSync(join(input, "drop-bundles-x86_64-unknown-linux-gnu", "drop_0.1.0_amd64.AppImage"), 0o755);
+    chmodSync(join(input, `drop-bundles-x86_64-unknown-linux-gnu/drop_${VERSION}_amd64.AppImage`), 0o755);
 
     await main(["prepare-artifacts", "--input", input, "--output", output]);
 
@@ -83,7 +93,7 @@ test("release artifact preparation collects every native target and writes integ
     const manifest = JSON.parse(readFileSync(join(output, "ARTIFACT_MANIFEST.json"), "utf8"));
     assert.equal(sums.length, 6);
     assert.equal(manifest.product, "Drop");
-    assert.equal(manifest.version, "0.1.0");
+    assert.equal(manifest.version, VERSION);
     assert.equal(manifest.signing, "unsigned");
     assert.equal(manifest.artifacts.length, 8);
     assert.ok(existsSync(join(output, "UNSIGNED.txt")));
@@ -108,9 +118,9 @@ test("signed artifact preparation writes a complete Tauri updater manifest", asy
     };
     for (const directory of Object.values(targetDirectories)) mkdirSync(directory, { recursive: true });
 
-    writeFixtureFile(targetDirectories["x86_64-pc-windows-msvc"], "Drop_0.1.0_x64-setup.exe");
-    writeFixtureFile(targetDirectories["x86_64-pc-windows-msvc"], "Drop_0.1.0_x64-setup.exe.sig", "windows-signature");
-    writeFixtureFile(targetDirectories["x86_64-pc-windows-msvc"], "Drop_0.1.0_x64_en-US.msi");
+    writeFixtureFile(targetDirectories["x86_64-pc-windows-msvc"], `Drop_${VERSION}_x64-setup.exe`);
+    writeFixtureFile(targetDirectories["x86_64-pc-windows-msvc"], `Drop_${VERSION}_x64-setup.exe.sig`, "windows-signature");
+    writeFixtureFile(targetDirectories["x86_64-pc-windows-msvc"], `Drop_${VERSION}_x64_en-US.msi`);
 
     const macTargets = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
     for (const target of macTargets) {
@@ -120,19 +130,19 @@ test("signed artifact preparation writes a complete Tauri updater manifest", asy
       const archive = "Drop.app.tar.gz";
       writeFixtureFile(directory, archive, `${target}-archive`);
       writeFixtureFile(directory, `${archive}.sig`, `${target}-signature`);
-      writeFixtureFile(directory, `Drop_0.1.0_${suffix}.dmg`);
+      writeFixtureFile(directory, `Drop_${VERSION}_${suffix}.dmg`);
     }
 
     const linuxDirectory = targetDirectories["x86_64-unknown-linux-gnu"];
-    writeFixtureFile(linuxDirectory, "drop_0.1.0_amd64.deb");
-    const linuxArtifact = writeFixtureFile(linuxDirectory, "drop_0.1.0_amd64.AppImage");
+    writeFixtureFile(linuxDirectory, `drop_${VERSION}_amd64.deb`);
+    const linuxArtifact = writeFixtureFile(linuxDirectory, `drop_${VERSION}_amd64.AppImage`);
     chmodSync(linuxArtifact, 0o755);
-    writeFixtureFile(linuxDirectory, "drop_0.1.0_amd64.AppImage.sig", "linux-signature");
+    writeFixtureFile(linuxDirectory, `drop_${VERSION}_amd64.AppImage.sig`, "linux-signature");
 
     await main(["prepare-artifacts", "--input", input, "--output", output]);
 
     const latest = JSON.parse(readFileSync(join(output, "latest.json"), "utf8"));
-    assert.equal(latest.version, "0.1.0");
+    assert.equal(latest.version, VERSION);
     assert.deepEqual(Object.keys(latest.platforms).sort(), [
       "darwin-aarch64",
       "darwin-x86_64",
@@ -140,14 +150,18 @@ test("signed artifact preparation writes a complete Tauri updater manifest", asy
       "windows-x86_64",
     ]);
     assert.equal(latest.platforms["windows-x86_64"].signature, "windows-signature");
-    assert.match(
+    assert.equal(
+      latest.platforms["windows-x86_64"].url.startsWith(`${REPOSITORY_URL}/releases/download/v${VERSION}/`),
+      true,
+    );
+    assert.equal(
       latest.platforms["windows-x86_64"].url,
-      /releases\/download\/v0\.1\.0\/Drop_0\.1\.0_x64-setup-x86_64-pc-windows-msvc\.exe$/,
+      `${REPOSITORY_URL}/releases/download/v${VERSION}/Drop_${VERSION}_x64-setup-x86_64-pc-windows-msvc.exe`,
     );
     assert.equal(latest.platforms["linux-x86_64"].signature, "linux-signature");
-    assert.match(
+    assert.equal(
       latest.platforms["linux-x86_64"].url,
-      /drop_0\.1\.0_amd64-x86_64-unknown-linux-gnu\.AppImage$/,
+      `${REPOSITORY_URL}/releases/download/v${VERSION}/drop_${VERSION}_amd64-x86_64-unknown-linux-gnu.AppImage`,
     );
     assert.equal(latest.platforms["darwin-aarch64"].signature, "aarch64-apple-darwin-signature");
     assert.equal(latest.platforms["darwin-x86_64"].signature, "x86_64-apple-darwin-signature");

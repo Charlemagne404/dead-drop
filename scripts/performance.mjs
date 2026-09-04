@@ -33,7 +33,7 @@ const cases = [
   { name: "many-small-files", size: requestedSmallFileBytes, count: requestedSmallFileCount },
 ];
 
-const buildArgs = ["build", "--manifest-path", manifest, "--features", "integration-tests", "--bin", "performance_peer"];
+const buildArgs = ["build", "--locked", "--manifest-path", manifest, "--features", "integration-tests", "--bin", "performance_peer"];
 if (profile === "release") buildArgs.push("--release");
 const build = spawnSync(
   "cargo",
