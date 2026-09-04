@@ -1,6 +1,6 @@
 [package]
 name = "dead-drop"
-version = "0.1.0"
+version = "0.1.1"
 description = "Direct local file transfer"
 authors = ["Continental"]
 edition = "2021"
